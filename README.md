@@ -25,8 +25,8 @@ parallelism or transform coroutine launches.
 
 ## Modules
 
-- `checker-core`: exact quantitative-effect abstract domain and a small
-  language-independent reference model used by core tests.
+- `checker-core`: exact quantitative-effect abstract domain and composition
+  operations.
 - `plugin-annotations`: annotations used at network and opaque API boundaries.
 - `compiler-plugin`: K2 compiler registration, annotation validation, and a
   native Kotlin IR visitor that infers effects for calls, sequence, functions,
