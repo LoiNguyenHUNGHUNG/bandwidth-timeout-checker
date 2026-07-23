@@ -20,17 +20,17 @@ environment, accounting for program concurrency.
 Kotlin source and library contracts
               |
               v
-Annotation validation and symbol summaries
+Kotlin FIR resolution: Gamma |- e : tau
               |
               v
-Native Kotlin IR quantitative-effect visitor
+FIR quantitative-effect visitor: Gamma |- e : tau |> Phi
   - primitive download -> singleton effect
   - sequence / choice -> sequential join
   - structured concurrency -> parallel composition
   - opaque call -> declared latent effect
               |
               v
-ReqBW report and feasibility diagnostics
+FIR diagnostics, symbol summaries, and ReqBW reports
 
 Kotlin IR
   |
@@ -40,10 +40,17 @@ Kotlin IR
 The quantitative-effect domain has no Kotlin or Android dependency. This lets
 us test the calculus independently and reuse it from other frontends later.
 
+Kotlin first resolves each expression's ordinary type and call target. The FIR
+visitor then computes the effect component on the same resolved tree; effects
+are logically paired with Kotlin types but do not replace Kotlin's type
+representation. Per-expression effects are temporary, while reusable function
+summaries are cached by resolved FIR symbol.
+
 Kotlin syntax-to-effect rules live in `KotlinNetworkEffectVisitor.kt`. The
 surrounding inference pass is responsible only for interprocedural caching,
-recursion boundaries, contracts, and diagnostics. The Kotlin frontend computes
-effects directly; it does not build an intermediate network-program tree.
+recursion boundaries, contracts, and diagnostics. The frontend computes effects
+directly; it does not build an intermediate network-program tree. IR is reserved
+for transformations such as the future bounded-scope semaphore rewrite.
 
 ## Annotation discipline
 
@@ -126,16 +133,16 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 
 ### M1 - Annotation and plugin diagnostics
 
-- Validate annotation placement and constant arguments in FIR.
-- Resolve primitive operations and opaque latent effects by symbol.
-- Emit actionable source-located diagnostics.
+- [x] Validate annotation placement and constant arguments in FIR.
+- [x] Resolve primitive operations and opaque latent effects by symbol.
+- [x] Emit actionable source-located FIR diagnostics.
 - Add Kotlin compiler test-data fixtures.
 
 ### M2 - Inference for sequential Kotlin
 
 - [x] Infer calls, `let`/statement sequence, functions, ordinary branches, and
-  `try/catch` directly from Kotlin IR.
-- [x] Structure inference as a return-valued Kotlin IR visitor so each
+  `try/catch` directly from resolved Kotlin FIR.
+- [x] Structure inference as a return-valued Kotlin FIR visitor so each
   additional language construct has an explicit extension point.
 - [x] Infer visible effects and use summaries across opaque boundaries.
 - [x] Check visible function and callback bodies against declared contracts.
@@ -145,8 +152,8 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   returned function types.
 - [x] Cache per-function summaries and reject unsupported recursion and
   effectful loops.
-- [ ] Move source diagnostics from the IR phase to FIR without duplicating the
-  effect rules.
+- [x] Run annotation validation, effect inference, and diagnostics in the FIR
+  frontend without an analysis-only IR pass.
 
 ### M3 - Structured coroutine concurrency
 
