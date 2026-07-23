@@ -7,7 +7,10 @@ import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.ir.IrElement
 import org.jetbrains.kotlin.ir.declarations.IrDeclaration
 import org.jetbrains.kotlin.ir.declarations.IrAnnotationContainer
+import org.jetbrains.kotlin.ir.declarations.IrFunction
 import org.jetbrains.kotlin.ir.declarations.IrModuleFragment
+import org.jetbrains.kotlin.ir.declarations.IrValueParameter
+import org.jetbrains.kotlin.ir.expressions.IrConstructorCall
 import org.jetbrains.kotlin.ir.visitors.IrVisitorVoid
 import org.jetbrains.kotlin.ir.visitors.acceptChildrenVoid
 
@@ -64,31 +67,48 @@ private class AnnotationValidator(
             }
         }
 
-        effectAnnotation?.let { annotation ->
-            val rMax: Long? = annotation.longArgument(0)
-            val nMax: Int? = annotation.intArgument(1)
-            if (rMax == null || rMax < 0) {
-                error(
-                    "@BandwidthEffect rMaxBytesPerSecond must be a non-negative constant.",
-                    location,
-                )
-            }
-            if (nMax == null || nMax < 0) {
-                error("@BandwidthEffect nMax must be a non-negative constant.", location)
-            }
-            if (rMax != null && rMax > 0 && nMax == 0) {
-                error(
-                    "@BandwidthEffect with a positive rMax must have nMax greater than zero.",
-                    location,
-                )
-            }
-        }
+        validateEffectAnnotation(effectAnnotation, location)
 
         container.annotation(BOUNDED_SCOPE_ANNOTATION)?.let { annotation ->
             val bound: Int? = annotation.intArgument(0)
             if (bound == null || bound <= 0) {
                 error("@BoundedScope k must be a positive constant.", location)
             }
+        }
+
+        when (container) {
+            is IrFunction -> validateEffectAnnotation(
+                container.returnType.annotation(BANDWIDTH_EFFECT_ANNOTATION),
+                location,
+            )
+            is IrValueParameter -> validateEffectAnnotation(
+                container.type.annotation(BANDWIDTH_EFFECT_ANNOTATION),
+                location,
+            )
+        }
+    }
+
+    private fun validateEffectAnnotation(
+        annotation: IrConstructorCall?,
+        location: org.jetbrains.kotlin.cli.common.messages.CompilerMessageSourceLocation?,
+    ) {
+        annotation ?: return
+        val rMax: Long? = annotation.longArgument(0)
+        val nMax: Int? = annotation.intArgument(1)
+        if (rMax == null || rMax < 0) {
+            error(
+                "@BandwidthEffect rMaxBytesPerSecond must be a non-negative constant.",
+                location,
+            )
+        }
+        if (nMax == null || nMax < 0) {
+            error("@BandwidthEffect nMax must be a non-negative constant.", location)
+        }
+        if (rMax != null && rMax > 0 && nMax == 0) {
+            error(
+                "@BandwidthEffect with a positive rMax must have nMax greater than zero.",
+                location,
+            )
         }
     }
 

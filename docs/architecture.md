@@ -51,8 +51,8 @@ Annotations are required only where inference cannot see enough:
 
 1. `@NetworkDownload(maxBytes, completeTimeoutMillis)` on primitive network
    operations or library adapters.
-2. `@BandwidthEffect(rMaxBytesPerSecond, nMax)` on opaque functions and
-   higher-order inputs.
+2. `@BandwidthEffect(rMaxBytesPerSecond, nMax)` on opaque functions,
+   higher-order inputs, and opaque returned function types.
 3. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
    enforce the stated launch bound.
 4. `@BandwidthAlternative` on a whole `try/catch` expression when the
@@ -139,6 +139,10 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   additional language construct has an explicit extension point.
 - [x] Infer visible effects and use summaries across opaque boundaries.
 - [x] Check visible function and callback bodies against declared contracts.
+- [x] Propagate latent effects through local storage, aliases, captures,
+  mutable branch assignments, and higher-order function returns.
+- [x] Require and check latent contracts on opaque higher-order inputs and
+  returned function types.
 - [x] Cache per-function summaries and reject unsupported recursion and
   effectful loops.
 - [ ] Move source diagnostics from the IR phase to FIR without duplicating the

@@ -22,7 +22,7 @@ internal class KotlinNetworkEffectInference(
     private val reportEffects: Boolean,
 ) {
     private val sourceFunctions: Set<IrFunction> = collectSourceFunctions(moduleFragment)
-    private val inferredEffects: MutableMap<IrFunction, NetworkEffect> = mutableMapOf()
+    private val inferredEffects: MutableMap<IrFunction, KotlinFunctionEffect> = mutableMapOf()
     private val functionsBeingInferred: MutableSet<IrFunction> = mutableSetOf()
     private val reportedProblems: MutableSet<String> = mutableSetOf()
     private val effectVisitor: KotlinNetworkEffectVisitor = KotlinNetworkEffectVisitor(
@@ -35,7 +35,8 @@ internal class KotlinNetworkEffectInference(
         sourceFunctions
             .filter { it.body != null }
             .forEach { function ->
-                val inferredEffect: NetworkEffect = inferFunctionEffect(function)
+                val inferred: KotlinFunctionEffect = inferFunctionEffect(function)
+                val inferredEffect: NetworkEffect = inferred.invocation
                 function.effectContract()?.let { contract ->
                     val declaredEffect: NetworkEffect = contract.toNetworkEffect()
                     if (!inferredEffect.isCoveredBy(declaredEffect)) {
@@ -44,6 +45,20 @@ internal class KotlinNetworkEffectInference(
                             "Inferred effect ${inferredEffect.render()} is not covered by " +
                                 "@BandwidthEffect(rMaxBytesPerSecond=${contract.rMaxBytesPerSecond}, " +
                                 "nMax=${contract.nMax}).",
+                        )
+                    }
+                }
+                function.returnType.effectContract()?.let { contract ->
+                    val inferredLatent: NetworkEffect =
+                        inferred.returned?.invocation ?: NetworkEffect.EMPTY
+                    val declaredLatent: NetworkEffect = contract.toNetworkEffect()
+                    if (!inferredLatent.isCoveredBy(declaredLatent)) {
+                        error(
+                            function,
+                            "Inferred returned latent effect ${inferredLatent.render()} is not " +
+                                "covered by @BandwidthEffect(" +
+                                "rMaxBytesPerSecond=${contract.rMaxBytesPerSecond}, " +
+                                "nMax=${contract.nMax}) on the return type.",
                         )
                     }
                 }
@@ -59,11 +74,13 @@ internal class KotlinNetworkEffectInference(
             }
     }
 
-    private fun inferFunctionEffect(function: IrFunction): NetworkEffect {
+    private fun inferFunctionEffect(function: IrFunction): KotlinFunctionEffect {
         function.downloadContract()?.let { contract ->
-            return NetworkEffect.download(
-                maxBytes = contract.maxBytes,
-                completeTimeoutMillis = contract.completeTimeoutMillis,
+            return KotlinFunctionEffect(
+                invocation = NetworkEffect.download(
+                    maxBytes = contract.maxBytes,
+                    completeTimeoutMillis = contract.completeTimeoutMillis,
+                ),
             )
         }
         inferredEffects[function]?.let { return it }
@@ -74,10 +91,10 @@ internal class KotlinNetworkEffectInference(
                 message = "Cannot infer recursive network function ${function.displayName()}. " +
                     "Add @BandwidthEffect(rMaxBytesPerSecond, nMax) as a recursion boundary.",
             )
-            return NetworkEffect.EMPTY
+            return KotlinFunctionEffect()
         }
 
-        val result: NetworkEffect = effectVisitor.infer(function.body, function)
+        val result: KotlinFunctionEffect = effectVisitor.inferFunctionBody(function)
         functionsBeingInferred.remove(function)
         inferredEffects[function] = result
         return result

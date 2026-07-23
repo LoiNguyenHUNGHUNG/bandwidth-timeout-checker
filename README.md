@@ -75,6 +75,13 @@ the declared effect. Invoked higher-order parameters require their own
 `@BandwidthEffect(rMaxBytesPerSecond, nMax)`, and visible callback bodies are
 checked against that declaration.
 
+Higher-order effects remain latent while lambdas and function references are
+stored, aliased, returned, or captured, and are charged only when the function
+value is invoked. Callback factories can therefore be inferred without internal
+annotations. Opaque APIs that return callbacks must annotate the returned
+function type. Function values stored in object fields or collections are not
+yet tracked and require an explicit boundary.
+
 To print inferred effects during a Gradle compilation:
 
 ```kotlin
@@ -98,7 +105,7 @@ Requirements: JDK 21 or newer.
 ## Status
 
 - [x] Exact rational rates and Pareto-normalized effects
-- [x] Sequential, conditional, parallel, and bounded-replication core nodes
+- [x] Sequential, conditional, parallel, and bounded-replication core operations
 - [x] Boundary annotations without priorities
 - [x] Compiler and Gradle plugin registration
 - [x] Runtime semaphore gate
@@ -106,6 +113,7 @@ Requirements: JDK 21 or newer.
 - [x] Native Kotlin visitor for sequential calls, functions, branches, and
   `try/catch`
 - [x] Higher-order parameter contracts and visible callback checking
+- [x] Latent effects for stored, aliased, captured, and returned function values
 - [ ] FIR-native diagnostics
 - [ ] Structured-coroutine effect inference
 - [ ] Path-sensitive, rate-sensitive branch refinement
