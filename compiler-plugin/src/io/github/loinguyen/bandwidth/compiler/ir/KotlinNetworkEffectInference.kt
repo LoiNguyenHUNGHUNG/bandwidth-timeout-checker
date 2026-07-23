@@ -1,8 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler.ir
 
 import io.github.loinguyen.bandwidth.core.NetworkEffect
-import io.github.loinguyen.bandwidth.core.NetworkEffectAnalyzer
-import io.github.loinguyen.bandwidth.core.NetworkProgram
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSeverity
 import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.ir.IrElement
@@ -13,23 +11,23 @@ import org.jetbrains.kotlin.ir.visitors.IrVisitorVoid
 import org.jetbrains.kotlin.ir.visitors.acceptChildrenVoid
 
 /**
- * Lowers the recursion-free sequential Kotlin subset to [NetworkProgram].
+ * Infers [NetworkEffect] directly from the recursion-free sequential Kotlin subset.
  *
  * This pass is deliberately path-insensitive: ordinary branches and catches
- * become [NetworkProgram.Choice], whose effects are joined by the core.
+ * are joined conservatively with sequential effect composition.
  */
-internal class KotlinNetworkProgramLowering(
+internal class KotlinNetworkEffectInference(
     moduleFragment: IrModuleFragment,
     private val messages: MessageCollector,
     private val reportEffects: Boolean,
 ) {
     private val sourceFunctions: Set<IrFunction> = collectSourceFunctions(moduleFragment)
-    private val inferredPrograms: MutableMap<IrFunction, NetworkProgram> = mutableMapOf()
+    private val inferredEffects: MutableMap<IrFunction, NetworkEffect> = mutableMapOf()
     private val functionsBeingInferred: MutableSet<IrFunction> = mutableSetOf()
     private val reportedProblems: MutableSet<String> = mutableSetOf()
-    private val programVisitor: KotlinNetworkProgramVisitor = KotlinNetworkProgramVisitor(
+    private val effectVisitor: KotlinNetworkEffectVisitor = KotlinNetworkEffectVisitor(
         sourceFunctions = sourceFunctions,
-        inferFunction = ::inferFunction,
+        inferFunction = ::inferFunctionEffect,
         reportProblem = ::problem,
     )
 
@@ -37,8 +35,7 @@ internal class KotlinNetworkProgramLowering(
         sourceFunctions
             .filter { it.body != null }
             .forEach { function ->
-                val program: NetworkProgram = inferFunction(function)
-                val inferredEffect: NetworkEffect = NetworkEffectAnalyzer.analyze(program)
+                val inferredEffect: NetworkEffect = inferFunctionEffect(function)
                 function.effectContract()?.let { contract ->
                     val declaredEffect: NetworkEffect = contract.toNetworkEffect()
                     if (!inferredEffect.isCoveredBy(declaredEffect)) {
@@ -62,14 +59,14 @@ internal class KotlinNetworkProgramLowering(
             }
     }
 
-    private fun inferFunction(function: IrFunction): NetworkProgram {
+    private fun inferFunctionEffect(function: IrFunction): NetworkEffect {
         function.downloadContract()?.let { contract ->
-            return NetworkProgram.Download(
+            return NetworkEffect.download(
                 maxBytes = contract.maxBytes,
                 completeTimeoutMillis = contract.completeTimeoutMillis,
             )
         }
-        inferredPrograms[function]?.let { return it }
+        inferredEffects[function]?.let { return it }
         if (!functionsBeingInferred.add(function)) {
             problem(
                 key = "recursion:${function.displayName()}",
@@ -77,12 +74,12 @@ internal class KotlinNetworkProgramLowering(
                 message = "Cannot infer recursive network function ${function.displayName()}. " +
                     "Add @BandwidthEffect(rMaxBytesPerSecond, nMax) as a recursion boundary.",
             )
-            return NetworkProgram.Pure
+            return NetworkEffect.EMPTY
         }
 
-        val result: NetworkProgram = programVisitor.lower(function.body, function)
+        val result: NetworkEffect = effectVisitor.infer(function.body, function)
         functionsBeingInferred.remove(function)
-        inferredPrograms[function] = result
+        inferredEffects[function] = result
         return result
     }
 

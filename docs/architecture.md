@@ -20,17 +20,14 @@ environment, accounting for program concurrency.
 Kotlin source and library contracts
               |
               v
-FIR validation and symbol summaries
+Annotation validation and symbol summaries
               |
               v
-Language-independent network IR
-  - primitive download
-  - sequence / choice / parallel
-  - opaque latent effect
-  - bounded-scope launch
-              |
-              v
-Pareto effect analysis in checker-core
+Native Kotlin IR quantitative-effect visitor
+  - primitive download -> singleton effect
+  - sequence / choice -> sequential join
+  - structured concurrency -> parallel composition
+  - opaque call -> declared latent effect
               |
               v
 ReqBW report and feasibility diagnostics
@@ -40,13 +37,13 @@ Kotlin IR
   +--> later: rewrite @BoundedScope launches through runtime gates
 ```
 
-The quantitative core has no Kotlin or Android dependency. This lets us test
-the calculus independently and add other frontends later.
+The quantitative-effect domain has no Kotlin or Android dependency. This lets
+us test the calculus independently and reuse it from other frontends later.
 
-Kotlin syntax-to-network-IR rules live in
-`KotlinNetworkProgramVisitor.kt`. The surrounding lowering pass is responsible
-only for interprocedural caching, recursion boundaries, contracts, and
-diagnostics.
+Kotlin syntax-to-effect rules live in `KotlinNetworkEffectVisitor.kt`. The
+surrounding inference pass is responsible only for interprocedural caching,
+recursion boundaries, contracts, and diagnostics. The Kotlin frontend computes
+effects directly; it does not build an intermediate network-program tree.
 
 ## Annotation discipline
 
@@ -136,10 +133,10 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 
 ### M2 - Inference for sequential Kotlin
 
-- [x] Lower calls, `let`/statement sequence, functions, ordinary branches, and
-  `try/catch` to the network IR.
-- [x] Structure lowering as a return-valued Kotlin IR visitor so each additional
-  language construct has an explicit extension point.
+- [x] Infer calls, `let`/statement sequence, functions, ordinary branches, and
+  `try/catch` directly from Kotlin IR.
+- [x] Structure inference as a return-valued Kotlin IR visitor so each
+  additional language construct has an explicit extension point.
 - [x] Infer visible effects and use summaries across opaque boundaries.
 - [x] Check visible function and callback bodies against declared contracts.
 - [x] Cache per-function summaries and reject unsupported recursion and

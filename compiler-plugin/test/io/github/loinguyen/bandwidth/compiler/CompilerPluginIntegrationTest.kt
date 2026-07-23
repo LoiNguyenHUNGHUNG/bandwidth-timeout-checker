@@ -38,6 +38,34 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `sequential inference preserves rate and concurrency correlation`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun fastSingle() = Unit
+
+            @BandwidthEffect(rMaxBytesPerSecond = 100, nMax = 10)
+            fun slowConcurrentBoundary() = Unit
+
+            fun combined() {
+                fastSingle()
+                slowConcurrentBoundary()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for combined: {(1000, 1), (100, 10)}",
+        )
+        result.assertOutputContains("ReqBW=1000 bytes/s")
+    }
+
+    @Test
     fun `joins try and catch paths conservatively`() {
         val result = compile(
             """
