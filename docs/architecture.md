@@ -133,6 +133,8 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 
 - [x] Lower calls, `let`/statement sequence, functions, ordinary branches, and
   `try/catch` to the network IR.
+- [x] Structure lowering as a return-valued Kotlin IR visitor so each additional
+  language construct has an explicit extension point.
 - [x] Infer visible effects and use summaries across opaque boundaries.
 - [x] Check visible function and callback bodies against declared contracts.
 - [x] Cache per-function summaries and reject unsupported recursion and

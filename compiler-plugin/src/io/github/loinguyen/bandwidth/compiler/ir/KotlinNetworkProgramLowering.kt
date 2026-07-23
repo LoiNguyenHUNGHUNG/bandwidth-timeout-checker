@@ -20,11 +20,11 @@ import org.jetbrains.kotlin.ir.expressions.IrFunctionReference
 import org.jetbrains.kotlin.ir.expressions.IrGetValue
 import org.jetbrains.kotlin.ir.expressions.IrLoop
 import org.jetbrains.kotlin.ir.expressions.IrReturn
-import org.jetbrains.kotlin.ir.expressions.IrStatementContainer
 import org.jetbrains.kotlin.ir.expressions.IrTry
 import org.jetbrains.kotlin.ir.expressions.IrTypeOperatorCall
 import org.jetbrains.kotlin.ir.expressions.IrWhen
 import org.jetbrains.kotlin.ir.util.fqNameWhenAvailable
+import org.jetbrains.kotlin.ir.visitors.IrVisitor
 import org.jetbrains.kotlin.ir.visitors.IrVisitorVoid
 import org.jetbrains.kotlin.ir.visitors.acceptChildrenVoid
 
@@ -43,6 +43,7 @@ internal class KotlinNetworkProgramLowering(
     private val inferredPrograms: MutableMap<IrFunction, NetworkProgram> = mutableMapOf()
     private val functionsBeingInferred: MutableSet<IrFunction> = mutableSetOf()
     private val reportedProblems: MutableSet<String> = mutableSetOf()
+    private val programVisitor: IrVisitor<NetworkProgram, IrFunction> = NetworkProgramVisitor()
 
     fun analyze() {
         sourceFunctions
@@ -91,55 +92,107 @@ internal class KotlinNetworkProgramLowering(
             return NetworkProgram.Pure
         }
 
-        val result: NetworkProgram = when (val body = function.body) {
-            is IrBlockBody -> sequence(body.statements.map { lower(it, function) })
-            is IrExpressionBody -> lower(body.expression, function)
-            else -> NetworkProgram.Pure
-        }
+        val result: NetworkProgram = lower(function.body, function)
         functionsBeingInferred.remove(function)
         inferredPrograms[function] = result
         return result
     }
 
     private fun lower(element: IrElement?, currentFunction: IrFunction): NetworkProgram =
-        when (element) {
-            null -> NetworkProgram.Pure
-            is IrFunctionExpression -> NetworkProgram.Pure
-            is IrFunction -> NetworkProgram.Pure
-            is IrVariable -> lower(element.initializer, currentFunction)
-            is IrCall -> lowerCall(element, currentFunction)
-            is IrWhen -> choice(
-                element.branches.map { branch ->
-                    sequence(
-                        listOf(
-                            lower(branch.condition, currentFunction),
-                            lower(branch.result, currentFunction),
-                        ),
-                    )
-                },
-            )
-            is IrTry -> {
-                val alternatives: NetworkProgram = choice(
-                    listOf(lower(element.tryResult, currentFunction)) +
-                        element.catches.map { lower(it.result, currentFunction) },
-                )
+        element?.accept(programVisitor, currentFunction) ?: NetworkProgram.Pure
+
+    /**
+     * Return-valued Kotlin IR visitor for the executable sequential subset.
+     *
+     * Each supported Kotlin construct has an explicit extension point. The
+     * default implementation preserves evaluation order by lowering immediate
+     * children as a sequence.
+     */
+    private inner class NetworkProgramVisitor : IrVisitor<NetworkProgram, IrFunction>() {
+        override fun visitElement(
+            element: IrElement,
+            data: IrFunction,
+        ): NetworkProgram = lowerChildren(element, data)
+
+        override fun visitFunction(
+            declaration: IrFunction,
+            data: IrFunction,
+        ): NetworkProgram = NetworkProgram.Pure
+
+        override fun visitFunctionExpression(
+            expression: IrFunctionExpression,
+            data: IrFunction,
+        ): NetworkProgram = NetworkProgram.Pure
+
+        override fun visitVariable(
+            declaration: IrVariable,
+            data: IrFunction,
+        ): NetworkProgram = lower(declaration.initializer, data)
+
+        override fun visitCall(
+            expression: IrCall,
+            data: IrFunction,
+        ): NetworkProgram = lowerCall(expression, data)
+
+        override fun visitWhen(
+            expression: IrWhen,
+            data: IrFunction,
+        ): NetworkProgram = choice(
+            expression.branches.map { branch ->
                 sequence(
                     listOf(
-                        alternatives,
-                        lower(element.finallyExpression, currentFunction),
+                        lower(branch.condition, data),
+                        lower(branch.result, data),
                     ),
                 )
-            }
-            is IrLoop -> lowerLoop(element, currentFunction)
-            is IrReturn -> lower(element.value, currentFunction)
-            is IrContainerExpression -> sequence(
-                element.statements.map { lower(it, currentFunction) },
+            },
+        )
+
+        override fun visitTry(
+            aTry: IrTry,
+            data: IrFunction,
+        ): NetworkProgram {
+            val alternatives: NetworkProgram = choice(
+                listOf(lower(aTry.tryResult, data)) +
+                    aTry.catches.map { lower(it.result, data) },
             )
-            is IrStatementContainer -> sequence(
-                element.statements.map { lower(it, currentFunction) },
+            return sequence(
+                listOf(
+                    alternatives,
+                    lower(aTry.finallyExpression, data),
+                ),
             )
-            else -> lowerChildren(element, currentFunction)
         }
+
+        override fun visitLoop(
+            loop: IrLoop,
+            data: IrFunction,
+        ): NetworkProgram = lowerLoop(loop, data)
+
+        override fun visitReturn(
+            expression: IrReturn,
+            data: IrFunction,
+        ): NetworkProgram = lower(expression.value, data)
+
+        override fun visitContainerExpression(
+            expression: IrContainerExpression,
+            data: IrFunction,
+        ): NetworkProgram = sequence(
+            expression.statements.map { lower(it, data) },
+        )
+
+        override fun visitBlockBody(
+            body: IrBlockBody,
+            data: IrFunction,
+        ): NetworkProgram = sequence(
+            body.statements.map { lower(it, data) },
+        )
+
+        override fun visitExpressionBody(
+            body: IrExpressionBody,
+            data: IrFunction,
+        ): NetworkProgram = lower(body.expression, data)
+    }
 
     private fun lowerCall(call: IrCall, currentFunction: IrFunction): NetworkProgram {
         validateHigherOrderArguments(call, currentFunction)
