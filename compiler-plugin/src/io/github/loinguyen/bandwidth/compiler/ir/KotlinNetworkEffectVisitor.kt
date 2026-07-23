@@ -1,8 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler.ir
 
 import io.github.loinguyen.bandwidth.core.NetworkEffect
-import io.github.loinguyen.bandwidth.core.NetworkEffectAnalyzer
-import io.github.loinguyen.bandwidth.core.NetworkProgram
 import org.jetbrains.kotlin.ir.IrElement
 import org.jetbrains.kotlin.ir.declarations.IrFunction
 import org.jetbrains.kotlin.ir.declarations.IrParameterKind
@@ -26,57 +24,57 @@ import org.jetbrains.kotlin.ir.visitors.acceptChildrenVoid
 
 /**
  * Translates executable Kotlin IR constructs into the language-independent
- * [NetworkProgram].
+ * quantitative [NetworkEffect] values.
  *
  * New Kotlin syntax and concurrency patterns should be modeled by adding a
  * dedicated visitor override here. Function-level caching, recursion handling,
- * contract checking, and reporting remain in [KotlinNetworkProgramLowering].
+ * contract checking, and reporting remain in [KotlinNetworkEffectInference].
  */
-internal class KotlinNetworkProgramVisitor(
+internal class KotlinNetworkEffectVisitor(
     private val sourceFunctions: Set<IrFunction>,
-    private val inferFunction: (IrFunction) -> NetworkProgram,
+    private val inferFunction: (IrFunction) -> NetworkEffect,
     private val reportProblem: (String, IrFunction, String) -> Unit,
-) : IrVisitor<NetworkProgram, IrFunction>() {
-    fun lower(
+) : IrVisitor<NetworkEffect, IrFunction>() {
+    fun infer(
         element: IrElement?,
         currentFunction: IrFunction,
-    ): NetworkProgram =
-        element?.accept(this, currentFunction) ?: NetworkProgram.Pure
+    ): NetworkEffect =
+        element?.accept(this, currentFunction) ?: NetworkEffect.EMPTY
 
     override fun visitElement(
         element: IrElement,
         data: IrFunction,
-    ): NetworkProgram = lowerChildren(element, data)
+    ): NetworkEffect = inferChildren(element, data)
 
     override fun visitFunction(
         declaration: IrFunction,
         data: IrFunction,
-    ): NetworkProgram = NetworkProgram.Pure
+    ): NetworkEffect = NetworkEffect.EMPTY
 
     override fun visitFunctionExpression(
         expression: IrFunctionExpression,
         data: IrFunction,
-    ): NetworkProgram = NetworkProgram.Pure
+    ): NetworkEffect = NetworkEffect.EMPTY
 
     override fun visitVariable(
         declaration: IrVariable,
         data: IrFunction,
-    ): NetworkProgram = lower(declaration.initializer, data)
+    ): NetworkEffect = infer(declaration.initializer, data)
 
     override fun visitCall(
         expression: IrCall,
         data: IrFunction,
-    ): NetworkProgram = lowerCall(expression, data)
+    ): NetworkEffect = inferCall(expression, data)
 
     override fun visitWhen(
         expression: IrWhen,
         data: IrFunction,
-    ): NetworkProgram = choice(
+    ): NetworkEffect = choice(
         expression.branches.map { branch ->
             sequence(
                 listOf(
-                    lower(branch.condition, data),
-                    lower(branch.result, data),
+                    infer(branch.condition, data),
+                    infer(branch.result, data),
                 ),
             )
         },
@@ -85,15 +83,15 @@ internal class KotlinNetworkProgramVisitor(
     override fun visitTry(
         aTry: IrTry,
         data: IrFunction,
-    ): NetworkProgram {
-        val alternatives: NetworkProgram = choice(
-            listOf(lower(aTry.tryResult, data)) +
-                aTry.catches.map { lower(it.result, data) },
+    ): NetworkEffect {
+        val alternatives: NetworkEffect = choice(
+            listOf(infer(aTry.tryResult, data)) +
+                aTry.catches.map { infer(it.result, data) },
         )
         return sequence(
             listOf(
                 alternatives,
-                lower(aTry.finallyExpression, data),
+                infer(aTry.finallyExpression, data),
             ),
         )
     }
@@ -101,56 +99,56 @@ internal class KotlinNetworkProgramVisitor(
     override fun visitLoop(
         loop: IrLoop,
         data: IrFunction,
-    ): NetworkProgram = lowerLoop(loop, data)
+    ): NetworkEffect = inferLoop(loop, data)
 
     override fun visitReturn(
         expression: IrReturn,
         data: IrFunction,
-    ): NetworkProgram = lower(expression.value, data)
+    ): NetworkEffect = infer(expression.value, data)
 
     override fun visitContainerExpression(
         expression: IrContainerExpression,
         data: IrFunction,
-    ): NetworkProgram = sequence(
-        expression.statements.map { lower(it, data) },
+    ): NetworkEffect = sequence(
+        expression.statements.map { infer(it, data) },
     )
 
     override fun visitBlockBody(
         body: IrBlockBody,
         data: IrFunction,
-    ): NetworkProgram = sequence(
-        body.statements.map { lower(it, data) },
+    ): NetworkEffect = sequence(
+        body.statements.map { infer(it, data) },
     )
 
     override fun visitExpressionBody(
         body: IrExpressionBody,
         data: IrFunction,
-    ): NetworkProgram = lower(body.expression, data)
+    ): NetworkEffect = infer(body.expression, data)
 
-    private fun lowerCall(
+    private fun inferCall(
         call: IrCall,
         currentFunction: IrFunction,
-    ): NetworkProgram {
+    ): NetworkEffect {
         validateHigherOrderArguments(call, currentFunction)
-        val evaluatedArguments: NetworkProgram = sequence(
-            call.arguments.map { lower(it, currentFunction) },
+        val evaluatedArguments: NetworkEffect = sequence(
+            call.arguments.map { infer(it, currentFunction) },
         )
         val target: IrFunction = call.symbol.owner
-        val callProgram: NetworkProgram = when {
+        val callEffect: NetworkEffect = when {
             target.downloadContract() != null -> {
                 val contract: DownloadContract = requireNotNull(target.downloadContract())
-                NetworkProgram.Download(
+                NetworkEffect.download(
                     maxBytes = contract.maxBytes,
                     completeTimeoutMillis = contract.completeTimeoutMillis,
                 )
             }
             target.effectContract() != null -> {
-                NetworkProgram.OpaqueCall(requireNotNull(target.effectContract()).toNetworkEffect())
+                requireNotNull(target.effectContract()).toNetworkEffect()
             }
             target in sourceFunctions -> inferFunction(target)
-            else -> higherOrderParameterProgram(call, currentFunction) ?: NetworkProgram.Pure
+            else -> higherOrderParameterEffect(call, currentFunction) ?: NetworkEffect.EMPTY
         }
-        return sequence(listOf(evaluatedArguments, callProgram))
+        return sequence(listOf(evaluatedArguments, callEffect))
     }
 
     private fun validateHigherOrderArguments(
@@ -192,8 +190,8 @@ internal class KotlinNetworkProgramVisitor(
     }
 
     private fun IrElement.callbackEffect(): NetworkEffect? = when (this) {
-        is IrFunctionExpression -> NetworkEffectAnalyzer.analyze(inferFunction(function))
-        is IrFunctionReference -> NetworkEffectAnalyzer.analyze(inferFunction(symbol.owner))
+        is IrFunctionExpression -> inferFunction(function)
+        is IrFunctionReference -> inferFunction(symbol.owner)
         is IrGetValue -> {
             val parameter: IrValueParameter = symbol.owner as? IrValueParameter ?: return null
             parameter.effectContract()?.toNetworkEffect()
@@ -202,10 +200,10 @@ internal class KotlinNetworkProgramVisitor(
         else -> null
     }
 
-    private fun higherOrderParameterProgram(
+    private fun higherOrderParameterEffect(
         call: IrCall,
         currentFunction: IrFunction,
-    ): NetworkProgram? {
+    ): NetworkEffect? {
         if (call.symbol.owner.name.asString() != "invoke") return null
         val parameter: IrValueParameter =
             ((call.dispatchReceiver as? IrGetValue)?.symbol?.owner as? IrValueParameter)
@@ -217,22 +215,22 @@ internal class KotlinNetworkProgramVisitor(
                 message = "Higher-order parameter '${parameter.name}' is invoked without " +
                     "@BandwidthEffect(rMaxBytesPerSecond, nMax).",
             )
-            return NetworkProgram.Pure
+            return NetworkEffect.EMPTY
         }
-        return NetworkProgram.OpaqueCall(contract.toNetworkEffect())
+        return contract.toNetworkEffect()
     }
 
-    private fun lowerLoop(
+    private fun inferLoop(
         loop: IrLoop,
         currentFunction: IrFunction,
-    ): NetworkProgram {
-        val oneIteration: NetworkProgram = sequence(
+    ): NetworkEffect {
+        val oneIteration: NetworkEffect = sequence(
             listOf(
-                lower(loop.condition, currentFunction),
-                lower(loop.body, currentFunction),
+                infer(loop.condition, currentFunction),
+                infer(loop.body, currentFunction),
             ),
         )
-        if (NetworkEffectAnalyzer.analyze(oneIteration) != NetworkEffect.EMPTY) {
+        if (oneIteration != NetworkEffect.EMPTY) {
             problem(
                 key = "loop:${currentFunction.displayName()}:${loop.startOffset}",
                 function = currentFunction,
@@ -243,15 +241,15 @@ internal class KotlinNetworkProgramVisitor(
         return oneIteration
     }
 
-    private fun lowerChildren(
+    private fun inferChildren(
         element: IrElement,
         currentFunction: IrFunction,
-    ): NetworkProgram {
-        val children: MutableList<NetworkProgram> = mutableListOf()
+    ): NetworkEffect {
+        val children: MutableList<NetworkEffect> = mutableListOf()
         element.acceptChildrenVoid(
             object : IrVisitorVoid() {
                 override fun visitElement(element: IrElement) {
-                    children += lower(element, currentFunction)
+                    children += infer(element, currentFunction)
                 }
 
                 override fun visitFunction(declaration: IrFunction) = Unit
@@ -268,34 +266,9 @@ internal class KotlinNetworkProgramVisitor(
         reportProblem(key, function, message)
     }
 
-    private fun sequence(programs: List<NetworkProgram>): NetworkProgram {
-        val steps: List<NetworkProgram> = programs
-            .flatMap {
-                when (it) {
-                    NetworkProgram.Pure -> emptyList()
-                    is NetworkProgram.Sequence -> it.steps
-                    else -> listOf(it)
-                }
-            }
-        return when (steps.size) {
-            0 -> NetworkProgram.Pure
-            1 -> steps.single()
-            else -> NetworkProgram.Sequence(steps)
-        }
-    }
+    private fun sequence(effects: List<NetworkEffect>): NetworkEffect =
+        effects.fold(NetworkEffect.EMPTY, NetworkEffect::then)
 
-    private fun choice(programs: List<NetworkProgram>): NetworkProgram {
-        val branches: List<NetworkProgram> = programs
-            .flatMap {
-                when (it) {
-                    is NetworkProgram.Choice -> it.branches
-                    else -> listOf(it)
-                }
-            }
-        return when (branches.size) {
-            0 -> NetworkProgram.Pure
-            1 -> branches.single()
-            else -> NetworkProgram.Choice(branches)
-        }
-    }
+    private fun choice(effects: List<NetworkEffect>): NetworkEffect =
+        effects.fold(NetworkEffect.EMPTY, NetworkEffect::then)
 }

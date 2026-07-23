@@ -12,9 +12,8 @@ import org.jetbrains.kotlin.ir.visitors.IrVisitorVoid
 import org.jetbrains.kotlin.ir.visitors.acceptChildrenVoid
 
 /**
- * First compiler milestone: validates the annotation discipline and provides
- * the IR seam where Kotlin code will be lowered to the language-independent
- * network IR. The bounded-scope transformation deliberately comes later.
+ * Validates the annotation discipline and infers quantitative effects directly
+ * from Kotlin IR. The bounded-scope transformation deliberately comes later.
  */
 internal class BandwidthIrGenerationExtension(
     private val messages: MessageCollector,
@@ -22,7 +21,7 @@ internal class BandwidthIrGenerationExtension(
 ) : IrGenerationExtension {
     override fun generate(moduleFragment: IrModuleFragment, pluginContext: IrPluginContext) {
         moduleFragment.acceptChildrenVoid(AnnotationValidator(messages))
-        KotlinNetworkProgramLowering(
+        KotlinNetworkEffectInference(
             moduleFragment = moduleFragment,
             messages = messages,
             reportEffects = reportEffects,

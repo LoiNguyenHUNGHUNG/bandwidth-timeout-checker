@@ -25,12 +25,12 @@ parallelism or transform coroutine launches.
 
 ## Modules
 
-- `checker-core`: language-independent network IR and exact quantitative-effect
-  implementation.
+- `checker-core`: exact quantitative-effect abstract domain and a small
+  language-independent reference model used by core tests.
 - `plugin-annotations`: annotations used at network and opaque API boundaries.
-- `compiler-plugin`: K2 compiler registration, annotation validation, and the
-  Kotlin-to-network-IR frontend for calls, sequence, functions, ordinary
-  branches, and `try/catch`.
+- `compiler-plugin`: K2 compiler registration, annotation validation, and a
+  native Kotlin IR visitor that infers effects for calls, sequence, functions,
+  ordinary branches, and `try/catch`.
 - `gradle-plugin`: adds the compiler plugin and annotation dependency to Kotlin
   compilations.
 - `runtime`: semaphore gate targeted by the future `@BoundedScope` IR rewrite.
@@ -103,10 +103,11 @@ Requirements: JDK 21 or newer.
 - [x] Compiler and Gradle plugin registration
 - [x] Runtime semaphore gate
 - [x] Source-located annotation and contract diagnostics
-- [x] Sequential call, function, branch, and `try/catch` effect inference
+- [x] Native Kotlin visitor for sequential calls, functions, branches, and
+  `try/catch`
 - [x] Higher-order parameter contracts and visible callback checking
 - [ ] FIR-native diagnostics
-- [ ] Coroutine control-flow lowering
+- [ ] Structured-coroutine effect inference
 - [ ] Path-sensitive, rate-sensitive branch refinement
 - [ ] Sound `@BandwidthAlternative` recovery semantics
 - [ ] `@BoundedScope` alias checks and IR rewriting
