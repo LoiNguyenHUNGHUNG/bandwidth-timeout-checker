@@ -40,11 +40,11 @@ buildConfig {
 
 gradlePlugin {
     plugins {
-        create("SimplePlugin") {
+        create("BandwidthChecker") {
             id = rootProject.group.toString()
-            displayName = "SimplePlugin"
-            description = "SimplePlugin"
-            implementationClass = "org.jetbrains.kotlin.compiler.plugin.template.SimpleGradlePlugin"
+            displayName = "Bandwidth Timeout Checker"
+            description = "Checks whether Kotlin network timeouts are feasible under a bandwidth budget."
+            implementationClass = "io.github.loinguyen.bandwidth.gradle.BandwidthCheckerGradlePlugin"
         }
     }
 }
