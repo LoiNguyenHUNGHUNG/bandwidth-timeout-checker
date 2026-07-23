@@ -7,6 +7,10 @@ on:
 env:
   GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false -Dkotlin.incremental=false"
 
+permissions:
+  contents: read
+  checks: write
+
 jobs:
   build:
     runs-on: macos-latest
@@ -21,7 +25,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v5
       - run: ./gradlew build --continue
 
-      - uses: mikepenz/action-junit-report@v5
+      - uses: mikepenz/action-junit-report@v6
         if: success() || failure()
         with:
           report_paths: '**/build/test-results/test/TEST-*.xml'
