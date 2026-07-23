@@ -14,8 +14,8 @@ public annotation class NetworkDownload(
 )
 
 /**
- * Conservative latent effect for a function or higher-order argument whose
- * body is unavailable to the checker.
+ * Conservative effect contract for an opaque function, higher-order input, or
+ * returned function type whose body is unavailable to the checker.
  */
 @Target(
     AnnotationTarget.FUNCTION,

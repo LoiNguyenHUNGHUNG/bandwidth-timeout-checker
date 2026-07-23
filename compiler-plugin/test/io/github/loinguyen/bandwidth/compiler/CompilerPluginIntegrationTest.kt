@@ -139,6 +139,214 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `infers the latent effect of a stored lambda`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun primitive() = Unit
+
+            fun caller() {
+                val operation = {
+                    primitive()
+                }
+                operation()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for caller: {(1000, 1)}")
+    }
+
+    @Test
+    fun `tracks function references through local aliases`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
+            fun primitive() = Unit
+
+            fun caller() {
+                val operation = ::primitive
+                val alias = operation
+                alias()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for caller: {(800, 1)}")
+    }
+
+    @Test
+    fun `tracks inferred latent effects captured by another lambda`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 650, completeTimeoutMillis = 1_000)
+            fun primitive() = Unit
+
+            fun caller() {
+                val inner = {
+                    primitive()
+                }
+                val outer = {
+                    inner()
+                }
+                outer()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for caller: {(650, 1)}")
+    }
+
+    @Test
+    fun `joins latent effects assigned on different branches`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1_000)
+            fun small() = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            fun large() = Unit
+
+            fun caller(useLarge: Boolean) {
+                var operation: () -> Unit = ::small
+                if (useLarge) {
+                    operation = ::large
+                }
+                operation()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for caller: {(900, 1)}")
+    }
+
+    @Test
+    fun `propagates latent effects returned by callback factories`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000)
+            fun primitive() = Unit
+
+            fun makeFactory(): () -> () -> Unit = {
+                {
+                    primitive()
+                }
+            }
+
+            fun caller() {
+                val factory = makeFactory()
+                val operation = factory()
+                operation()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for caller: {(750, 1)}")
+    }
+
+    @Test
+    fun `uses a latent effect contract on an opaque callback return`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+
+            interface Boundary {
+                fun callback():
+                    @BandwidthEffect(rMaxBytesPerSecond = 900, nMax = 1) (() -> Unit)
+            }
+
+            fun caller(boundary: Boundary) {
+                val operation = boundary.callback()
+                operation()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for caller: {(900, 1)}")
+    }
+
+    @Test
+    fun `checks a visible callback return against its latent contract`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            fun primitive() = Unit
+
+            fun callback():
+                @BandwidthEffect(rMaxBytesPerSecond = 500, nMax = 1) (() -> Unit) = {
+                primitive()
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred returned latent effect {(900, 1)} is not covered")
+    }
+
+    @Test
+    fun `validates a latent effect annotation on a callback return type`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+
+            interface Boundary {
+                fun callback():
+                    @BandwidthEffect(rMaxBytesPerSecond = 900, nMax = 0) (() -> Unit)
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "@BandwidthEffect with a positive rMax must have nMax greater than zero",
+        )
+    }
+
+    @Test
+    fun `rejects invocation of an opaque callback return without a latent contract`() {
+        val result = compile(
+            """
+            interface Boundary {
+                fun callback(): () -> Unit
+            }
+
+            fun caller(boundary: Boundary) {
+                val operation = boundary.callback()
+                operation()
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Cannot infer the latent effect of an invoked function value")
+    }
+
+    @Test
     fun `requires a contract when a higher-order parameter is invoked`() {
         val result = compile(
             """
