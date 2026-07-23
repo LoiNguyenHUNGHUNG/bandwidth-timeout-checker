@@ -18,18 +18,19 @@ parallel(Phi1, Phi2) =
 ReqBW(Phi) = max {(r * n) | (r, n) in Phi}
 ```
 
-The current milestone builds the mathematical core, public annotations, Kotlin
-compiler-plugin registration, Gradle integration, and runtime support for a
-future bounded-scope rewrite. It does not yet infer effects from arbitrary
-Kotlin bodies or transform coroutine launches.
+The current milestone builds the mathematical core, public annotations,
+sequential Kotlin effect inference, Gradle integration, and runtime support for
+a future bounded-scope rewrite. It does not yet infer structured coroutine
+parallelism or transform coroutine launches.
 
 ## Modules
 
 - `checker-core`: language-independent network IR and exact quantitative-effect
   implementation.
 - `plugin-annotations`: annotations used at network and opaque API boundaries.
-- `compiler-plugin`: K2 compiler registration and annotation validation; this
-  becomes the Kotlin-to-network-IR frontend.
+- `compiler-plugin`: K2 compiler registration, annotation validation, and the
+  Kotlin-to-network-IR frontend for calls, sequence, functions, ordinary
+  branches, and `try/catch`.
 - `gradle-plugin`: adds the compiler plugin and annotation dependency to Kotlin
   compilations.
 - `runtime`: semaphore gate targeted by the future `@BoundedScope` IR rewrite.
@@ -68,6 +69,24 @@ For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 This avoids assigning zero bandwidth to `try { download() } catch { showError() }`
 before the alternative relation is formalized.
 
+Visible function bodies are inferred. A `@BandwidthEffect` on a visible function
+is checked as an interface contract, while calls across opaque boundaries use
+the declared effect. Invoked higher-order parameters require their own
+`@BandwidthEffect(rMaxBytesPerSecond, nMax)`, and visible callback bodies are
+checked against that declaration.
+
+To print inferred effects during a Gradle compilation:
+
+```kotlin
+bandwidthChecker {
+    reportEffects.set(true)
+}
+```
+
+The recursion-free milestone rejects unannotated recursion, effectful loops,
+and effectful callbacks passed to opaque higher-order APIs without a parameter
+contract.
+
 ## Build
 
 Requirements: JDK 21 or newer.
@@ -83,8 +102,11 @@ Requirements: JDK 21 or newer.
 - [x] Boundary annotations without priorities
 - [x] Compiler and Gradle plugin registration
 - [x] Runtime semaphore gate
-- [ ] FIR diagnostics and symbol/effect inference
-- [ ] Kotlin control-flow lowering, including coroutine structure
+- [x] Source-located annotation and contract diagnostics
+- [x] Sequential call, function, branch, and `try/catch` effect inference
+- [x] Higher-order parameter contracts and visible callback checking
+- [ ] FIR-native diagnostics
+- [ ] Coroutine control-flow lowering
 - [ ] Path-sensitive, rate-sensitive branch refinement
 - [ ] Sound `@BandwidthAlternative` recovery semantics
 - [ ] `@BoundedScope` alias checks and IR rewriting

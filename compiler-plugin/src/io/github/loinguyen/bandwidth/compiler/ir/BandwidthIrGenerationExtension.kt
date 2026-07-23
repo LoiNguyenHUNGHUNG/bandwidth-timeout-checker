@@ -5,12 +5,9 @@ import org.jetbrains.kotlin.backend.common.extensions.IrPluginContext
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSeverity
 import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.ir.IrElement
+import org.jetbrains.kotlin.ir.declarations.IrDeclaration
 import org.jetbrains.kotlin.ir.declarations.IrAnnotationContainer
 import org.jetbrains.kotlin.ir.declarations.IrModuleFragment
-import org.jetbrains.kotlin.ir.expressions.IrConst
-import org.jetbrains.kotlin.ir.expressions.IrConstructorCall
-import org.jetbrains.kotlin.ir.util.fqNameWhenAvailable
-import org.jetbrains.kotlin.ir.util.parentAsClass
 import org.jetbrains.kotlin.ir.visitors.IrVisitorVoid
 import org.jetbrains.kotlin.ir.visitors.acceptChildrenVoid
 
@@ -21,9 +18,15 @@ import org.jetbrains.kotlin.ir.visitors.acceptChildrenVoid
  */
 internal class BandwidthIrGenerationExtension(
     private val messages: MessageCollector,
+    private val reportEffects: Boolean,
 ) : IrGenerationExtension {
     override fun generate(moduleFragment: IrModuleFragment, pluginContext: IrPluginContext) {
         moduleFragment.acceptChildrenVoid(AnnotationValidator(messages))
+        KotlinNetworkProgramLowering(
+            moduleFragment = moduleFragment,
+            messages = messages,
+            reportEffects = reportEffects,
+        ).analyze()
     }
 }
 
@@ -38,60 +41,62 @@ private class AnnotationValidator(
     }
 
     private fun validate(container: IrAnnotationContainer) {
-        container.annotation(NETWORK_DOWNLOAD)?.let { annotation ->
+        val location = (container as? IrDeclaration)?.messageLocation()
+        val downloadAnnotation = container.annotation(NETWORK_DOWNLOAD_ANNOTATION)
+        val effectAnnotation = container.annotation(BANDWIDTH_EFFECT_ANNOTATION)
+        if (downloadAnnotation != null && effectAnnotation != null) {
+            error(
+                "@NetworkDownload and @BandwidthEffect cannot annotate the same declaration.",
+                location,
+            )
+        }
+
+        downloadAnnotation?.let { annotation ->
             val maxBytes: Long? = annotation.longArgument(0)
             val timeoutMillis: Long? = annotation.longArgument(1)
             if (maxBytes == null || maxBytes < 0) {
-                error("@NetworkDownload maxBytes must be a non-negative constant.")
+                error("@NetworkDownload maxBytes must be a non-negative constant.", location)
             }
             if (timeoutMillis == null || timeoutMillis <= 0) {
-                error("@NetworkDownload completeTimeoutMillis must be a positive constant.")
+                error(
+                    "@NetworkDownload completeTimeoutMillis must be a positive constant.",
+                    location,
+                )
             }
         }
 
-        container.annotation(BANDWIDTH_EFFECT)?.let { annotation ->
+        effectAnnotation?.let { annotation ->
             val rMax: Long? = annotation.longArgument(0)
             val nMax: Int? = annotation.intArgument(1)
             if (rMax == null || rMax < 0) {
-                error("@BandwidthEffect rMaxBytesPerSecond must be a non-negative constant.")
+                error(
+                    "@BandwidthEffect rMaxBytesPerSecond must be a non-negative constant.",
+                    location,
+                )
             }
             if (nMax == null || nMax < 0) {
-                error("@BandwidthEffect nMax must be a non-negative constant.")
+                error("@BandwidthEffect nMax must be a non-negative constant.", location)
             }
             if (rMax != null && rMax > 0 && nMax == 0) {
-                error("@BandwidthEffect with a positive rMax must have nMax greater than zero.")
+                error(
+                    "@BandwidthEffect with a positive rMax must have nMax greater than zero.",
+                    location,
+                )
             }
         }
 
-        container.annotation(BOUNDED_SCOPE)?.let { annotation ->
+        container.annotation(BOUNDED_SCOPE_ANNOTATION)?.let { annotation ->
             val bound: Int? = annotation.intArgument(0)
             if (bound == null || bound <= 0) {
-                error("@BoundedScope k must be a positive constant.")
+                error("@BoundedScope k must be a positive constant.", location)
             }
         }
     }
 
-    private fun IrAnnotationContainer.annotation(fqName: String): IrConstructorCall? =
-        annotations.firstOrNull {
-            it.symbol.owner.parentAsClass.fqNameWhenAvailable?.asString() == fqName
-        }
-
-    private fun IrConstructorCall.longArgument(index: Int): Long? =
-        (arguments[index] as? IrConst)?.value as? Long
-
-    private fun IrConstructorCall.intArgument(index: Int): Int? =
-        (arguments[index] as? IrConst)?.value as? Int
-
-    private fun error(message: String) {
-        messages.report(CompilerMessageSeverity.ERROR, message)
-    }
-
-    private companion object {
-        const val NETWORK_DOWNLOAD: String =
-            "io.github.loinguyen.bandwidth.annotations.NetworkDownload"
-        const val BANDWIDTH_EFFECT: String =
-            "io.github.loinguyen.bandwidth.annotations.BandwidthEffect"
-        const val BOUNDED_SCOPE: String =
-            "io.github.loinguyen.bandwidth.annotations.BoundedScope"
+    private fun error(
+        message: String,
+        location: org.jetbrains.kotlin.cli.common.messages.CompilerMessageSourceLocation?,
+    ) {
+        messages.report(CompilerMessageSeverity.ERROR, message, location)
     }
 }
