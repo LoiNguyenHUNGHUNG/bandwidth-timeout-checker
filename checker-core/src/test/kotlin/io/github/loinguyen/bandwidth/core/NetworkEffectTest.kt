@@ -59,19 +59,17 @@ class NetworkEffectTest {
 
     @Test
     fun `bounded launches replicate the whole body effect`() {
-        val body: NetworkProgram = NetworkProgram.Parallel(
-            listOf(
-                NetworkProgram.Download(1_000, 1_000),
-                NetworkProgram.Download(500, 1_000),
+        val body: NetworkEffect = NetworkEffect.download(
+            maxBytes = 1_000,
+            completeTimeoutMillis = 1_000,
+        ).parallel(
+            NetworkEffect.download(
+                maxBytes = 500,
+                completeTimeoutMillis = 1_000,
             ),
         )
-        val program: NetworkProgram = NetworkProgram.BoundedScopeLaunch(
-            scopeId = "downloadScope",
-            maxConcurrentBodies = 4,
-            body = body,
-        )
 
-        val result: NetworkEffect = NetworkEffectAnalyzer.analyze(program)
+        val result: NetworkEffect = body.boundedReplication(maxConcurrentBodies = 4)
 
         assertEquals(8, result.maxConcurrency)
         assertEquals(Rational.of(8_000), result.requiredBandwidthBytesPerSecond())
