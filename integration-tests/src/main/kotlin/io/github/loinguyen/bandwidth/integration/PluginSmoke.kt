@@ -8,13 +8,35 @@ import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 @NetworkDownload(maxBytes = 8_000_000, completeTimeoutMillis = 10_000)
 suspend fun primitiveDownload(): Unit = Unit
 
-@BandwidthEffect(rMaxBytesPerSecond = 800_000, nMax = 1)
-suspend fun opaqueNetworkOperation(): Unit = Unit
+@NetworkDownload(maxBytes = 2_000_000, completeTimeoutMillis = 10_000)
+suspend fun thumbnailDownload(): Unit = Unit
 
-fun invokeNetworkCallback(
+@BandwidthEffect(rMaxBytesPerSecond = 800_000, nMax = 1)
+suspend fun loadImage(useLarge: Boolean) {
+    thumbnailDownload()
+    if (useLarge) {
+        primitiveDownload()
+    } else {
+        thumbnailDownload()
+    }
+}
+
+@BandwidthEffect(rMaxBytesPerSecond = 800_000, nMax = 1)
+suspend fun invokeNetworkCallback(
     @BandwidthEffect(rMaxBytesPerSecond = 800_000, nMax = 1)
     callback: suspend () -> Unit,
-): suspend () -> Unit = callback
+) {
+    callback()
+}
+
+@BandwidthEffect(rMaxBytesPerSecond = 800_000, nMax = 1)
+suspend fun recoverImage() {
+    try {
+        primitiveDownload()
+    } catch (_: Exception) {
+        thumbnailDownload()
+    }
+}
 
 @BoundedScope(k = 4)
 val downloadScopePlaceholder: Any = Any()

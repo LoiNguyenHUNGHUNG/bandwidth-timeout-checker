@@ -10,7 +10,10 @@ import org.jetbrains.kotlin.config.CompilerConfiguration
 class BandwidthCommandLineProcessor : CommandLineProcessor {
     override val pluginId: String = BuildConfig.KOTLIN_PLUGIN_ID
 
-    override val pluginOptions: Collection<CliOption> = listOf(ENABLED_OPTION)
+    override val pluginOptions: Collection<CliOption> = listOf(
+        ENABLED_OPTION,
+        REPORT_EFFECTS_OPTION,
+    )
 
     override fun processOption(
         option: AbstractCliOption,
@@ -22,6 +25,10 @@ class BandwidthCommandLineProcessor : CommandLineProcessor {
                 BandwidthConfiguration.ENABLED,
                 value.toBooleanStrict(),
             )
+            REPORT_EFFECTS_OPTION.optionName -> configuration.put(
+                BandwidthConfiguration.REPORT_EFFECTS,
+                value.toBooleanStrict(),
+            )
             else -> error("Unexpected config option: '${option.optionName}'")
         }
     }
@@ -31,6 +38,13 @@ class BandwidthCommandLineProcessor : CommandLineProcessor {
             optionName = "enabled",
             valueDescription = "<true|false>",
             description = "Enable bandwidth-timeout checking.",
+            required = false,
+            allowMultipleOccurrences = false,
+        )
+        val REPORT_EFFECTS_OPTION: CliOption = CliOption(
+            optionName = "reportEffects",
+            valueDescription = "<true|false>",
+            description = "Report inferred effects and required bandwidth during compilation.",
             required = false,
             allowMultipleOccurrences = false,
         )

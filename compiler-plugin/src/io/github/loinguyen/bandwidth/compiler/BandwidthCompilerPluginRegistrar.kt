@@ -18,6 +18,11 @@ class BandwidthCompilerPluginRegistrar : CompilerPluginRegistrar() {
 
         val messages: MessageCollector =
             configuration.get(CommonConfigurationKeys.MESSAGE_COLLECTOR_KEY, MessageCollector.NONE)
-        IrGenerationExtension.registerExtension(BandwidthIrGenerationExtension(messages))
+        IrGenerationExtension.registerExtension(
+            BandwidthIrGenerationExtension(
+                messages = messages,
+                reportEffects = configuration.get(BandwidthConfiguration.REPORT_EFFECTS, false),
+            ),
+        )
     }
 }

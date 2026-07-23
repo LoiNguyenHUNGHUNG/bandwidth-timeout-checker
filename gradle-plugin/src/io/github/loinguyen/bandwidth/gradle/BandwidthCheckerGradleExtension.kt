@@ -8,4 +8,5 @@ abstract class BandwidthCheckerGradleExtension @Inject constructor(
     objects: ObjectFactory,
 ) {
     val enabled: Property<Boolean> = objects.property(Boolean::class.java).convention(true)
+    val reportEffects: Property<Boolean> = objects.property(Boolean::class.java).convention(false)
 }

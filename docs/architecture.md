@@ -43,6 +43,11 @@ Kotlin IR
 The quantitative core has no Kotlin or Android dependency. This lets us test
 the calculus independently and add other frontends later.
 
+Kotlin syntax-to-network-IR rules live in
+`KotlinNetworkProgramVisitor.kt`. The surrounding lowering pass is responsible
+only for interprocedural caching, recursion boundaries, contracts, and
+diagnostics.
+
 ## Annotation discipline
 
 Annotations are required only where inference cannot see enough:
@@ -131,10 +136,16 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 
 ### M2 - Inference for sequential Kotlin
 
-- Lower calls, `let`/statement sequence, functions, and ordinary branches to the
-  network IR.
-- Infer all visible effects; require summaries only across opaque boundaries.
-- Cache per-function summaries and detect unsupported recursion.
+- [x] Lower calls, `let`/statement sequence, functions, ordinary branches, and
+  `try/catch` to the network IR.
+- [x] Structure lowering as a return-valued Kotlin IR visitor so each additional
+  language construct has an explicit extension point.
+- [x] Infer visible effects and use summaries across opaque boundaries.
+- [x] Check visible function and callback bodies against declared contracts.
+- [x] Cache per-function summaries and reject unsupported recursion and
+  effectful loops.
+- [ ] Move source diagnostics from the IR phase to FIR without duplicating the
+  effect rules.
 
 ### M3 - Structured coroutine concurrency
 
