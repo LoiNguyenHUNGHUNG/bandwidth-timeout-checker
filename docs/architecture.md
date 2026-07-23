@@ -43,6 +43,11 @@ Kotlin IR
 The quantitative core has no Kotlin or Android dependency. This lets us test
 the calculus independently and add other frontends later.
 
+Kotlin syntax-to-network-IR rules live in
+`KotlinNetworkProgramVisitor.kt`. The surrounding lowering pass is responsible
+only for interprocedural caching, recursion boundaries, contracts, and
+diagnostics.
+
 ## Annotation discipline
 
 Annotations are required only where inference cannot see enough:
