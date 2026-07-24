@@ -11,7 +11,6 @@ suspend fun primitiveDownload(): Unit = Unit
 @NetworkDownload(maxBytes = 2_000_000, completeTimeoutMillis = 10_000)
 suspend fun thumbnailDownload(): Unit = Unit
 
-@BandwidthEffect(rMaxBytesPerSecond = 800_000, nMax = 1)
 suspend fun loadImage(useLarge: Boolean) {
     thumbnailDownload()
     if (useLarge) {
@@ -21,7 +20,6 @@ suspend fun loadImage(useLarge: Boolean) {
     }
 }
 
-@BandwidthEffect(rMaxBytesPerSecond = 800_000, nMax = 1)
 suspend fun invokeNetworkCallback(
     @BandwidthEffect(rMaxBytesPerSecond = 800_000, nMax = 1)
     callback: suspend () -> Unit,
@@ -29,7 +27,6 @@ suspend fun invokeNetworkCallback(
     callback()
 }
 
-@BandwidthEffect(rMaxBytesPerSecond = 800_000, nMax = 1)
 suspend fun recoverImage() {
     try {
         primitiveDownload()
