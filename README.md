@@ -116,7 +116,8 @@ Requirements: JDK 21 or newer.
 - [x] Higher-order parameter contracts and visible callback checking
 - [x] Latent effects for stored, aliased, captured, and returned function values
 - [x] FIR-native annotation, contract, recursion, and loop diagnostics
-- [ ] Structured-coroutine effect inference
+- [x] Structured `coroutineScope` inference with sequential parent work and
+  conservative `launch`/`async` overlap
 - [ ] Path-sensitive, rate-sensitive branch refinement
 - [ ] Sound `@BandwidthAlternative` recovery semantics
 - [ ] `@BoundedScope` alias checks and IR rewriting
