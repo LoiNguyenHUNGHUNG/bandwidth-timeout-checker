@@ -1,0 +1,57 @@
+package io.github.loinguyen.bandwidth.compiler.fir
+
+import org.jetbrains.kotlin.cli.common.messages.MessageCollector
+import org.jetbrains.kotlin.diagnostics.DiagnosticReporter
+import org.jetbrains.kotlin.diagnostics.reportOn
+import org.jetbrains.kotlin.fir.FirSession
+import org.jetbrains.kotlin.fir.analysis.checkers.MppCheckerKind
+import org.jetbrains.kotlin.fir.analysis.checkers.context.CheckerContext
+import org.jetbrains.kotlin.fir.analysis.checkers.declaration.DeclarationCheckers
+import org.jetbrains.kotlin.fir.analysis.checkers.declaration.FirDeclarationChecker
+import org.jetbrains.kotlin.fir.analysis.extensions.FirAdditionalCheckersExtension
+import org.jetbrains.kotlin.fir.declarations.FirDeclaration
+import org.jetbrains.kotlin.fir.declarations.FirNamedFunction
+
+internal class BandwidthFirCheckersExtension(
+    session: FirSession,
+    messages: MessageCollector,
+    reportEffects: Boolean,
+) : FirAdditionalCheckersExtension(session) {
+    private val inference = KotlinNetworkEffectInference(
+        session = session,
+        messages = messages,
+        reportEffects = reportEffects,
+    )
+
+    override val declarationCheckers: DeclarationCheckers =
+        object : DeclarationCheckers() {
+            override val basicDeclarationCheckers =
+                setOf(BandwidthAnnotationChecker)
+            override val simpleFunctionCheckers =
+                setOf(BandwidthFunctionEffectChecker(inference))
+        }
+}
+
+private object BandwidthAnnotationChecker :
+    FirDeclarationChecker<FirDeclaration>(MppCheckerKind.Common) {
+    context(context: CheckerContext, reporter: DiagnosticReporter)
+    override fun check(declaration: FirDeclaration) {
+        declaration.validateBandwidthAnnotations(context.session).forEach { problem ->
+            reporter.reportOn(
+                problem.source ?: declaration.source,
+                BandwidthDiagnostics.ERROR,
+                problem.message,
+                context,
+            )
+        }
+    }
+}
+
+private class BandwidthFunctionEffectChecker(
+    private val inference: KotlinNetworkEffectInference,
+) : FirDeclarationChecker<FirNamedFunction>(MppCheckerKind.Common) {
+    context(context: CheckerContext, reporter: DiagnosticReporter)
+    override fun check(declaration: FirNamedFunction) {
+        inference.analyze(declaration, context, reporter)
+    }
+}

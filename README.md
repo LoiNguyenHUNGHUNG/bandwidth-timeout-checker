@@ -29,7 +29,8 @@ parallelism or transform coroutine launches.
   operations.
 - `plugin-annotations`: annotations used at network and opaque API boundaries.
 - `compiler-plugin`: K2 compiler registration, annotation validation, and a
-  native Kotlin IR visitor that infers effects for calls, sequence, functions,
+  native Kotlin FIR visitor that augments resolved Kotlin types with effects
+  for calls, sequence, functions,
   ordinary branches, and `try/catch`.
 - `gradle-plugin`: adds the compiler plugin and annotation dependency to Kotlin
   compilations.
@@ -110,11 +111,11 @@ Requirements: JDK 21 or newer.
 - [x] Compiler and Gradle plugin registration
 - [x] Runtime semaphore gate
 - [x] Source-located annotation and contract diagnostics
-- [x] Native Kotlin visitor for sequential calls, functions, branches, and
+- [x] Native Kotlin FIR visitor for sequential calls, functions, branches, and
   `try/catch`
 - [x] Higher-order parameter contracts and visible callback checking
 - [x] Latent effects for stored, aliased, captured, and returned function values
-- [ ] FIR-native diagnostics
+- [x] FIR-native annotation, contract, recursion, and loop diagnostics
 - [ ] Structured-coroutine effect inference
 - [ ] Path-sensitive, rate-sensitive branch refinement
 - [ ] Sound `@BandwidthAlternative` recovery semantics

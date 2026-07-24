@@ -1,8 +1,11 @@
-package io.github.loinguyen.bandwidth.compiler.ir
+package io.github.loinguyen.bandwidth.compiler.fir
 
 import io.github.loinguyen.bandwidth.core.NetworkEffect
-import org.jetbrains.kotlin.ir.declarations.IrFunction
-import org.jetbrains.kotlin.ir.declarations.IrValueDeclaration
+import org.jetbrains.kotlin.fir.FirAnnotationContainer
+import org.jetbrains.kotlin.fir.FirSession
+import org.jetbrains.kotlin.fir.declarations.FirCallableDeclaration
+import org.jetbrains.kotlin.fir.declarations.FirFunction
+import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 
 /**
  * Effect suspended inside a Kotlin function value.
@@ -22,7 +25,7 @@ internal data class LatentNetworkEffect(
 }
 
 /**
- * Result of visiting one Kotlin expression or statement.
+ * The effect component paired with the Kotlin type already resolved on FIR.
  */
 internal data class KotlinExpressionEffect(
     val immediate: NetworkEffect = NetworkEffect.EMPTY,
@@ -30,7 +33,7 @@ internal data class KotlinExpressionEffect(
 )
 
 /**
- * Interprocedural summary of calling a Kotlin function.
+ * Interprocedural summary keyed by the FIR function symbol.
  */
 internal data class KotlinFunctionEffect(
     val invocation: NetworkEffect = NetworkEffect.EMPTY,
@@ -44,31 +47,37 @@ internal data class KotlinFunctionEffect(
 }
 
 /**
- * Lexical environment for latent values and returned callbacks.
- *
- * Bindings are joined rather than overwritten, conservatively merging values
- * assigned along different control-flow paths. The binding map is shared with
- * nested-function contexts so captured local callbacks retain their effects.
+ * Lexical environment for latent function values and returned callbacks.
  */
 internal class KotlinEffectContext(
-    val function: IrFunction,
-    private val latentValues: MutableMap<IrValueDeclaration, LatentNetworkEffect>,
+    val function: FirFunction,
+    private val session: FirSession,
+    private val latentValues: MutableMap<FirBasedSymbol<*>, LatentNetworkEffect>,
 ) {
     var returnedLatent: LatentNetworkEffect? = null
         private set
 
     fun bind(
-        declaration: IrValueDeclaration,
+        symbol: FirBasedSymbol<*>?,
         latent: LatentNetworkEffect?,
     ) {
-        if (latent == null) return
-        latentValues[declaration] = latentValues[declaration]?.join(latent) ?: latent
+        if (symbol == null || latent == null) return
+        latentValues[symbol] = latentValues[symbol]?.join(latent) ?: latent
     }
 
-    fun latentOf(declaration: IrValueDeclaration): LatentNetworkEffect? =
-        latentValues[declaration]
-            ?: declaration.effectContract()?.toLatentEffect()
-            ?: declaration.type.effectContract()?.toLatentEffect()
+    fun latentOf(symbol: FirBasedSymbol<*>?): LatentNetworkEffect? {
+        symbol ?: return null
+        latentValues[symbol]?.let { return it }
+        val declaration = symbol.fir
+        val direct = (declaration as? FirAnnotationContainer)
+            ?.effectContract(session)
+            ?.toLatentEffect()
+        if (direct != null) return direct
+        return (declaration as? FirCallableDeclaration)
+            ?.returnTypeRef
+            ?.effectContract(session)
+            ?.toLatentEffect()
+    }
 
     fun recordReturn(latent: LatentNetworkEffect?) {
         if (latent == null) return

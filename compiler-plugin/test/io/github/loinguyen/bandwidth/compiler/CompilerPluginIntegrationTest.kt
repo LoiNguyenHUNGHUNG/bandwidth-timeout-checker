@@ -431,6 +431,33 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `uses a declared FIR effect as a recursion boundary`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun primitive() = Unit
+
+            @BandwidthEffect(rMaxBytesPerSecond = 1_000, nMax = 1)
+            fun recursive(remaining: Int) {
+                primitive()
+                if (remaining > 0) {
+                    recursive(remaining - 1)
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for recursive: {(1000, 1)}",
+        )
+    }
+
+    @Test
     fun `rejects an effectful loop`() {
         val result = compile(
             """
