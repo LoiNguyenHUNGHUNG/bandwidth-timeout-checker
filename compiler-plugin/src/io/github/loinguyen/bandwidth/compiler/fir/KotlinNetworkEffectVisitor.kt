@@ -243,6 +243,9 @@ internal class KotlinNetworkEffectVisitor(
         val target: FirFunction =
             (call.resolvedSymbol() as? FirFunctionSymbol<*>)?.fir
                 ?: return inferChildren(call, context)
+        if (target.isCoroutineScope()) {
+            return inferCoroutineScope(call, context)
+        }
         val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
         fun effectOf(expression: FirExpression): KotlinExpressionEffect =
             cachedEffects.getOrPut(expression) { infer(expression, context) }
@@ -281,6 +284,101 @@ internal class KotlinNetworkEffectVisitor(
             latent = summary.returned,
         )
     }
+
+    /**
+     * A coroutine scope is sequential except where launch/async introduces a
+     * child that may overlap the remainder of the enclosing structured scope.
+     *
+     * Until join/await synchronization is modeled, every child conservatively
+     * remains live until the end of its scope.
+     */
+    private fun inferCoroutineScope(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val body = call.visibleLambdaArgument()?.anonymousFunction?.body as? FirBlock
+        if (body == null) {
+            problem(
+                key = "coroutine-scope:${context.function.displayName()}:" +
+                    "${call.source?.startOffset}",
+                source = call.source ?: context.function.source,
+                message = "Cannot infer coroutineScope with a non-visible block. " +
+                    "Keep the structured coroutine lambda visible.",
+            )
+            return KotlinExpressionEffect()
+        }
+        return inferCoroutineStatements(body, context)
+    }
+
+    private fun inferCoroutineStatements(
+        block: FirBlock,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        var suffix = KotlinExpressionEffect()
+        block.statements.asReversed().forEach { statement ->
+            val child = statement.structuredChildLambda()
+            suffix =
+                if (child == null) {
+                    thenValue(infer(statement, context), suffix)
+                } else {
+                    val childBody = child.anonymousFunction.body as? FirBlock
+                    val childEffect =
+                        childBody?.let { inferCoroutineStatements(it, context) }
+                            ?: infer(child, context).latent?.let {
+                                KotlinExpressionEffect(immediate = it.invocation)
+                            }
+                            ?: KotlinExpressionEffect()
+                    KotlinExpressionEffect(
+                        immediate = childEffect.immediate.parallel(suffix.immediate),
+                        latent = suffix.latent,
+                    )
+                }
+        }
+        return suffix
+    }
+
+    private fun FirElement.structuredChildLambda(): FirAnonymousFunctionExpression? =
+        when (this) {
+            is FirFunctionCall ->
+                if (resolvedFunction()?.isCoroutineBuilder() == true) {
+                    visibleLambdaArgument()
+                } else {
+                    null
+                }
+            is FirProperty -> initializer?.structuredChildLambda()
+            is FirWrappedArgumentExpression -> expression.structuredChildLambda()
+            is FirNamedArgumentExpression -> expression.structuredChildLambda()
+            is FirSpreadArgumentExpression -> expression.structuredChildLambda()
+            is FirFunctionTypeConversionExpression -> expression.structuredChildLambda()
+            is FirWrappedExpression -> expression.structuredChildLambda()
+            else -> null
+        }
+
+    private fun FirFunctionCall.visibleLambdaArgument(): FirAnonymousFunctionExpression? =
+        argumentList.arguments
+            .asSequence()
+            .mapNotNull { it.visibleLambda() }
+            .singleOrNull()
+
+    private fun FirExpression.visibleLambda(): FirAnonymousFunctionExpression? =
+        when (this) {
+            is FirAnonymousFunctionExpression -> this
+            is FirWrappedArgumentExpression -> expression.visibleLambda()
+            is FirNamedArgumentExpression -> expression.visibleLambda()
+            is FirSpreadArgumentExpression -> expression.visibleLambda()
+            is FirFunctionTypeConversionExpression -> expression.visibleLambda()
+            is FirWrappedExpression -> expression.visibleLambda()
+            else -> null
+        }
+
+    private fun FirFunctionCall.resolvedFunction(): FirFunction? =
+        (resolvedSymbol() as? FirFunctionSymbol<*>)?.fir
+
+    private fun FirFunction.isCoroutineScope(): Boolean =
+        symbol.callableId.asSingleFqName().asString() == COROUTINE_SCOPE_FQ_NAME
+
+    private fun FirFunction.isCoroutineBuilder(): Boolean =
+        symbol.callableId.asSingleFqName().asString() in COROUTINE_BUILDER_FQ_NAMES
 
     private fun inferFunctionInvocation(
         call: FirImplicitInvokeCall,
@@ -513,4 +611,12 @@ internal class KotlinNetworkEffectVisitor(
             immediate = first.immediate.then(second.immediate),
             latent = second.latent,
         )
+
+    private companion object {
+        const val COROUTINE_SCOPE_FQ_NAME: String = "kotlinx.coroutines.coroutineScope"
+        val COROUTINE_BUILDER_FQ_NAMES: Set<String> = setOf(
+            "kotlinx.coroutines.launch",
+            "kotlinx.coroutines.async",
+        )
+    }
 }

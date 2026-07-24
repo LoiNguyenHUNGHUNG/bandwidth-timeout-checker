@@ -24,6 +24,7 @@ dependencies {
 
     testImplementation(libs.kotlin.compiler)
     testImplementation(libs.kotlin.test.junit5)
+    testImplementation(libs.kotlinx.coroutines.core)
     testImplementation(project(":plugin-annotations"))
 }
 

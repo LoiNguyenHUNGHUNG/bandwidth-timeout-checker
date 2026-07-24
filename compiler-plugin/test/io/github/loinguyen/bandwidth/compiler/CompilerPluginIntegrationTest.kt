@@ -95,6 +95,93 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `keeps ordinary coroutineScope statements sequential`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun first() = Unit
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun second() = Unit
+
+            suspend fun load() = coroutineScope {
+                first()
+                second()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 1)}")
+        result.assertOutputContains("ReqBW=1000 bytes/s")
+    }
+
+    @Test
+    fun `composes launched children with the remaining scope in parallel`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun first() = Unit
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun second() = Unit
+
+            suspend fun load() = coroutineScope {
+                first()
+                launch {
+                    second()
+                }
+                second()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for load: {(1000, 1), (500, 2)}",
+        )
+        result.assertOutputContains("ReqBW=1000 bytes/s")
+    }
+
+    @Test
+    fun `composes assigned async children in parallel`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun large() = Unit
+
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
+            suspend fun small() = Unit
+
+            suspend fun load() = coroutineScope {
+                val largeResult = async { large() }
+                val smallResult = async { small() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for load: {(900, 2)}",
+        )
+        result.assertOutputContains("ReqBW=1800 bytes/s")
+    }
+
+    @Test
     fun `rejects a function contract that does not cover its inferred body`() {
         val result = compile(
             """

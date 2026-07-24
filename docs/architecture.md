@@ -157,7 +157,9 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 
 ### M3 - Structured coroutine concurrency
 
-- Recognize `coroutineScope`, `async`/`await`, `launch`/`join`, and fixed fan-out.
+- [x] Recognize visible `coroutineScope` blocks and preserve sequential work.
+- [x] Compose `async` and `launch` bodies with the remaining scope in parallel.
+- [ ] Use `await` and `join` to shorten conservatively inferred overlap windows.
 - Distinguish structured completion from escaped jobs.
 - Compare inferred results against hand-written core fixtures.
 
