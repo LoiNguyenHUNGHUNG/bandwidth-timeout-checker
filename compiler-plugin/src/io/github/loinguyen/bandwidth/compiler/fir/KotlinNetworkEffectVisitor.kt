@@ -286,17 +286,14 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     /**
-     * A coroutine scope is sequential except where launch/async introduces a
-     * child that may overlap the remainder of the enclosing structured scope.
-     *
-     * Until join/await synchronization is modeled, every child conservatively
-     * remains live until the end of its scope.
+     * A coroutine scope is split into sequential phases. launch/async children
+     * overlap each phase until a direct join/await on their local handle.
      */
     private fun inferCoroutineScope(
         call: FirFunctionCall,
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
-        val body = call.visibleLambdaArgument()?.anonymousFunction?.body as? FirBlock
+        val body = call.visibleLambdaArgument()?.anonymousFunction?.body
         if (body == null) {
             problem(
                 key = "coroutine-scope:${context.function.displayName()}:" +
@@ -314,45 +311,75 @@ internal class KotlinNetworkEffectVisitor(
         block: FirBlock,
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
-        var suffix = KotlinExpressionEffect()
-        block.statements.asReversed().forEach { statement ->
-            val child = statement.structuredChildLambda()
-            suffix =
-                if (child == null) {
-                    thenValue(infer(statement, context), suffix)
-                } else {
-                    val childBody = child.anonymousFunction.body as? FirBlock
-                    val childEffect =
-                        childBody?.let { inferCoroutineStatements(it, context) }
-                            ?: infer(child, context).latent?.let {
-                                KotlinExpressionEffect(immediate = it.invocation)
-                            }
-                            ?: KotlinExpressionEffect()
-                    KotlinExpressionEffect(
-                        immediate = childEffect.immediate.parallel(suffix.immediate),
-                        latent = suffix.latent,
-                    )
-                }
+        val phases = CoroutinePhaseState<FirBasedSymbol<*>>()
+
+        block.statements.forEach { statement ->
+            val child = statement.structuredChild()
+            if (child != null) {
+                phases.addChild(
+                    handle = child.handle,
+                    effect = inferCoroutineChild(child.lambda, context),
+                )
+                return@forEach
+            }
+
+            val waitedHandle = statement.coroutineWaitedHandle()
+            if (waitedHandle != null && phases.synchronize(waitedHandle)) {
+                return@forEach
+            }
+
+            phases.recordStatement(infer(statement, context))
         }
-        return suffix
+
+        return phases.finish()
     }
 
-    private fun FirElement.structuredChildLambda(): FirAnonymousFunctionExpression? =
+    private fun inferCoroutineChild(
+        lambda: FirAnonymousFunctionExpression,
+        context: KotlinEffectContext,
+    ): NetworkEffect {
+        val body = lambda.anonymousFunction.body
+        return body?.let { inferCoroutineStatements(it, context).immediate }
+            ?: infer(lambda, context).latent?.invocation
+            ?: NetworkEffect.EMPTY
+    }
+
+    private fun FirElement.structuredChild(): StructuredChild? =
         when (this) {
             is FirFunctionCall ->
                 if (resolvedFunction()?.isCoroutineBuilder() == true) {
-                    visibleLambdaArgument()
+                    visibleLambdaArgument()?.let { StructuredChild(handle = null, lambda = it) }
                 } else {
                     null
                 }
-            is FirProperty -> initializer?.structuredChildLambda()
-            is FirWrappedArgumentExpression -> expression.structuredChildLambda()
-            is FirNamedArgumentExpression -> expression.structuredChildLambda()
-            is FirSpreadArgumentExpression -> expression.structuredChildLambda()
-            is FirFunctionTypeConversionExpression -> expression.structuredChildLambda()
-            is FirWrappedExpression -> expression.structuredChildLambda()
+            is FirProperty -> initializer?.structuredChild()?.copy(handle = symbol)
+            is FirWrappedArgumentExpression -> expression.structuredChild()
+            is FirNamedArgumentExpression -> expression.structuredChild()
+            is FirSpreadArgumentExpression -> expression.structuredChild()
+            is FirFunctionTypeConversionExpression -> expression.structuredChild()
+            is FirWrappedExpression -> expression.structuredChild()
             else -> null
         }
+
+    private fun FirElement.coroutineWaitedHandle(): FirBasedSymbol<*>? {
+        val call =
+            when (this) {
+                is FirFunctionCall -> this
+                is FirWrappedArgumentExpression -> return expression.coroutineWaitedHandle()
+                is FirNamedArgumentExpression -> return expression.coroutineWaitedHandle()
+                is FirSpreadArgumentExpression -> return expression.coroutineWaitedHandle()
+                is FirFunctionTypeConversionExpression -> return expression.coroutineWaitedHandle()
+                is FirWrappedExpression -> return expression.coroutineWaitedHandle()
+                else -> return null
+            }
+        if (call.resolvedFunction()?.isCoroutineWait() != true) {
+            return null
+        }
+        return call.receiverExpressions()
+            .asSequence()
+            .mapNotNull { it.resolvedSymbol() }
+            .firstOrNull()
+    }
 
     private fun FirFunctionCall.visibleLambdaArgument(): FirAnonymousFunctionExpression? =
         argumentList.arguments
@@ -379,6 +406,9 @@ internal class KotlinNetworkEffectVisitor(
 
     private fun FirFunction.isCoroutineBuilder(): Boolean =
         symbol.callableId.asSingleFqName().asString() in COROUTINE_BUILDER_FQ_NAMES
+
+    private fun FirFunction.isCoroutineWait(): Boolean =
+        symbol.callableId.asSingleFqName().asString() in COROUTINE_WAIT_FQ_NAMES
 
     private fun inferFunctionInvocation(
         call: FirImplicitInvokeCall,
@@ -613,10 +643,19 @@ internal class KotlinNetworkEffectVisitor(
         )
 
     private companion object {
+        data class StructuredChild(
+            val handle: FirBasedSymbol<*>?,
+            val lambda: FirAnonymousFunctionExpression,
+        )
+
         const val COROUTINE_SCOPE_FQ_NAME: String = "kotlinx.coroutines.coroutineScope"
         val COROUTINE_BUILDER_FQ_NAMES: Set<String> = setOf(
             "kotlinx.coroutines.launch",
             "kotlinx.coroutines.async",
+        )
+        val COROUTINE_WAIT_FQ_NAMES: Set<String> = setOf(
+            "kotlinx.coroutines.Job.join",
+            "kotlinx.coroutines.Deferred.await",
         )
     }
 }
