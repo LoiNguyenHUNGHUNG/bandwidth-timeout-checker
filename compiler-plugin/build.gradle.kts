@@ -1,11 +1,22 @@
 plugins {
-    alias(libs.plugins.kotlin.jvm)
+    id("org.jetbrains.kotlin.jvm")
     alias(libs.plugins.buildconfig)
+}
+
+val kotlinCompilerVersion =
+    providers.gradleProperty("kotlinVersion").orElse(libs.versions.kotlin)
+val kotlinAdapterDirectory = when {
+    kotlinCompilerVersion.get().startsWith("2.3.") -> "src-kotlin-2.3"
+    kotlinCompilerVersion.get().startsWith("2.4.") -> "src-kotlin-2.4"
+    else -> error(
+        "Unsupported Kotlin compiler ${kotlinCompilerVersion.get()}. " +
+            "Supported lines: 2.3.x, 2.4.x.",
+    )
 }
 
 sourceSets {
     main {
-        java.setSrcDirs(listOf("src"))
+        java.setSrcDirs(listOf("src", kotlinAdapterDirectory))
         resources.setSrcDirs(listOf("resources"))
     }
     test {
@@ -44,6 +55,9 @@ buildConfig {
 
 kotlin {
     compilerOptions {
+        if (kotlinCompilerVersion.get().startsWith("2.3.")) {
+            freeCompilerArgs.add("-Xcontext-parameters")
+        }
         optIn.add("org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi")
         optIn.add("org.jetbrains.kotlin.fir.symbols.SymbolInternals")
     }

@@ -14,7 +14,6 @@ import org.jetbrains.kotlin.fir.expressions.FirCallableReferenceAccess
 import org.jetbrains.kotlin.fir.expressions.FirDoWhileLoop
 import org.jetbrains.kotlin.fir.expressions.FirExpression
 import org.jetbrains.kotlin.fir.expressions.FirFunctionCall
-import org.jetbrains.kotlin.fir.expressions.FirFunctionTypeConversionExpression
 import org.jetbrains.kotlin.fir.expressions.FirImplicitInvokeCall
 import org.jetbrains.kotlin.fir.expressions.FirLoop
 import org.jetbrains.kotlin.fir.expressions.FirNamedArgumentExpression
@@ -79,7 +78,9 @@ internal class KotlinNetworkEffectVisitor(
     override fun visitElement(
         element: FirElement,
         data: KotlinEffectContext,
-    ): KotlinExpressionEffect = inferChildren(element, data)
+    ): KotlinExpressionEffect =
+        element.functionTypeConversionOperand()?.let { infer(it, data) }
+            ?: inferChildren(element, data)
 
     override fun visitFunction(
         function: FirFunction,
@@ -157,11 +158,6 @@ internal class KotlinNetworkEffectVisitor(
         spreadArgumentExpression: FirSpreadArgumentExpression,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = infer(spreadArgumentExpression.expression, data)
-
-    override fun visitFunctionTypeConversionExpression(
-        functionTypeConversionExpression: FirFunctionTypeConversionExpression,
-        data: KotlinEffectContext,
-    ): KotlinExpressionEffect = infer(functionTypeConversionExpression.expression, data)
 
     override fun visitWrappedExpression(
         wrappedExpression: FirWrappedExpression,
@@ -344,8 +340,9 @@ internal class KotlinNetworkEffectVisitor(
             ?: NetworkEffect.EMPTY
     }
 
-    private fun FirElement.structuredChild(): StructuredChild? =
-        when (this) {
+    private fun FirElement.structuredChild(): StructuredChild? {
+        functionTypeConversionOperand()?.let { return it.structuredChild() }
+        return when (this) {
             is FirFunctionCall ->
                 if (resolvedFunction()?.isCoroutineBuilder() == true) {
                     visibleLambdaArgument()?.let { StructuredChild(handle = null, lambda = it) }
@@ -356,19 +353,19 @@ internal class KotlinNetworkEffectVisitor(
             is FirWrappedArgumentExpression -> expression.structuredChild()
             is FirNamedArgumentExpression -> expression.structuredChild()
             is FirSpreadArgumentExpression -> expression.structuredChild()
-            is FirFunctionTypeConversionExpression -> expression.structuredChild()
             is FirWrappedExpression -> expression.structuredChild()
             else -> null
         }
+    }
 
     private fun FirElement.coroutineWaitedHandle(): FirBasedSymbol<*>? {
+        functionTypeConversionOperand()?.let { return it.coroutineWaitedHandle() }
         val call =
             when (this) {
                 is FirFunctionCall -> this
                 is FirWrappedArgumentExpression -> return expression.coroutineWaitedHandle()
                 is FirNamedArgumentExpression -> return expression.coroutineWaitedHandle()
                 is FirSpreadArgumentExpression -> return expression.coroutineWaitedHandle()
-                is FirFunctionTypeConversionExpression -> return expression.coroutineWaitedHandle()
                 is FirWrappedExpression -> return expression.coroutineWaitedHandle()
                 else -> return null
             }
@@ -387,16 +384,17 @@ internal class KotlinNetworkEffectVisitor(
             .mapNotNull { it.visibleLambda() }
             .singleOrNull()
 
-    private fun FirExpression.visibleLambda(): FirAnonymousFunctionExpression? =
-        when (this) {
+    private fun FirExpression.visibleLambda(): FirAnonymousFunctionExpression? {
+        functionTypeConversionOperand()?.let { return it.visibleLambda() }
+        return when (this) {
             is FirAnonymousFunctionExpression -> this
             is FirWrappedArgumentExpression -> expression.visibleLambda()
             is FirNamedArgumentExpression -> expression.visibleLambda()
             is FirSpreadArgumentExpression -> expression.visibleLambda()
-            is FirFunctionTypeConversionExpression -> expression.visibleLambda()
             is FirWrappedExpression -> expression.visibleLambda()
             else -> null
         }
+    }
 
     private fun FirFunctionCall.resolvedFunction(): FirFunction? =
         (resolvedSymbol() as? FirFunctionSymbol<*>)?.fir
