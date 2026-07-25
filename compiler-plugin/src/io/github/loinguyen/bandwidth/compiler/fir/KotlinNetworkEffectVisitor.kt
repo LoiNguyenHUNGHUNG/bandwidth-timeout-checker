@@ -311,52 +311,27 @@ internal class KotlinNetworkEffectVisitor(
         block: FirBlock,
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
-        var result = NetworkEffect.EMPTY
-        var lastLatent: LatentNetworkEffect? = null
-        val activeChildren = linkedMapOf<FirBasedSymbol<*>, NetworkEffect>()
-        val untrackedChildren = mutableListOf<NetworkEffect>()
-
-        fun activeEffect(): NetworkEffect =
-            (activeChildren.values + untrackedChildren)
-                .fold(NetworkEffect.EMPTY) { effect, child ->
-                    effect.parallel(child)
-                }
-
-        fun recordPhase(parent: NetworkEffect = NetworkEffect.EMPTY) {
-            result = result.then(activeEffect().parallel(parent))
-        }
+        val phases = CoroutinePhaseState<FirBasedSymbol<*>>()
 
         block.statements.forEach { statement ->
             val child = statement.structuredChild()
             if (child != null) {
-                val effect = inferCoroutineChild(child.lambda, context)
-                if (child.handle == null) {
-                    untrackedChildren += effect
-                } else {
-                    activeChildren[child.handle] = effect
-                }
-                lastLatent = null
+                phases.addChild(
+                    handle = child.handle,
+                    effect = inferCoroutineChild(child.lambda, context),
+                )
                 return@forEach
             }
 
             val waitedHandle = statement.coroutineWaitedHandle()
-            if (waitedHandle != null && waitedHandle in activeChildren) {
-                recordPhase()
-                activeChildren.remove(waitedHandle)
-                lastLatent = null
+            if (waitedHandle != null && phases.synchronize(waitedHandle)) {
                 return@forEach
             }
 
-            val statementEffect = infer(statement, context)
-            recordPhase(statementEffect.immediate)
-            lastLatent = statementEffect.latent
+            phases.recordStatement(infer(statement, context))
         }
 
-        recordPhase()
-        return KotlinExpressionEffect(
-            immediate = result,
-            latent = lastLatent,
-        )
+        return phases.finish()
     }
 
     private fun inferCoroutineChild(
