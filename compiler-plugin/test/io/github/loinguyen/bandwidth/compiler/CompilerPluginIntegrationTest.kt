@@ -282,6 +282,140 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `join and await create successive overlap phases`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
+            suspend fun launchedChild() = Unit
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun asyncChild() = Unit
+
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
+            suspend fun beforeJoin() = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun betweenWaits() = Unit
+
+            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
+            suspend fun afterAwait() = Unit
+
+            suspend fun load() = coroutineScope {
+                val job = launch { launchedChild() }
+                val deferred = async { asyncChild() }
+                beforeJoin()
+                job.join()
+                betweenWaits()
+                deferred.await()
+                afterAwait()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for load: {(1100, 1), (900, 2), (500, 3)}",
+        )
+        result.assertOutputContains("ReqBW=1800 bytes/s")
+    }
+
+    @Test
+    fun `await and join can synchronize children in reverse order`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+
+            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
+            suspend fun launchedChild() = Unit
+
+            @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1_000)
+            suspend fun asyncChild() = Unit
+
+            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
+            suspend fun beforeAwait() = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun betweenWaits() = Unit
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun afterJoin() = Unit
+
+            suspend fun load() = coroutineScope {
+                val job = launch { launchedChild() }
+                val deferred = async { asyncChild() }
+                beforeAwait()
+                deferred.await()
+                betweenWaits()
+                job.join()
+                afterJoin()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for load: {(1000, 1), (900, 2), (700, 3)}",
+        )
+        result.assertOutputContains("ReqBW=2100 bytes/s")
+    }
+
+    @Test
+    fun `nested coroutine scopes honor inner await and outer join`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
+            suspend fun innerChild() = Unit
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun beforeInnerAwait() = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun afterInnerAwait() = Unit
+
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
+            suspend fun outerSiblingWork() = Unit
+
+            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
+            suspend fun afterOuterJoin() = Unit
+
+            suspend fun load() = coroutineScope {
+                val outer = launch {
+                    val inner = async { innerChild() }
+                    beforeInnerAwait()
+                    inner.await()
+                    afterInnerAwait()
+                }
+                outerSiblingWork()
+                outer.join()
+                afterOuterJoin()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for load: {(1100, 1), (900, 2), (500, 3)}",
+        )
+        result.assertOutputContains("ReqBW=1800 bytes/s")
+    }
+
+    @Test
     fun `rejects a function contract that does not cover its inferred body`() {
         val result = compile(
             """
