@@ -159,7 +159,10 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 
 - [x] Recognize visible `coroutineScope` blocks and preserve sequential work.
 - [x] Compose `async` and `launch` bodies with the remaining scope in parallel.
-- [ ] Use `await` and `join` to shorten conservatively inferred overlap windows.
+- [x] Use direct `await` and `join` calls on local child handles to shorten
+  conservatively inferred overlap windows.
+- Keep aliased, reassigned, stored, or escaped child handles live until scope
+  completion unless ownership can be proved.
 - Distinguish structured completion from escaped jobs.
 - Compare inferred results against hand-written core fixtures.
 

@@ -182,6 +182,106 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `join ends a launched child's overlap with later work`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
+            suspend fun childDownload() = Unit
+
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
+            suspend fun beforeJoin() = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun afterJoin() = Unit
+
+            suspend fun load() = coroutineScope {
+                val job = launch { childDownload() }
+                beforeJoin()
+                job.join()
+                afterJoin()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for load: {(900, 1), (400, 2)}",
+        )
+        result.assertOutputContains("ReqBW=900 bytes/s")
+    }
+
+    @Test
+    fun `await ends only the awaited child's overlap`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
+            suspend fun firstChild() = Unit
+
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
+            suspend fun secondChild() = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun afterFirstAwait() = Unit
+
+            suspend fun load() = coroutineScope {
+                val first = async { firstChild() }
+                val second = async { secondChild() }
+                first.await()
+                afterFirstAwait()
+                second.await()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for load: {(900, 2)}",
+        )
+        result.assertOutputContains("ReqBW=1800 bytes/s")
+    }
+
+    @Test
+    fun `keeps aliased child handles live conservatively`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
+            suspend fun childDownload() = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun afterAwait() = Unit
+
+            suspend fun load() = coroutineScope {
+                val original = async { childDownload() }
+                val alias = original
+                alias.await()
+                afterAwait()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for load: {(900, 2)}",
+        )
+        result.assertOutputContains("ReqBW=1800 bytes/s")
+    }
+
+    @Test
     fun `rejects a function contract that does not cover its inferred body`() {
         val result = compile(
             """
