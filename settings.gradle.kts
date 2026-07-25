@@ -1,9 +1,21 @@
 pluginManagement {
+    val kotlinVersionOverride = providers.gradleProperty("kotlinVersion").orNull
+
     repositories {
         mavenCentral()
         gradlePluginPortal()
     }
-    
+
+    resolutionStrategy {
+        eachPlugin {
+            if (
+                kotlinVersionOverride != null &&
+                requested.id.id.startsWith("org.jetbrains.kotlin.")
+            ) {
+                useVersion(kotlinVersionOverride)
+            }
+        }
+    }
 }
 
 dependencyResolutionManagement {

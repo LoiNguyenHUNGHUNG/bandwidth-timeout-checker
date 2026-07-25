@@ -10,7 +10,6 @@ import org.jetbrains.kotlin.fir.analysis.checkers.declaration.DeclarationChecker
 import org.jetbrains.kotlin.fir.analysis.checkers.declaration.FirDeclarationChecker
 import org.jetbrains.kotlin.fir.analysis.extensions.FirAdditionalCheckersExtension
 import org.jetbrains.kotlin.fir.declarations.FirDeclaration
-import org.jetbrains.kotlin.fir.declarations.FirNamedFunction
 
 internal class BandwidthFirCheckersExtension(
     session: FirSession,
@@ -28,7 +27,7 @@ internal class BandwidthFirCheckersExtension(
             override val basicDeclarationCheckers =
                 setOf(BandwidthAnnotationChecker)
             override val simpleFunctionCheckers =
-                setOf(BandwidthFunctionEffectChecker(inference))
+                bandwidthFunctionEffectCheckers(inference)
         }
 }
 
@@ -44,14 +43,5 @@ private object BandwidthAnnotationChecker :
                 context,
             )
         }
-    }
-}
-
-private class BandwidthFunctionEffectChecker(
-    private val inference: KotlinNetworkEffectInference,
-) : FirDeclarationChecker<FirNamedFunction>(MppCheckerKind.Common) {
-    context(context: CheckerContext, reporter: DiagnosticReporter)
-    override fun check(declaration: FirNamedFunction) {
-        inference.analyze(declaration, context, reporter)
     }
 }

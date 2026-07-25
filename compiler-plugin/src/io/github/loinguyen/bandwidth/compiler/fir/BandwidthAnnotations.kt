@@ -158,10 +158,13 @@ private fun MutableList<AnnotationProblem>.validateEffectAnnotation(
 }
 
 private fun FirAnnotation.longArgument(name: Name, session: FirSession): Long? =
-    argument(name)?.constantValue(session) as? Long
+    argument(name)?.constantValue(session).integralLongValue()
 
 private fun FirAnnotation.intArgument(name: Name, session: FirSession): Int? =
-    argument(name)?.constantValue(session) as? Int
+    argument(name)?.constantValue(session)
+        .integralLongValue()
+        ?.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }
+        ?.toInt()
 
 private fun FirAnnotation.argument(name: Name): FirExpression? =
     argumentMapping.mapping[name]
@@ -169,3 +172,12 @@ private fun FirAnnotation.argument(name: Name): FirExpression? =
 private fun FirExpression.constantValue(session: FirSession): Any? =
     (this as? FirLiteralExpression)?.value
         ?: evaluateAs<FirLiteralExpression>(session)?.value
+
+private fun Any?.integralLongValue(): Long? =
+    when (this) {
+        is Byte -> toLong()
+        is Short -> toLong()
+        is Int -> toLong()
+        is Long -> this
+        else -> null
+    }

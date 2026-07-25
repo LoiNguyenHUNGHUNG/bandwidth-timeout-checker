@@ -40,6 +40,23 @@ Kotlin IR
 The quantitative-effect domain has no Kotlin or Android dependency. This lets
 us test the calculus independently and reuse it from other frontends later.
 
+## Kotlin compiler compatibility
+
+Kotlin's FIR compiler-plugin API is experimental, so the checker treats the FIR
+surface as a versioned adapter. Shared inference code remains under
+`compiler-plugin/src`, while the small incompatible seams live under
+`src-kotlin-2.3` and `src-kotlin-2.4`. The selected adapter, Kotlin Gradle
+plugin, and `org.jetbrains.kotlin` compiler dependencies are aligned through:
+
+```shell
+./gradlew build -PkotlinVersion=2.3.0
+```
+
+One build produces an artifact for one Kotlin compiler version. The eventual
+published Gradle plugin will select a version-aligned compiler artifact; it
+must not load a 2.4 FIR artifact into a 2.3 compiler process. CI builds and
+tests every supported compiler line so adapter drift fails before publication.
+
 Kotlin first resolves each expression's ordinary type and call target. The FIR
 visitor then computes the effect component on the same resolved tree; effects
 are logically paired with Kotlin types but do not replace Kotlin's type
@@ -181,6 +198,8 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 
 ### M6 - Android integration and evaluation
 
+- Build and test version-aligned FIR adapters for Kotlin 2.3 and 2.4 while
+  keeping the effect domain and annotation model shared.
 - Provide an Android/Gradle sample with OkHttp or Retrofit boundary adapters.
 - Analyze representative open-source applications.
 - Measure annotation count, unsupported constructs, precision, build overhead,

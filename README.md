@@ -103,6 +103,19 @@ Requirements: JDK 21 or newer.
 ./gradlew build
 ```
 
+The FIR adapter can be compiled and tested against a supported Kotlin compiler
+version without changing source:
+
+```shell
+./gradlew clean build -PkotlinVersion=2.3.0
+./gradlew clean build -PkotlinVersion=2.4.10
+```
+
+The default remains the version in `gradle/libs.versions.toml`. CI verifies
+both supported compiler lines. This override changes the Kotlin Gradle plugin
+and all `org.jetbrains.kotlin` build dependencies together; compiler-plugin
+artifacts must not mix versions.
+
 ## Status
 
 - [x] Exact rational rates and Pareto-normalized effects
@@ -118,6 +131,7 @@ Requirements: JDK 21 or newer.
 - [x] FIR-native annotation, contract, recursion, and loop diagnostics
 - [x] Structured `coroutineScope` inference with sequential parent work and
   conservative `launch`/`async` overlap
+- [x] Version-selected FIR adapters and CI coverage for Kotlin 2.3 and 2.4
 - [ ] Path-sensitive, rate-sensitive branch refinement
 - [ ] Sound `@BandwidthAlternative` recovery semantics
 - [ ] `@BoundedScope` alias checks and IR rewriting

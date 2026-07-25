@@ -10,7 +10,6 @@ import org.jetbrains.kotlin.diagnostics.reportOn
 import org.jetbrains.kotlin.fir.FirSession
 import org.jetbrains.kotlin.fir.analysis.checkers.context.CheckerContext
 import org.jetbrains.kotlin.fir.declarations.FirFunction
-import org.jetbrains.kotlin.fir.declarations.FirNamedFunction
 import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirFunctionSymbol
 
@@ -41,7 +40,7 @@ internal class KotlinNetworkEffectInference(
     )
 
     fun analyze(
-        function: FirNamedFunction,
+        function: FirFunction,
         context: CheckerContext,
         reporter: DiagnosticReporter,
     ) {
@@ -83,7 +82,7 @@ internal class KotlinNetworkEffectInference(
                         "${inferredEffect.render()}, " +
                         "ReqBW=${inferredEffect.requiredBandwidthBytesPerSecond()} bytes/s.",
                     CompilerMessageLocation.create(
-                        context.containingFile?.path ?: "<unknown>",
+                        context.bandwidthSourcePath(),
                     ),
                 )
             }
