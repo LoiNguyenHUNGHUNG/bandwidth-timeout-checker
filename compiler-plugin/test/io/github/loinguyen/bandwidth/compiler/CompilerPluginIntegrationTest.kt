@@ -466,6 +466,136 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `infers inline awaitAll children inside withContext`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.Dispatchers
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.withContext
+
+            interface SyncRepository {
+                @BandwidthEffect(rMaxBytesPerSecond = 900, nMax = 1)
+                suspend fun sync(): Boolean
+            }
+
+            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
+            suspend fun populateSearchIndex() = Unit
+
+            suspend fun syncAll(
+                topicRepository: SyncRepository,
+                newsRepository: SyncRepository,
+            ) = withContext(Dispatchers.IO) {
+                val syncedSuccessfully = awaitAll(
+                    async { topicRepository.sync() },
+                    async { newsRepository.sync() },
+                ).all { it }
+
+                if (syncedSuccessfully) {
+                    populateSearchIndex()
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for syncAll: {(1100, 1), (900, 2)}",
+        )
+        result.assertOutputContains("ReqBW=1800 bytes/s")
+    }
+
+    @Test
+    fun `keeps chunked forEach network work sequential`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
+            suspend fun downloadBatch(ids: List<String>) = Unit
+
+            suspend fun syncChanged(ids: List<String>) {
+                ids.chunked(40).forEach { chunkedIds ->
+                    downloadBatch(chunkedIds)
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for syncChanged: {(700, 1)}",
+        )
+        result.assertOutputContains("ReqBW=700 bytes/s")
+    }
+
+    @Test
+    fun `withContext preserves ordinary sequential work`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.Dispatchers
+            import kotlinx.coroutines.withContext
+
+            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
+            suspend fun first() = Unit
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun second() = Unit
+
+            suspend fun load() = withContext(Dispatchers.IO) {
+                first()
+                second()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for load: {(800, 1)}",
+        )
+        result.assertOutputContains("ReqBW=800 bytes/s")
+    }
+
+    @Test
+    fun `treats Android traceAsync as a sequential wrapper`() {
+        val result = compile(
+            """
+            package androidx.tracing
+
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            inline fun <T> traceAsync(
+                methodName: String,
+                cookie: Int,
+                @BandwidthEffect(rMaxBytesPerSecond = 1_000, nMax = 1)
+                block: () -> T,
+            ): T = block()
+
+            @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000)
+            suspend fun download() = Unit
+
+            suspend fun tracedSync() = traceAsync("Sync", 0) {
+                download()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for androidx.tracing.tracedSync: {(750, 1)}",
+        )
+        result.assertOutputContains("ReqBW=750 bytes/s")
+    }
+
+    @Test
     fun `rejects a function contract that does not cover its inferred body`() {
         val result = compile(
             """

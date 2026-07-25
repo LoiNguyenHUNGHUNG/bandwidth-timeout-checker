@@ -93,7 +93,9 @@ bandwidthChecker {
 
 The recursion-free milestone rejects unannotated recursion, effectful loops,
 and effectful callbacks passed to opaque higher-order APIs without a parameter
-contract.
+contract. Trusted library models cover sequential `forEach` callbacks and
+AndroidX `traceAsync`; these invoke a visible callback once for peak-bandwidth
+inference rather than treating it as concurrent work.
 
 ## Build
 
@@ -129,8 +131,9 @@ artifacts must not mix versions.
 - [x] Higher-order parameter contracts and visible callback checking
 - [x] Latent effects for stored, aliased, captured, and returned function values
 - [x] FIR-native annotation, contract, recursion, and loop diagnostics
-- [x] Structured `coroutineScope` inference with sequential parent work and
-  conservative `launch`/`async` overlap
+- [x] Structured `coroutineScope`/`withContext` inference with sequential parent
+  work, conservative `launch`/`async` overlap, and inline `awaitAll`
+- [x] Sequential `chunked(...).forEach` callback inference
 - [x] Version-selected FIR adapters and CI coverage for Kotlin 2.3 and 2.4
 - [ ] Path-sensitive, rate-sensitive branch refinement
 - [ ] Sound `@BandwidthAlternative` recovery semantics
