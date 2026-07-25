@@ -416,6 +416,56 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `composes coroutine await phases across function calls`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
+            suspend fun innerChild() = Unit
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun innerConcurrentWork() = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun innerAfterAwait() = Unit
+
+            suspend fun innerLoad() = coroutineScope {
+                val inner = async { innerChild() }
+                innerConcurrentWork()
+                inner.await()
+                innerAfterAwait()
+            }
+
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
+            suspend fun outerChild() = Unit
+
+            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
+            suspend fun outerAfterAwait() = Unit
+
+            suspend fun outerLoad() = coroutineScope {
+                val outer = async { outerChild() }
+                innerLoad()
+                outer.await()
+                outerAfterAwait()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for innerLoad: {(900, 1), (500, 2)}",
+        )
+        result.assertOutputContains(
+            "Inferred bandwidth effect for outerLoad: {(1100, 1), (900, 2), (500, 3)}",
+        )
+        result.assertOutputContains("ReqBW=1800 bytes/s")
+    }
+
+    @Test
     fun `rejects a function contract that does not cover its inferred body`() {
         val result = compile(
             """
