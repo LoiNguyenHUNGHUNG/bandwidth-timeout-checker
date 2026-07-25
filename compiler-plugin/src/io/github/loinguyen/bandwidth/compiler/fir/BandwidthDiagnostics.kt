@@ -3,7 +3,7 @@
 
 package io.github.loinguyen.bandwidth.compiler.fir
 
-import com.intellij.psi.PsiElement
+import org.jetbrains.kotlin.com.intellij.psi.PsiElement
 import org.jetbrains.kotlin.diagnostics.KtDiagnosticFactoryToRendererMap
 import org.jetbrains.kotlin.diagnostics.KtDiagnosticsContainer
 import org.jetbrains.kotlin.diagnostics.error1

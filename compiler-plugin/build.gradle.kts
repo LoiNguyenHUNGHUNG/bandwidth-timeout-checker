@@ -18,11 +18,11 @@ val embedded: Configuration = configurations.create("embedded") {
 }
 
 dependencies {
-    compileOnly(libs.kotlin.compiler)
+    compileOnly(libs.kotlin.compiler.embeddable)
     implementation(project(":checker-core"))
     embedded(project(":checker-core"))
 
-    testImplementation(libs.kotlin.compiler)
+    testImplementation(libs.kotlin.compiler.embeddable)
     testImplementation(libs.kotlin.test.junit5)
     testImplementation(libs.kotlinx.coroutines.core)
     testImplementation(project(":plugin-annotations"))
