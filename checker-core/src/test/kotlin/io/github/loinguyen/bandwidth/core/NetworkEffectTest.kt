@@ -14,7 +14,7 @@ class NetworkEffectTest {
 
         val result = download.boundedReplication(maxConcurrentBodies = 3)
 
-        assertEquals(listOf(EffectPair(Rational.of(1_000), 3)), result.obligations)
+        assertEquals(listOf(DownloadEffect(Rational.of(1_000), 3, selfBound = 2)), result.obligations)
         assertEquals(Rational.of(3_000), result.requiredBandwidthBytesPerSecond())
     }
 
@@ -24,7 +24,7 @@ class NetworkEffectTest {
             .withSelfBound(3)
             .withUnknownRepetition()
 
-        assertEquals(listOf(EffectPair(Rational.of(1_000), 3)), result.obligations)
+        assertEquals(listOf(DownloadEffect(Rational.of(1_000), 3, selfBound = 3)), result.obligations)
         assertEquals(Rational.of(3_000), result.requiredBandwidthBytesPerSecond())
     }
 
@@ -36,7 +36,7 @@ class NetworkEffectTest {
 
         val result = body.withUnknownRepetition().withUnknownRepetition()
 
-        assertEquals(listOf(EffectPair(Rational.of(1_000), 5)), result.obligations)
+        assertEquals(listOf(DownloadEffect(Rational.of(1_000), 5, selfBound = 2)), result.obligations)
     }
 
     @Test
@@ -50,10 +50,10 @@ class NetworkEffectTest {
     @Test
     fun `sequential join preserves rate-concurrency correlation`() {
         val fastSingle: NetworkEffect = NetworkEffect.of(
-            listOf(EffectPair(Rational.of(10), 1)),
+            listOf(DownloadEffect(Rational.of(10), 1)),
         )
         val slowTriple: NetworkEffect = NetworkEffect.of(
-            listOf(EffectPair(Rational.of(1), 3)),
+            listOf(DownloadEffect(Rational.of(1), 3)),
         )
 
         val result: NetworkEffect = fastSingle.then(slowTriple)
@@ -66,20 +66,20 @@ class NetworkEffectTest {
     fun `parallel composition shifts each child by other maximum concurrency`() {
         val left: NetworkEffect = NetworkEffect.of(
             listOf(
-                EffectPair(Rational.of(10), 1),
-                EffectPair(Rational.of(6), 5),
+                DownloadEffect(Rational.of(10), 1),
+                DownloadEffect(Rational.of(6), 5),
             ),
         )
         val right: NetworkEffect = NetworkEffect.of(
-            listOf(EffectPair(Rational.of(1), 10)),
+            listOf(DownloadEffect(Rational.of(1), 10)),
         )
 
         val result: NetworkEffect = left.parallel(right)
 
         assertEquals(
             listOf(
-                EffectPair(Rational.of(10), 11),
-                EffectPair(Rational.of(6), 15),
+                DownloadEffect(Rational.of(10), 11),
+                DownloadEffect(Rational.of(6), 15),
             ),
             result.obligations,
         )
@@ -121,12 +121,12 @@ class NetworkEffectTest {
     fun `normalization removes dominated obligations`() {
         val result: NetworkEffect = NetworkEffect.of(
             listOf(
-                EffectPair(Rational.of(1), 15),
-                EffectPair(Rational.of(6), 15),
+                DownloadEffect(Rational.of(1), 15),
+                DownloadEffect(Rational.of(6), 15),
             ),
         )
 
-        assertEquals(listOf(EffectPair(Rational.of(6), 15)), result.obligations)
+        assertEquals(listOf(DownloadEffect(Rational.of(6), 15)), result.obligations)
         assertTrue(NetworkEffect.summary(1, 1).isCoveredBy(result))
     }
 }

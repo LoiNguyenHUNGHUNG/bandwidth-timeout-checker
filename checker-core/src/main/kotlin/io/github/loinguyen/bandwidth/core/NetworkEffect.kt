@@ -2,26 +2,8 @@ package io.github.loinguyen.bandwidth.core
 
 import java.math.BigInteger
 
-/** A discharged rate/concurrency obligation `(r, n)` from the paper. */
-public data class EffectPair(
-    public val requiredRateBytesPerSecond: Rational,
-    public val concurrency: Int,
-) {
-    init {
-        require(requiredRateBytesPerSecond >= Rational.ZERO) {
-            "required rate must be non-negative"
-        }
-        require(concurrency >= 0) { "concurrency must be non-negative" }
-    }
-
-    internal fun dominates(other: EffectPair): Boolean =
-        requiredRateBytesPerSecond >= other.requiredRateBytesPerSecond &&
-            concurrency >= other.concurrency &&
-            this != other
-}
-
 /**
- * One primitive download instance before final concurrency discharge.
+ * One primitive download effect `(r, n?, selfBound?)`.
  *
  * [concurrency] is known only after Kotlin syntax establishes it. [selfBound] is a
  * trusted bound for instances of this download kind. It is retained when an
@@ -42,26 +24,32 @@ public data class DownloadEffect(
         require(selfBound == null || selfBound > 0) { "selfBound must be positive" }
     }
 
-    internal fun discharged(): EffectPair? =
-        concurrency?.let { EffectPair(requiredRateBytesPerSecond, it) }
+    internal fun dominates(other: DownloadEffect): Boolean {
+        val thisConcurrency = concurrency ?: return false
+        val otherConcurrency = other.concurrency ?: return false
+        return requiredRateBytesPerSecond >= other.requiredRateBytesPerSecond &&
+            thisConcurrency >= otherConcurrency &&
+            this != other
+    }
 }
 
 /** A finite set of primitive download effects. */
 public class NetworkEffect private constructor(
     private val downloads: Set<DownloadEffect>,
 ) {
-    public val obligations: List<EffectPair>
-        get() = normalize(downloads.mapNotNullTo(mutableSetOf()) { it.discharged() }).sortedWith(
-            compareByDescending<EffectPair> { it.requiredRateBytesPerSecond }
-                .thenByDescending { it.concurrency },
+    /** Final downloads. Every returned value has a non-null [DownloadEffect.concurrency]. */
+    public val obligations: List<DownloadEffect>
+        get() = normalize(downloads.filterTo(mutableSetOf()) { it.concurrency != null }).sortedWith(
+            compareByDescending<DownloadEffect> { it.requiredRateBytesPerSecond }
+                .thenByDescending { requireNotNull(it.concurrency) },
         )
 
     /** True when program syntax has not established `n`. */
     public val hasUnresolvedConcurrency: Boolean
-        get() = downloads.any { it.discharged() == null }
+        get() = downloads.any { it.concurrency == null }
 
     public val maxConcurrency: Int
-        get() = obligations.maxOfOrNull(EffectPair::concurrency) ?: 0
+        get() = obligations.maxOfOrNull { requireNotNull(it.concurrency) } ?: 0
 
     private val rawMaxConcurrency: Int
         get() = downloads.maxOfOrNull { it.concurrency ?: Int.MAX_VALUE } ?: 0
@@ -123,7 +111,9 @@ public class NetworkEffect private constructor(
         require(!hasUnresolvedConcurrency) {
             "cannot compute required bandwidth with unresolved concurrency"
         }
-        return obligations.maxOfOrNull { it.requiredRateBytesPerSecond * it.concurrency }
+        return obligations.maxOfOrNull {
+            it.requiredRateBytesPerSecond * requireNotNull(it.concurrency)
+        }
             ?: Rational.ZERO
     }
 
@@ -132,7 +122,7 @@ public class NetworkEffect private constructor(
         !hasUnresolvedConcurrency && !other.hasUnresolvedConcurrency && obligations.all { pair ->
             other.obligations.any {
                 it.requiredRateBytesPerSecond >= pair.requiredRateBytesPerSecond &&
-                    it.concurrency >= pair.concurrency
+                    requireNotNull(it.concurrency) >= requireNotNull(pair.concurrency)
             }
         }
 
@@ -146,12 +136,8 @@ public class NetworkEffect private constructor(
     public companion object {
         public val EMPTY: NetworkEffect = NetworkEffect(emptySet())
 
-        public fun of(pairs: Collection<EffectPair>): NetworkEffect =
-            NetworkEffect(
-                pairs.mapTo(mutableSetOf()) {
-                    DownloadEffect(it.requiredRateBytesPerSecond, concurrency = it.concurrency)
-                },
-            )
+        public fun of(downloads: Collection<DownloadEffect>): NetworkEffect =
+            NetworkEffect(downloads.toSet())
 
         public fun download(maxBytes: Long, completeTimeoutMillis: Long): NetworkEffect {
             require(maxBytes >= 0) { "maximum transfer size must be non-negative" }
@@ -166,12 +152,14 @@ public class NetworkEffect private constructor(
         public fun summary(rMaxBytesPerSecond: Long, nMax: Int): NetworkEffect {
             require(rMaxBytesPerSecond >= 0) { "rMax must be non-negative" }
             require(nMax >= 0) { "nMax must be non-negative" }
-            return if (nMax == 0) EMPTY else of(listOf(EffectPair(Rational.of(rMaxBytesPerSecond), nMax)))
+            return if (nMax == 0) EMPTY else of(
+                listOf(DownloadEffect(Rational.of(rMaxBytesPerSecond), nMax)),
+            )
         }
 
-        private fun normalize(pairs: Set<EffectPair>): Set<EffectPair> =
-            pairs.filterNotTo(mutableSetOf()) { pair ->
-                pairs.any { candidate -> candidate.dominates(pair) }
+        private fun normalize(downloads: Set<DownloadEffect>): Set<DownloadEffect> =
+            downloads.filterNotTo(mutableSetOf()) { download ->
+                downloads.any { candidate -> candidate.dominates(download) }
             }
     }
 
