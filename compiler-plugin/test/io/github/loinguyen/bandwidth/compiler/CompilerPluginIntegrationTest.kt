@@ -158,6 +158,53 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `sums sequential callee self bounds inside forEach launches`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.downloadPrimary() = Unit
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.downloadSecondary() = Unit
+
+            suspend fun foo(
+                @BoundedClient(k = 2) primaryClient: NetworkClient,
+                @BoundedClient(k = 3) secondaryClient: NetworkClient,
+            ) = coroutineScope {
+                primaryClient.downloadPrimary()
+                secondaryClient.downloadSecondary()
+            }
+
+            fun loadAll(
+                urls: List<String>,
+                viewModelScope: CoroutineScope,
+                @BoundedClient(k = 2) primaryClient: NetworkClient,
+                @BoundedClient(k = 3) secondaryClient: NetworkClient,
+            ) {
+                urls.forEach {
+                    viewModelScope.launch { foo(primaryClient, secondaryClient) }
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for loadAll: {(900, 5)}",
+        )
+        result.assertOutputContains("ReqBW=4500 bytes/s")
+    }
+
+    @Test
     fun `adds independent bounded clients inside one coroutine scope`() {
         val result = compile(
             """
