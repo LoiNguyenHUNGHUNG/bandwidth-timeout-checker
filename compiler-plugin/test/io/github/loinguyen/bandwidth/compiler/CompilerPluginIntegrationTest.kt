@@ -1343,7 +1343,7 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `rejects an effectful loop without a finite client bound`() {
+    fun `rejects an effectful general loop`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
@@ -1362,7 +1362,7 @@ class CompilerPluginIntegrationTest {
         )
 
         assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Cannot establish a finite network concurrency bound")
+        result.assertOutputContains("Cannot infer network work in a general loop")
     }
 
     private fun compile(
