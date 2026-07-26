@@ -244,6 +244,9 @@ internal class KotlinNetworkEffectVisitor(
         if (target.isStructuredCoroutineScope()) {
             return inferStructuredCoroutineScope(call, context)
         }
+        if (target.isCoroutineBuilder()) {
+            return inferUnstructuredCoroutineBuilder(call, context)
+        }
         if (target.isAwaitAll()) {
             return inferInlineAwaitAll(call, context)
         }
@@ -341,6 +344,32 @@ internal class KotlinNetworkEffectVisitor(
         }
         val receivers = inferReceivers(call, context)
         return receivers.then(parallelChildren)
+    }
+
+    /**
+     * A launch/async outside a visible structured scope can overlap an
+     * unbounded number of future invocations (for example, UI click events).
+     * Keep its rate effect but leave n unresolved for a client bound to
+     * discharge at the final check.
+     */
+    private fun inferUnstructuredCoroutineBuilder(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val lambda = call.visibleLambdaArgument()
+        val child = lambda?.let { inferCoroutineChild(it, context) }
+            ?: return KotlinExpressionEffect()
+        val inputs = sequence(
+            call.receiverExpressions().map { infer(it, context) } +
+                call.argumentList.arguments
+                    .filter { it.visibleLambda() !== lambda }
+                    .map { infer(it, context) },
+        )
+        return inputs.then(
+            KotlinExpressionEffect(
+                immediate = child.immediate.withUnknownConcurrency(),
+            ),
+        )
     }
 
     private fun inferSequentialCallbackCall(
@@ -619,16 +648,9 @@ internal class KotlinNetworkEffectVisitor(
                 infer(loop.block, context),
             ),
         )
-        if (oneIteration.immediate != NetworkEffect.EMPTY) {
-            problem(
-                key = "loop:${context.function.displayName()}:${loop.source?.startOffset}",
-                source = loop.source ?: context.function.source,
-                message = "Cannot infer an effectful loop in " +
-                    "${context.function.displayName()}; the current checker requires " +
-                    "statically finite network structure.",
-            )
-        }
-        return KotlinExpressionEffect(immediate = oneIteration.immediate)
+        return KotlinExpressionEffect(
+            immediate = oneIteration.immediate.withUnknownConcurrency(),
+        )
     }
 
     private fun inferChildren(

@@ -37,7 +37,7 @@ class NetworkEffectTest {
     }
 
     @Test
-    fun `does not discharge client bound while unbounded work overlaps`() {
+    fun `uses inferred concurrency when bounded and unbounded work overlap`() {
         val images = NetworkPool(id = "images", maxConcurrentRequests = 2)
         val imageDownload = NetworkEffect.download(1_000, 1_000)
             .through(images)
@@ -48,6 +48,25 @@ class NetworkEffectTest {
 
         assertEquals(listOf(EffectPair(Rational.of(1_000), 4)), result.obligations)
         assertEquals(Rational.of(4_000), result.requiredBandwidthBytesPerSecond())
+    }
+
+    @Test
+    fun `uses client capacity only when syntax leaves concurrency unknown`() {
+        val pool = NetworkPool(id = "images", maxConcurrentRequests = 3)
+        val result = NetworkEffect.download(1_000, 1_000)
+            .withUnknownConcurrency()
+            .through(pool)
+
+        assertEquals(listOf(EffectPair(Rational.of(1_000), 3)), result.obligations)
+        assertEquals(Rational.of(3_000), result.requiredBandwidthBytesPerSecond())
+    }
+
+    @Test
+    fun `keeps unknown concurrency unresolved without a client bound`() {
+        val result = NetworkEffect.download(1_000, 1_000)
+            .withUnknownConcurrency()
+
+        assertTrue(result.hasUnresolvedConcurrency)
     }
 
     @Test

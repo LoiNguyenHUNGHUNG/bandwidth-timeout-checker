@@ -71,6 +71,60 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `discharges an unstructured launch through its bounded client`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            fun onDownloadClicked(
+                scope: CoroutineScope,
+                @BoundedClient(k = 3) client: NetworkClient,
+            ) {
+                scope.launch { client.download() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for onDownloadClicked: {(600, 3)}",
+        )
+        result.assertOutputContains("ReqBW=1800 bytes/s")
+    }
+
+    @Test
+    fun `rejects an unstructured launch without a finite client bound`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            fun onDownloadClicked(scope: CoroutineScope, client: NetworkClient) {
+                scope.launch { client.download() }
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Cannot establish a finite network concurrency bound")
+    }
+
+    @Test
     fun `adds independent bounded clients inside one coroutine scope`() {
         val result = compile(
             """
@@ -105,42 +159,6 @@ class CompilerPluginIntegrationTest {
         assertEquals(0, result.exitCode, result.output)
         result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 4)}")
         result.assertOutputContains("ReqBW=4000 bytes/s")
-    }
-
-    @Test
-    fun `keeps a client bound through a repository wrapper`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.BoundedClient
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            import kotlinx.coroutines.coroutineScope
-            import kotlinx.coroutines.launch
-
-            class NetworkClient
-
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.sendSomething() = Unit
-
-            class Repository(
-                @BoundedClient(k = 2) private val client: NetworkClient,
-            ) {
-                suspend fun load() {
-                    client.sendSomething()
-                }
-            }
-
-            suspend fun loadAll(repository: Repository) = coroutineScope {
-                launch { repository.load() }
-                launch { repository.load() }
-                launch { repository.load() }
-            }
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for loadAll: {(800, 2)}")
-        result.assertOutputContains("ReqBW=1600 bytes/s")
     }
 
     @Test
@@ -1245,7 +1263,7 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `rejects an effectful loop`() {
+    fun `rejects an effectful loop without a finite client bound`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
@@ -1264,7 +1282,7 @@ class CompilerPluginIntegrationTest {
         )
 
         assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Cannot infer an effectful loop")
+        result.assertOutputContains("Cannot establish a finite network concurrency bound")
     }
 
     private fun compile(

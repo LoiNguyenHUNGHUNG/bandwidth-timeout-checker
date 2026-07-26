@@ -74,8 +74,11 @@ intended to be inferred.
 value or parameter. The core effect keeps each client's capacity separate
 while sequential and parallel work compose, then discharges the final request
 concurrency using shared-client caps. Independent clients add their capacities;
-unbounded work remains conservative. The checker trusts the client
-configuration; for OkHttp, set the matching `Dispatcher.maxRequests` value.
+when a recognized construct establishes concurrency, that inferred value wins.
+When an unstructured async boundary leaves concurrency unknown, `k` supplies
+the finite fallback. Unknown work without a client bound is rejected. The
+checker trusts the client configuration; for OkHttp, set the matching
+`Dispatcher.maxRequests` value.
 
 For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 `try/catch` expression, but recovery paths are still joined conservatively.

@@ -50,6 +50,15 @@ internal class KotlinNetworkEffectInference(
         try {
             val inferred: KotlinFunctionEffect = inferFunctionEffect(function)
             val inferredEffect: NetworkEffect = inferred.invocation
+            if (inferredEffect.hasUnresolvedConcurrency) {
+                error(
+                    function.source,
+                    "Cannot establish a finite network concurrency bound for " +
+                        "${function.displayName()}. Use a recognized structured " +
+                        "coroutine construct or route the download through " +
+                        "@BoundedClient(k).",
+                )
+            }
             function.effectContract(session)?.let { contract ->
                 val declaredEffect: NetworkEffect = contract.toNetworkEffect()
                 if (!inferredEffect.isCoveredBy(declaredEffect)) {
@@ -86,7 +95,9 @@ internal class KotlinNetworkEffectInference(
                     )
                 }
             }
-            if (reportEffects && inferredEffect != NetworkEffect.EMPTY) {
+            if (reportEffects && inferredEffect != NetworkEffect.EMPTY &&
+                !inferredEffect.hasUnresolvedConcurrency
+            ) {
                 messages.report(
                     CompilerMessageSeverity.INFO,
                     "Inferred bandwidth effect for ${function.displayName()}: " +

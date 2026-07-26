@@ -43,20 +43,18 @@ public data class NetworkPool(
 
 private data class TrackedEffectPair(
     val pair: EffectPair,
+    /** Null means syntax did not establish a finite concurrency bound. */
+    val inferredConcurrency: Int? = pair.concurrency,
     val pools: Set<NetworkPool> = emptySet(),
-    val hasUnboundedRequest: Boolean = true,
 ) {
-    fun discharged(): EffectPair =
-        if (hasUnboundedRequest) {
-            pair
-        } else {
-            pair.copy(
-                concurrency = minOf(
-                    pair.concurrency,
-                    pools.sumOf(NetworkPool::maxConcurrentRequests),
-                ),
-            )
+    fun discharged(): EffectPair? {
+        val capacity = pools.sumOf(NetworkPool::maxConcurrentRequests)
+        val concurrency = when (val inferred = inferredConcurrency) {
+            null -> capacity.takeIf { it > 0 }
+            else -> if (capacity == 0) inferred else minOf(inferred, capacity)
         }
+        return concurrency?.let { pair.copy(concurrency = it) }
+    }
 }
 
 /**
@@ -67,16 +65,23 @@ public class NetworkEffect private constructor(
     private val trackedPairs: Set<TrackedEffectPair>,
 ) {
     public val obligations: List<EffectPair>
-        get() = normalize(trackedPairs.mapTo(mutableSetOf()) { it.discharged() }).sortedWith(
+        get() = normalize(trackedPairs.mapNotNullTo(mutableSetOf()) { it.discharged() }).sortedWith(
             compareByDescending<EffectPair> { it.requiredRateBytesPerSecond }
                 .thenByDescending { it.concurrency },
         )
+
+    /** True when a final bandwidth check lacks both inferred n and nMax. */
+    public val hasUnresolvedConcurrency: Boolean
+        get() = trackedPairs.any { it.discharged() == null }
 
     public val maxConcurrency: Int
         get() = obligations.maxOfOrNull(EffectPair::concurrency) ?: 0
 
     private val rawMaxConcurrency: Int
-        get() = trackedPairs.maxOfOrNull { it.pair.concurrency } ?: 0
+        get() = trackedPairs.maxOfOrNull { it.inferredConcurrency ?: Int.MAX_VALUE } ?: 0
+
+    private val hasUnknownRawConcurrency: Boolean
+        get() = trackedPairs.any { it.inferredConcurrency == null }
 
     /**
      * Sequential join: `Norm(Phi1 union Phi2)`.
@@ -126,22 +131,34 @@ public class NetworkEffect private constructor(
     public fun through(pool: NetworkPool): NetworkEffect =
         NetworkEffect(
             trackedPairs.mapTo(mutableSetOf()) { pair ->
-                pair.copy(pools = setOf(pool), hasUnboundedRequest = false)
+                pair.copy(pools = setOf(pool))
+            },
+        )
+
+    /** Marks a boundary whose asynchronous concurrency cannot be inferred. */
+    public fun withUnknownConcurrency(): NetworkEffect =
+        NetworkEffect(
+            trackedPairs.mapTo(mutableSetOf()) { pair ->
+                pair.copy(inferredConcurrency = null)
             },
         )
 
     /**
      * `ReqBW(Phi) = max { r * n | (r, n) in Phi }`.
      */
-    public fun requiredBandwidthBytesPerSecond(): Rational =
-        obligations.maxOfOrNull { it.requiredRateBytesPerSecond * it.concurrency }
+    public fun requiredBandwidthBytesPerSecond(): Rational {
+        require(!hasUnresolvedConcurrency) {
+            "cannot compute required bandwidth with unresolved concurrency"
+        }
+        return obligations.maxOfOrNull { it.requiredRateBytesPerSecond * it.concurrency }
             ?: Rational.ZERO
+    }
 
     /**
      * True when [other] is a safe over-approximation of this effect.
      */
     public fun isCoveredBy(other: NetworkEffect): Boolean =
-        obligations.all { pair ->
+        !hasUnresolvedConcurrency && !other.hasUnresolvedConcurrency && obligations.all { pair ->
             other.obligations.any {
                 it.requiredRateBytesPerSecond >= pair.requiredRateBytesPerSecond &&
                     it.concurrency >= pair.concurrency
@@ -194,14 +211,24 @@ public class NetworkEffect private constructor(
         other: NetworkEffect,
         concurrencyShift: Int,
     ): TrackedEffectPair = copy(
-        pair = pair.copy(concurrency = pair.concurrency + concurrencyShift),
-        pools = pools + other.concurrentPools,
-        hasUnboundedRequest = hasUnboundedRequest || other.hasUnboundedRequest,
+        inferredConcurrency =
+            if (inferredConcurrency == null || other.hasUnknownRawConcurrency) {
+                null
+            } else {
+                inferredConcurrency + concurrencyShift
+            },
+        pools =
+            if (pools.isNotEmpty() && other.hasOnlyBoundedRequests) {
+                pools + other.concurrentPools
+            } else {
+                emptySet()
+            },
     )
 
     private val concurrentPools: Set<NetworkPool>
         get() = trackedPairs.flatMapTo(mutableSetOf()) { it.pools }
 
-    private val hasUnboundedRequest: Boolean
-        get() = trackedPairs.any(TrackedEffectPair::hasUnboundedRequest)
+    private val hasOnlyBoundedRequests: Boolean
+        get() = trackedPairs.all { it.pools.isNotEmpty() }
+
 }
