@@ -24,9 +24,8 @@ public data class EffectPair(
  * One primitive download instance before final concurrency discharge.
  *
  * [concurrency] is known only after Kotlin syntax establishes it. [selfBound] is a
- * trusted runtime-client bound for instances of this download kind, used when repetition makes [concurrency]
- * unknown. It is deliberately not a client identity: distinct clients may
- * overlap, so a known global concurrency must never be reduced by this value.
+ * trusted bound for instances of this download kind. It is retained when an
+ * enclosing unknown-repetition construct recalculates [concurrency].
  */
 public data class DownloadEffect(
     public val requiredRateBytesPerSecond: Rational,
@@ -44,7 +43,7 @@ public data class DownloadEffect(
     }
 
     internal fun discharged(): EffectPair? =
-        (concurrency ?: selfBound)?.let { EffectPair(requiredRateBytesPerSecond, it) }
+        concurrency?.let { EffectPair(requiredRateBytesPerSecond, it) }
 }
 
 /** A finite set of primitive download effects. */
@@ -57,7 +56,7 @@ public class NetworkEffect private constructor(
                 .thenByDescending { it.concurrency },
         )
 
-    /** True when neither program syntax nor a client bound establishes `n`. */
+    /** True when program syntax has not established `n`. */
     public val hasUnresolvedConcurrency: Boolean
         get() = downloads.any { it.discharged() == null }
 
@@ -104,6 +103,20 @@ public class NetworkEffect private constructor(
     /** Marks a repetition boundary whose concurrency syntax cannot establish. */
     public fun withUnknownConcurrency(): NetworkEffect =
         NetworkEffect(downloads.mapTo(mutableSetOf()) { it.copy(concurrency = null) })
+
+    /**
+     * Summarizes an unknown number of overlapping copies of this body.
+     *
+     * Every retained download may reach its own [DownloadEffect.selfBound], so
+     * each resulting global concurrency is their sum. Self bounds stay on the
+     * returned downloads for an enclosing repetition boundary.
+     */
+    public fun withUnknownRepetition(): NetworkEffect {
+        val concurrency = downloads.sumOf { it.selfBound ?: return withUnknownConcurrency() }
+        return NetworkEffect(
+            downloads.mapTo(mutableSetOf()) { it.copy(concurrency = concurrency) },
+        )
+    }
 
     /** `ReqBW(Phi) = max { r * n | (r, n) in Phi }`. */
     public fun requiredBandwidthBytesPerSecond(): Rational {

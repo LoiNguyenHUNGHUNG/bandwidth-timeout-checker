@@ -55,8 +55,8 @@ internal class KotlinNetworkEffectInference(
                     function.source,
                     "Cannot establish a finite network concurrency bound for " +
                         "${function.displayName()}. Use a recognized structured " +
-                        "coroutine construct or route the download through " +
-                        "@BoundedClient(k).",
+                        "coroutine construct, or an annotated client inside " +
+                        "an unknown forEach repetition.",
                 )
             }
             function.effectContract(session)?.let { contract ->

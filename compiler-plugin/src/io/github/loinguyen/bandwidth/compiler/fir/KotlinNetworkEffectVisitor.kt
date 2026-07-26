@@ -67,6 +67,7 @@ internal class KotlinNetworkEffectVisitor(
         return KotlinFunctionEffect(
             invocation = bodyEffect.immediate,
             returned = context.returnedLatent.join(expressionResult),
+            hasUnknownRepetition = bodyEffect.hasUnknownRepetition,
         )
     }
 
@@ -199,6 +200,8 @@ internal class KotlinNetworkEffectVisitor(
         return KotlinExpressionEffect(
             immediate = alternatives.immediate.then(finallyEffect.immediate),
             latent = alternatives.latent,
+            hasUnknownRepetition =
+                alternatives.hasUnknownRepetition || finallyEffect.hasUnknownRepetition,
         )
     }
 
@@ -290,6 +293,7 @@ internal class KotlinNetworkEffectVisitor(
         return KotlinExpressionEffect(
             immediate = evaluatedInputs.then(invocation),
             latent = summary.returned,
+            hasUnknownRepetition = summary.hasUnknownRepetition,
         )
     }
 
@@ -346,10 +350,8 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     /**
-     * A launch/async outside a visible structured scope can overlap an
-     * unbounded number of future invocations (for example, UI click events).
-     * Keep its rate effect but leave n unresolved for a client bound to
-     * discharge at the final check.
+     * A launch/async body has its ordinary local effect. An enclosing forEach
+     * later recognizes the escaping builder and applies unknown repetition.
      */
     private fun inferUnstructuredCoroutineBuilder(
         call: FirFunctionCall,
@@ -366,7 +368,8 @@ internal class KotlinNetworkEffectVisitor(
         )
         return inputs.then(
             KotlinExpressionEffect(
-                immediate = child.immediate.withUnknownConcurrency(),
+                immediate = child.immediate,
+                hasUnknownRepetition = true,
             ),
         )
     }
@@ -388,12 +391,25 @@ internal class KotlinNetworkEffectVisitor(
             effect.then(
                 KotlinExpressionEffect(
                     immediate = argument.latent?.invocation ?: NetworkEffect.EMPTY,
+                    hasUnknownRepetition = argument.latent?.hasUnknownRepetition ?: false,
                 ),
             )
         }
+        val hasUnknownRepetition = invokedCallbacks.hasUnknownRepetition
+        val callbackEffect =
+            if (call.isForEach() && hasUnknownRepetition) {
+                invokedCallbacks.immediate.withUnknownRepetition()
+            } else {
+                invokedCallbacks.immediate
+            }
         return KotlinExpressionEffect(immediate = receiverEffects.immediate)
             .then(KotlinExpressionEffect(immediate = evaluatedArguments))
-            .then(invokedCallbacks)
+            .then(
+                KotlinExpressionEffect(
+                    immediate = callbackEffect,
+                    hasUnknownRepetition = hasUnknownRepetition,
+                ),
+            )
     }
 
     private fun inferCoroutineStatements(
@@ -547,6 +563,7 @@ internal class KotlinNetworkEffectVisitor(
         return KotlinExpressionEffect(
             immediate = evaluatedInputs.then(latent.invocation),
             latent = latent.returned,
+            hasUnknownRepetition = latent.hasUnknownRepetition,
         )
     }
 
@@ -574,6 +591,7 @@ internal class KotlinNetworkEffectVisitor(
                 ?: NetworkEffect.EMPTY,
             returned = returnedContract?.toLatentEffect()
                 ?: inferred?.returned,
+            hasUnknownRepetition = inferred?.hasUnknownRepetition ?: false,
         )
     }
 
@@ -721,6 +739,8 @@ internal class KotlinNetworkEffectVisitor(
             KotlinExpressionEffect(
                 immediate = effect.immediate.then(branch.immediate),
                 latent = effect.latent.join(branch.latent),
+                hasUnknownRepetition =
+                    effect.hasUnknownRepetition || branch.hasUnknownRepetition,
             )
         }
 
@@ -743,6 +763,9 @@ internal class KotlinNetworkEffectVisitor(
             .distinct()
         return bounds.singleOrNull()
     }
+
+    private fun FirFunctionCall.isForEach(): Boolean =
+        resolvedFunction()?.symbol?.callableId?.asSingleFqName()?.asString() in FOR_EACH_FQ_NAMES
 
     private companion object {
         data class StructuredChild(
@@ -768,6 +791,11 @@ internal class KotlinNetworkEffectVisitor(
             "kotlin.collections.forEachIndexed",
             "kotlin.sequences.forEach",
             "androidx.tracing.traceAsync",
+        )
+        val FOR_EACH_FQ_NAMES: Set<String> = setOf(
+            "kotlin.collections.forEach",
+            "kotlin.collections.forEachIndexed",
+            "kotlin.sequences.forEach",
         )
     }
 }

@@ -37,8 +37,8 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
-        result.assertOutputContains("ReqBW=2000 bytes/s")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 3)}")
+        result.assertOutputContains("ReqBW=3000 bytes/s")
     }
 
     @Test
@@ -66,12 +66,12 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(600, 3)}")
-        result.assertOutputContains("ReqBW=1800 bytes/s")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(600, 4)}")
+        result.assertOutputContains("ReqBW=2400 bytes/s")
     }
 
     @Test
-    fun `discharges an unstructured launch through its bounded client`() {
+    fun `keeps one unstructured launch at local concurrency`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.BoundedClient
@@ -96,13 +96,13 @@ class CompilerPluginIntegrationTest {
 
         assertEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "Inferred bandwidth effect for onDownloadClicked: {(600, 3)}",
+            "Inferred bandwidth effect for onDownloadClicked: {(600, 1)}",
         )
-        result.assertOutputContains("ReqBW=1800 bytes/s")
+        result.assertOutputContains("ReqBW=600 bytes/s")
     }
 
     @Test
-    fun `rejects an unstructured launch without a finite client bound`() {
+    fun `keeps one unbounded-client launch at local concurrency`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
@@ -120,8 +120,7 @@ class CompilerPluginIntegrationTest {
             """,
         )
 
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Cannot establish a finite network concurrency bound")
+        assertEquals(0, result.exitCode, result.output)
     }
 
     @Test
@@ -191,8 +190,8 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 5)}")
-        result.assertOutputContains("ReqBW=5000 bytes/s")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 6)}")
+        result.assertOutputContains("ReqBW=6000 bytes/s")
     }
 
     @Test

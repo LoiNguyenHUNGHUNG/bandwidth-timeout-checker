@@ -43,6 +43,7 @@ internal class CoroutinePhaseState<Handle : Any> {
         return KotlinExpressionEffect(
             immediate = result.immediate,
             latent = lastLatent,
+            hasUnknownRepetition = result.hasUnknownRepetition,
         )
     }
 

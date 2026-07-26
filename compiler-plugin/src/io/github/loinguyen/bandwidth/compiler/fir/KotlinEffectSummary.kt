@@ -16,11 +16,13 @@ import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 internal data class LatentNetworkEffect(
     val invocation: NetworkEffect,
     val returned: LatentNetworkEffect? = null,
+    val hasUnknownRepetition: Boolean = false,
 ) {
     fun join(other: LatentNetworkEffect): LatentNetworkEffect =
         LatentNetworkEffect(
             invocation = invocation.then(other.invocation),
             returned = returned.join(other.returned),
+            hasUnknownRepetition = hasUnknownRepetition || other.hasUnknownRepetition,
         )
 }
 
@@ -30,17 +32,20 @@ internal data class LatentNetworkEffect(
 internal data class KotlinExpressionEffect(
     val immediate: NetworkEffect = NetworkEffect.EMPTY,
     val latent: LatentNetworkEffect? = null,
+    val hasUnknownRepetition: Boolean = false,
 )
 
 internal fun KotlinExpressionEffect.then(other: KotlinExpressionEffect): KotlinExpressionEffect =
     KotlinExpressionEffect(
         immediate = immediate.then(other.immediate),
         latent = other.latent,
+        hasUnknownRepetition = hasUnknownRepetition || other.hasUnknownRepetition,
     )
 
 internal fun KotlinExpressionEffect.parallel(other: KotlinExpressionEffect): KotlinExpressionEffect =
     KotlinExpressionEffect(
         immediate = immediate.parallel(other.immediate),
+        hasUnknownRepetition = hasUnknownRepetition || other.hasUnknownRepetition,
     )
 
 /**
@@ -49,11 +54,13 @@ internal fun KotlinExpressionEffect.parallel(other: KotlinExpressionEffect): Kot
 internal data class KotlinFunctionEffect(
     val invocation: NetworkEffect = NetworkEffect.EMPTY,
     val returned: LatentNetworkEffect? = null,
+    val hasUnknownRepetition: Boolean = false,
 ) {
     fun asLatent(): LatentNetworkEffect =
         LatentNetworkEffect(
             invocation = invocation,
             returned = returned,
+            hasUnknownRepetition = hasUnknownRepetition,
         )
 }
 

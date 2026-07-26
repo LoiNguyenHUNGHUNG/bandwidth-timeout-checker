@@ -70,14 +70,14 @@ try {
 effect when a higher-order or library body is unavailable. Other effects are
 intended to be inferred.
 
-`@BoundedClient(k)` attaches a configured runtime bound to instances of one
-primitive download kind. A raw download begins as `(r, 1, selfBound=k)`.
-Recognized Kotlin syntax supplies a known global concurrency `n`; an unknown
-repetition boundary such as `forEach { viewModelScope.launch { ... } }` uses
-`selfBound` as its finite `n`. The checker never treats `k` as a global app
-bound: work from other clients may overlap and is composed in parallel.
-Unknown work without a client bound is rejected. The checker trusts the client
-configuration; for OkHttp, set the matching `Dispatcher.maxRequests` value.
+`@BoundedClient(k)` attaches a configured self bound to instances of one
+primitive download kind. A raw download carries `(r, n, selfBound=k)`.
+Recognized concurrency constructs compute `n` with ordinary parallel algebra.
+Only unknown `forEach` repetition uses self bounds: every retained download
+receives `n = sum(selfBound)` for the callback body, while retaining its own
+`selfBound` for an enclosing `forEach`. Unknown work outside this rule is
+rejected. The checker trusts the client configuration; for OkHttp, set the
+matching `Dispatcher.maxRequests` value.
 
 For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 `try/catch` expression, but recovery paths are still joined conservatively.

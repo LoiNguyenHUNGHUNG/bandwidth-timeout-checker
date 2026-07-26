@@ -19,13 +19,24 @@ class NetworkEffectTest {
     }
 
     @Test
-    fun `uses self bound when repetition makes concurrency unknown`() {
+    fun `uses summed self bounds for unknown repetition`() {
         val result = NetworkEffect.download(1_000, 1_000)
-            .withUnknownConcurrency()
             .withSelfBound(3)
+            .withUnknownRepetition()
 
         assertEquals(listOf(EffectPair(Rational.of(1_000), 3)), result.obligations)
         assertEquals(Rational.of(3_000), result.requiredBandwidthBytesPerSecond())
+    }
+
+    @Test
+    fun `retains self bounds for nested unknown repetition`() {
+        val body = NetworkEffect.download(1_000, 1_000)
+            .withSelfBound(2)
+            .then(NetworkEffect.download(500, 1_000).withSelfBound(3))
+
+        val result = body.withUnknownRepetition().withUnknownRepetition()
+
+        assertEquals(listOf(EffectPair(Rational.of(1_000), 5)), result.obligations)
     }
 
     @Test
