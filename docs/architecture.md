@@ -178,6 +178,10 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 - [x] Compose `async` and `launch` bodies with the remaining scope in parallel.
 - [x] Use direct `await` and `join` calls on local child handles to shorten
   conservatively inferred overlap windows.
+- [x] Treat `withContext` as a structured scope and inline
+  `awaitAll(async { ... }, ...)` as a parallel phase that completes at the call.
+- [x] Model trusted `forEach` and AndroidX `traceAsync` callbacks as sequential
+  invocation; unknown higher-order library calls still require contracts.
 - Keep aliased, reassigned, stored, or escaped child handles live until scope
   completion unless ownership can be proved.
 - Distinguish structured completion from escaped jobs.
@@ -200,6 +204,8 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 
 - Build and test version-aligned FIR adapters for Kotlin 2.3 and 2.4 while
   keeping the effect domain and annotation model shared.
+- Keep a compiler fixture matching Now in Android's
+  `withContext`/`awaitAll`/`chunked().forEach` sync structure.
 - Provide an Android/Gradle sample with OkHttp or Retrofit boundary adapters.
 - Analyze representative open-source applications.
 - Measure annotation count, unsupported constructs, precision, build overhead,

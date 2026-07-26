@@ -24,6 +24,7 @@ import org.jetbrains.kotlin.fir.expressions.FirSpreadArgumentExpression
 import org.jetbrains.kotlin.fir.expressions.FirTryExpression
 import org.jetbrains.kotlin.fir.expressions.FirTypeOperatorCall
 import org.jetbrains.kotlin.fir.expressions.FirVariableAssignment
+import org.jetbrains.kotlin.fir.expressions.FirVarargArgumentsExpression
 import org.jetbrains.kotlin.fir.expressions.FirWhenExpression
 import org.jetbrains.kotlin.fir.expressions.FirWhileLoop
 import org.jetbrains.kotlin.fir.expressions.FirWrappedArgumentExpression
@@ -239,8 +240,14 @@ internal class KotlinNetworkEffectVisitor(
         val target: FirFunction =
             (call.resolvedSymbol() as? FirFunctionSymbol<*>)?.fir
                 ?: return inferChildren(call, context)
-        if (target.isCoroutineScope()) {
-            return inferCoroutineScope(call, context)
+        if (target.isStructuredCoroutineScope()) {
+            return inferStructuredCoroutineScope(call, context)
+        }
+        if (target.isAwaitAll()) {
+            return inferInlineAwaitAll(call, context)
+        }
+        if (target.isSequentialCallbackFunction()) {
+            return inferSequentialCallbackCall(call, context)
         }
         val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
         fun effectOf(expression: FirExpression): KotlinExpressionEffect =
@@ -285,22 +292,77 @@ internal class KotlinNetworkEffectVisitor(
      * A coroutine scope is split into sequential phases. launch/async children
      * overlap each phase until a direct join/await on their local handle.
      */
-    private fun inferCoroutineScope(
+    private fun inferStructuredCoroutineScope(
         call: FirFunctionCall,
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
-        val body = call.visibleLambdaArgument()?.anonymousFunction?.body
+        val lambda = call.visibleLambdaArgument()
+        val body = lambda?.anonymousFunction?.body
         if (body == null) {
             problem(
                 key = "coroutine-scope:${context.function.displayName()}:" +
                     "${call.source?.startOffset}",
                 source = call.source ?: context.function.source,
-                message = "Cannot infer coroutineScope with a non-visible block. " +
+                message = "Cannot infer structured coroutine scope with a non-visible block. " +
                     "Keep the structured coroutine lambda visible.",
             )
             return KotlinExpressionEffect()
         }
-        return inferCoroutineStatements(body, context)
+        val evaluatedInputs = sequence(
+            call.receiverExpressions().map { infer(it, context) } +
+                call.argumentList.arguments
+                    .filter { it.visibleLambda() !== lambda }
+                    .map { infer(it, context) },
+        )
+        return thenValue(evaluatedInputs, inferCoroutineStatements(body, context))
+    }
+
+    private fun inferInlineAwaitAll(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val arguments = call.argumentList.arguments.flatMap { it.flattenVarargArguments() }
+        val children = arguments.mapNotNull { it.structuredChild() }
+        if (children.size != arguments.size) {
+            problem(
+                key = "await-all:${context.function.displayName()}:" +
+                    "${call.source?.startOffset}",
+                source = call.source ?: context.function.source,
+                message = "Cannot infer awaitAll unless every argument is a visible inline " +
+                    "async child. Store-and-await handles require separate synchronization.",
+            )
+            return KotlinExpressionEffect()
+        }
+        val parallelChildren = children.fold(NetworkEffect.EMPTY) { effect, child ->
+            effect.parallel(inferCoroutineChild(child.lambda, context))
+        }
+        val receivers = inferReceivers(call, context)
+        return KotlinExpressionEffect(
+            immediate = receivers.immediate.then(parallelChildren),
+        )
+    }
+
+    private fun inferSequentialCallbackCall(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        fun effectOf(expression: FirExpression): KotlinExpressionEffect =
+            cachedEffects.getOrPut(expression) { infer(expression, context) }
+
+        val receiverEffects = sequence(call.receiverExpressions().map(::effectOf))
+        val argumentEffects = call.argumentList.arguments.map(::effectOf)
+        val evaluatedArguments = argumentEffects.fold(NetworkEffect.EMPTY) { effect, argument ->
+            effect.then(argument.immediate)
+        }
+        val invokedCallbacks = argumentEffects.fold(NetworkEffect.EMPTY) { effect, argument ->
+            effect.then(argument.latent?.invocation ?: NetworkEffect.EMPTY)
+        }
+        return KotlinExpressionEffect(
+            immediate = receiverEffects.immediate
+                .then(evaluatedArguments)
+                .then(invokedCallbacks),
+        )
     }
 
     private fun inferCoroutineStatements(
@@ -396,17 +458,30 @@ internal class KotlinNetworkEffectVisitor(
         }
     }
 
+    private fun FirExpression.flattenVarargArguments(): List<FirExpression> =
+        if (this is FirVarargArgumentsExpression) {
+            arguments.flatMap { it.flattenVarargArguments() }
+        } else {
+            listOf(this)
+        }
+
     private fun FirFunctionCall.resolvedFunction(): FirFunction? =
         (resolvedSymbol() as? FirFunctionSymbol<*>)?.fir
 
-    private fun FirFunction.isCoroutineScope(): Boolean =
-        symbol.callableId.asSingleFqName().asString() == COROUTINE_SCOPE_FQ_NAME
+    private fun FirFunction.isStructuredCoroutineScope(): Boolean =
+        symbol.callableId.asSingleFqName().asString() in STRUCTURED_COROUTINE_SCOPE_FQ_NAMES
 
     private fun FirFunction.isCoroutineBuilder(): Boolean =
         symbol.callableId.asSingleFqName().asString() in COROUTINE_BUILDER_FQ_NAMES
 
     private fun FirFunction.isCoroutineWait(): Boolean =
         symbol.callableId.asSingleFqName().asString() in COROUTINE_WAIT_FQ_NAMES
+
+    private fun FirFunction.isAwaitAll(): Boolean =
+        symbol.callableId.asSingleFqName().asString() == AWAIT_ALL_FQ_NAME
+
+    private fun FirFunction.isSequentialCallbackFunction(): Boolean =
+        symbol.callableId.asSingleFqName().asString() in SEQUENTIAL_CALLBACK_FQ_NAMES
 
     private fun inferFunctionInvocation(
         call: FirImplicitInvokeCall,
@@ -646,7 +721,10 @@ internal class KotlinNetworkEffectVisitor(
             val lambda: FirAnonymousFunctionExpression,
         )
 
-        const val COROUTINE_SCOPE_FQ_NAME: String = "kotlinx.coroutines.coroutineScope"
+        val STRUCTURED_COROUTINE_SCOPE_FQ_NAMES: Set<String> = setOf(
+            "kotlinx.coroutines.coroutineScope",
+            "kotlinx.coroutines.withContext",
+        )
         val COROUTINE_BUILDER_FQ_NAMES: Set<String> = setOf(
             "kotlinx.coroutines.launch",
             "kotlinx.coroutines.async",
@@ -654,6 +732,13 @@ internal class KotlinNetworkEffectVisitor(
         val COROUTINE_WAIT_FQ_NAMES: Set<String> = setOf(
             "kotlinx.coroutines.Job.join",
             "kotlinx.coroutines.Deferred.await",
+        )
+        const val AWAIT_ALL_FQ_NAME: String = "kotlinx.coroutines.awaitAll"
+        val SEQUENTIAL_CALLBACK_FQ_NAMES: Set<String> = setOf(
+            "kotlin.collections.forEach",
+            "kotlin.collections.forEachIndexed",
+            "kotlin.sequences.forEach",
+            "androidx.tracing.traceAsync",
         )
     }
 }
