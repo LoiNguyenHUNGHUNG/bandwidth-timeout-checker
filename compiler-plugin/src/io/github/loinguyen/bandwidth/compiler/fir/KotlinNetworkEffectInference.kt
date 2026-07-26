@@ -61,6 +61,17 @@ internal class KotlinNetworkEffectInference(
                     )
                 }
             }
+            function.overriddenEffectContracts(session, context).forEach { contract ->
+                val declaredEffect: NetworkEffect = contract.toNetworkEffect()
+                if (!inferredEffect.isCoveredBy(declaredEffect)) {
+                    error(
+                        function.source,
+                        "Inferred override effect ${inferredEffect.render()} is not covered by " +
+                            "the overridden @BandwidthEffect(rMaxBytesPerSecond=" +
+                            "${contract.rMaxBytesPerSecond}, nMax=${contract.nMax}).",
+                    )
+                }
+            }
             function.returnTypeRef.effectContract(session)?.let { contract ->
                 val inferredLatent: NetworkEffect =
                     inferred.returned?.invocation ?: NetworkEffect.EMPTY
