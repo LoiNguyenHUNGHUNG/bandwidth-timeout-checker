@@ -11,6 +11,118 @@ import kotlin.test.assertNotEquals
 
 class CompilerPluginIntegrationTest {
     @Test
+    fun `caps parallel downloads through a bounded client`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @BoundedClient(k = 2)
+            val client = NetworkClient()
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            suspend fun load() = coroutineScope {
+                launch { client.download() }
+                launch { client.download() }
+                launch { client.download() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
+        result.assertOutputContains("ReqBW=2000 bytes/s")
+    }
+
+    @Test
+    fun `uses a bounded client parameter as a client type contract`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            suspend fun load(@BoundedClient(k = 3) client: NetworkClient) = coroutineScope {
+                launch { client.download() }
+                launch { client.download() }
+                launch { client.download() }
+                launch { client.download() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(600, 3)}")
+        result.assertOutputContains("ReqBW=1800 bytes/s")
+    }
+
+    @Test
+    fun `does not cap mixed bounded and unbounded downloads`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.async
+
+            class NetworkClient
+
+            @BoundedClient(k = 1)
+            val client = NetworkClient()
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.boundedDownload() = Unit
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun unboundedDownload() = Unit
+
+            suspend fun load() = coroutineScope {
+                val bounded = async { client.boundedDownload() }
+                val unbounded = async { unboundedDownload() }
+                bounded.await()
+                unbounded.await()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
+        result.assertOutputContains("ReqBW=2000 bytes/s")
+    }
+
+    @Test
+    fun `rejects a non-positive bounded client limit`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+
+            class NetworkClient
+
+            @BoundedClient(k = 0)
+            val client = NetworkClient()
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("@BoundedClient k must be a positive constant")
+    }
+
+    @Test
     fun `infers sequential and branch effects under a function contract`() {
         val result = compile(
             """

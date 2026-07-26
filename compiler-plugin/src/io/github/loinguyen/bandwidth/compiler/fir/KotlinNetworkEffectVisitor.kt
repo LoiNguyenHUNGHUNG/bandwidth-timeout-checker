@@ -285,6 +285,7 @@ internal class KotlinNetworkEffectVisitor(
         return KotlinExpressionEffect(
             immediate = evaluatedInputs.then(summary.invocation),
             latent = summary.returned,
+            boundedClientK = call.boundedClientK(target),
         )
     }
 
@@ -333,13 +334,11 @@ internal class KotlinNetworkEffectVisitor(
             )
             return KotlinExpressionEffect()
         }
-        val parallelChildren = children.fold(NetworkEffect.EMPTY) { effect, child ->
+        val parallelChildren = children.fold(KotlinExpressionEffect()) { effect, child ->
             effect.parallel(inferCoroutineChild(child.lambda, context))
         }
         val receivers = inferReceivers(call, context)
-        return KotlinExpressionEffect(
-            immediate = receivers.immediate.then(parallelChildren),
-        )
+        return receivers.then(parallelChildren)
     }
 
     private fun inferSequentialCallbackCall(
@@ -355,14 +354,16 @@ internal class KotlinNetworkEffectVisitor(
         val evaluatedArguments = argumentEffects.fold(NetworkEffect.EMPTY) { effect, argument ->
             effect.then(argument.immediate)
         }
-        val invokedCallbacks = argumentEffects.fold(NetworkEffect.EMPTY) { effect, argument ->
-            effect.then(argument.latent?.invocation ?: NetworkEffect.EMPTY)
+        val invokedCallbacks = argumentEffects.fold(KotlinExpressionEffect()) { effect, argument ->
+            effect.then(
+                KotlinExpressionEffect(
+                    immediate = argument.latent?.invocation ?: NetworkEffect.EMPTY,
+                ),
+            )
         }
-        return KotlinExpressionEffect(
-            immediate = receiverEffects.immediate
-                .then(evaluatedArguments)
-                .then(invokedCallbacks),
-        )
+        return KotlinExpressionEffect(immediate = receiverEffects.immediate)
+            .then(KotlinExpressionEffect(immediate = evaluatedArguments))
+            .then(invokedCallbacks)
     }
 
     private fun inferCoroutineStatements(
@@ -395,11 +396,12 @@ internal class KotlinNetworkEffectVisitor(
     private fun inferCoroutineChild(
         lambda: FirAnonymousFunctionExpression,
         context: KotlinEffectContext,
-    ): NetworkEffect {
+    ): KotlinExpressionEffect {
         val body = lambda.anonymousFunction.body
-        return body?.let { inferCoroutineStatements(it, context).immediate }
-            ?: infer(lambda, context).latent?.invocation
-            ?: NetworkEffect.EMPTY
+        return body?.let { inferCoroutineStatements(it, context) }
+            ?: KotlinExpressionEffect(
+                immediate = infer(lambda, context).latent?.invocation ?: NetworkEffect.EMPTY,
+            )
     }
 
     private fun FirElement.structuredChild(): StructuredChild? {
@@ -551,6 +553,10 @@ internal class KotlinNetworkEffectVisitor(
         argumentEffects: Map<FirValueParameter, KotlinExpressionEffect>,
         context: KotlinEffectContext,
     ) {
+        // launch/async are handled by structured coroutine rules, including
+        // their visible lambda bodies. They are not ordinary library callback
+        // contracts.
+        if (target.isCoroutineBuilder()) return
         target.valueParameters.forEach { parameter ->
             if (!parameter.returnTypeRef.coneType.isSomeFunctionType(session)) {
                 return@forEach
@@ -637,11 +643,7 @@ internal class KotlinNetworkEffectVisitor(
                 override fun visitFunction(function: FirFunction) = Unit
             },
         )
-        return KotlinExpressionEffect(
-            immediate = children.fold(NetworkEffect.EMPTY) { effect, child ->
-                effect.then(child.immediate)
-            },
-        )
+        return sequence(children)
     }
 
     private fun inferReceivers(
@@ -689,31 +691,33 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     private fun sequence(effects: List<KotlinExpressionEffect>): KotlinExpressionEffect =
-        KotlinExpressionEffect(
-            immediate = effects.fold(NetworkEffect.EMPTY) { effect, next ->
-                effect.then(next.immediate)
-            },
-            latent = effects.lastOrNull()?.latent,
-        )
+        effects.fold(KotlinExpressionEffect()) { effect, next -> effect.then(next) }
 
     private fun choice(effects: List<KotlinExpressionEffect>): KotlinExpressionEffect =
-        KotlinExpressionEffect(
-            immediate = effects.fold(NetworkEffect.EMPTY) { effect, branch ->
-                effect.then(branch.immediate)
-            },
-            latent = effects.fold(null as LatentNetworkEffect?) { latent, branch ->
-                latent.join(branch.latent)
-            },
-        )
+        effects.fold(KotlinExpressionEffect()) { effect, branch ->
+            KotlinExpressionEffect(
+                immediate = effect.immediate.then(branch.immediate),
+                latent = effect.latent.join(branch.latent),
+                boundedClientK = effect.then(branch).boundedClientK,
+            )
+        }
 
     private fun thenValue(
         first: KotlinExpressionEffect,
         second: KotlinExpressionEffect,
-    ): KotlinExpressionEffect =
-        KotlinExpressionEffect(
-            immediate = first.immediate.then(second.immediate),
-            latent = second.latent,
-        )
+    ): KotlinExpressionEffect = first.then(second)
+
+    private fun FirFunctionCall.boundedClientK(target: FirFunction): Int? {
+        if (target.downloadContract(session) == null) return null
+        val bounds = receiverExpressions()
+            .mapNotNull { receiver ->
+                val declaration = receiver.resolvedSymbol()?.fir
+                    as? org.jetbrains.kotlin.fir.FirAnnotationContainer
+                declaration?.boundedClientContract(session)?.k
+            }
+            .distinct()
+        return bounds.singleOrNull()
+    }
 
     private companion object {
         data class StructuredChild(

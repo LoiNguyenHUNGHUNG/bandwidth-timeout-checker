@@ -48,3 +48,18 @@ public annotation class BandwidthAlternative
 public annotation class BoundedScope(
     public val k: Int,
 )
+
+/**
+ * Declares the maximum number of network requests a client can execute at
+ * once. The application must configure the underlying client to enforce this
+ * bound (for example, with an OkHttp Dispatcher).
+ */
+@Target(
+    AnnotationTarget.PROPERTY,
+    AnnotationTarget.FIELD,
+    AnnotationTarget.VALUE_PARAMETER,
+)
+@Retention(AnnotationRetention.BINARY)
+public annotation class BoundedClient(
+    public val k: Int,
+)

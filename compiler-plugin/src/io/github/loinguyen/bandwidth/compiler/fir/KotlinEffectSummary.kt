@@ -30,7 +30,40 @@ internal data class LatentNetworkEffect(
 internal data class KotlinExpressionEffect(
     val immediate: NetworkEffect = NetworkEffect.EMPTY,
     val latent: LatentNetworkEffect? = null,
+    /**
+     * A client cap carried while every non-empty immediate effect in this
+     * expression uses that same client. The cap is erased once work from an
+     * unbounded or differently bounded client is combined.
+     */
+    val boundedClientK: Int? = null,
 )
+
+internal fun KotlinExpressionEffect.then(other: KotlinExpressionEffect): KotlinExpressionEffect =
+    combineImmediate(other, NetworkEffect::then, other.latent)
+
+internal fun KotlinExpressionEffect.parallel(other: KotlinExpressionEffect): KotlinExpressionEffect =
+    combineImmediate(other, NetworkEffect::parallel)
+
+private fun KotlinExpressionEffect.combineImmediate(
+    other: KotlinExpressionEffect,
+    compose: (NetworkEffect, NetworkEffect) -> NetworkEffect,
+    latent: LatentNetworkEffect? = null,
+): KotlinExpressionEffect {
+    val combined = compose(immediate, other.immediate)
+    val bound = compatibleBound(other)
+    return KotlinExpressionEffect(
+        immediate = bound?.let(combined::capConcurrency) ?: combined,
+        latent = latent,
+        boundedClientK = bound,
+    )
+}
+
+private fun KotlinExpressionEffect.compatibleBound(other: KotlinExpressionEffect): Int? = when {
+    immediate == NetworkEffect.EMPTY -> other.boundedClientK
+    other.immediate == NetworkEffect.EMPTY -> boundedClientK
+    boundedClientK != null && boundedClientK == other.boundedClientK -> boundedClientK
+    else -> null
+}
 
 /**
  * Interprocedural summary keyed by the FIR function symbol.

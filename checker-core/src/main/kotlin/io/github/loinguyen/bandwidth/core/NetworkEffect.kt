@@ -74,6 +74,22 @@ public class NetworkEffect private constructor(
     }
 
     /**
+     * Applies a runtime client limit to every request represented by this
+     * effect. Used only while all non-empty work in an expression is known to
+     * use the same bounded client.
+     */
+    public fun capConcurrency(maxConcurrentRequests: Int): NetworkEffect {
+        require(maxConcurrentRequests >= 0) {
+            "maximum concurrent requests must be non-negative"
+        }
+        return of(
+            pairs.map { pair ->
+                pair.copy(concurrency = minOf(pair.concurrency, maxConcurrentRequests))
+            },
+        )
+    }
+
+    /**
      * `ReqBW(Phi) = max { r * n | (r, n) in Phi }`.
      */
     public fun requiredBandwidthBytesPerSecond(): Rational =
