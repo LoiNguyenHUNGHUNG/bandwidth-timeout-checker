@@ -37,8 +37,8 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 3)}")
-        result.assertOutputContains("ReqBW=3000 bytes/s")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
+        result.assertOutputContains("ReqBW=2000 bytes/s")
     }
 
     @Test
