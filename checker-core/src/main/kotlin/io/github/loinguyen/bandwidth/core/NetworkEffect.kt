@@ -3,72 +3,86 @@ package io.github.loinguyen.bandwidth.core
 import java.math.BigInteger
 
 /**
- * One primitive download effect `(r, n?, selfBound?)`.
+ * One primitive download effect `(r, n, selfBound?)`.
  *
- * [concurrency] is known only after Kotlin syntax establishes it. [selfBound] is a
+ * [concurrency] is always established by the effect rules. [selfBound] is a
  * trusted bound for instances of this download kind. It is retained when an
  * enclosing unknown-repetition construct recalculates [concurrency].
  */
 public data class DownloadEffect(
     public val requiredRateBytesPerSecond: Rational,
-    public val concurrency: Int?,
+    public val concurrency: Int,
     public val selfBound: Int? = null,
 ) {
     init {
         require(requiredRateBytesPerSecond >= Rational.ZERO) {
             "required rate must be non-negative"
         }
-        require(concurrency == null || concurrency >= 0) {
+        require(concurrency >= 0) {
             "concurrency must be non-negative"
         }
         require(selfBound == null || selfBound > 0) { "selfBound must be positive" }
     }
 
     internal fun dominates(other: DownloadEffect): Boolean {
-        val thisConcurrency = concurrency ?: return false
-        val otherConcurrency = other.concurrency ?: return false
         return requiredRateBytesPerSecond >= other.requiredRateBytesPerSecond &&
-            thisConcurrency >= otherConcurrency &&
-            this != other
+            concurrency >= other.concurrency &&
+            (requiredRateBytesPerSecond > other.requiredRateBytesPerSecond ||
+                concurrency > other.concurrency)
     }
-}
 
-/** A finite set of primitive download effects. */
-public class NetworkEffect private constructor(
-    private val downloads: Set<DownloadEffect>,
-) {
-    /** Final downloads. Every returned value has a non-null [DownloadEffect.concurrency]. */
-    public val obligations: List<DownloadEffect>
-        get() = normalize(downloads.filterTo(mutableSetOf()) { it.concurrency != null }).sortedWith(
-            compareByDescending<DownloadEffect> { it.requiredRateBytesPerSecond }
-                .thenByDescending { requireNotNull(it.concurrency) },
+    internal fun hasSameRateAndConcurrency(other: DownloadEffect): Boolean =
+        requiredRateBytesPerSecond == other.requiredRateBytesPerSecond &&
+            concurrency == other.concurrency
+
+    internal fun mergeSelfBound(other: DownloadEffect): DownloadEffect =
+        copy(
+            selfBound = when {
+                selfBound == null || other.selfBound == null -> null
+                else -> selfBound + other.selfBound
+            },
         )
 
-    /** True when program syntax has not established `n`. */
-    public val hasUnresolvedConcurrency: Boolean
-        get() = downloads.any { it.concurrency == null }
+    internal fun mergeEquivalentSelfBound(other: DownloadEffect): DownloadEffect =
+        copy(
+            selfBound = when {
+                selfBound == null || other.selfBound == null -> null
+                selfBound == other.selfBound -> selfBound
+                else -> selfBound + other.selfBound
+            },
+        )
+}
+
+/** A normalized finite set of primitive download effects. */
+public class NetworkEffect private constructor(
+    private val downloads: List<DownloadEffect>,
+) {
+    /** Final downloads. */
+    public val obligations: List<DownloadEffect>
+        get() = downloads.sortedWith(
+            compareByDescending<DownloadEffect> { it.requiredRateBytesPerSecond }
+                .thenByDescending { it.concurrency },
+        )
+
+    /** True when this effect can cross an unknown repetition boundary. */
+    public val hasSelfBoundForEveryDownload: Boolean
+        get() = downloads.all { it.selfBound != null }
 
     public val maxConcurrency: Int
-        get() = obligations.maxOfOrNull { requireNotNull(it.concurrency) } ?: 0
-
-    private val rawMaxConcurrency: Int
-        get() = downloads.maxOfOrNull { it.concurrency ?: Int.MAX_VALUE } ?: 0
-
-    private val hasUnknownConcurrency: Boolean
-        get() = downloads.any { it.concurrency == null }
+        get() = downloads.maxOfOrNull { it.concurrency } ?: 0
 
     /** Sequential join: `Norm(Phi1 union Phi2)`. */
     public fun then(other: NetworkEffect): NetworkEffect =
-        NetworkEffect(downloads + other.downloads)
+        of(downloads + other.downloads)
 
     /** Parallel composition from Table 2 of the paper. */
     public fun parallel(other: NetworkEffect): NetworkEffect {
-        val leftShift: Int = other.rawMaxConcurrency
-        val rightShift: Int = rawMaxConcurrency
-        return NetworkEffect(
-            downloads.mapTo(mutableSetOf()) { download ->
+        val leftShift: Int = other.maxConcurrency
+        val rightShift: Int = maxConcurrency
+        return of(
+            downloads.map { download ->
                 download.concurrentWith(other, leftShift)
-            } + other.downloads.mapTo(mutableSetOf()) { download ->
+            } + other.downloads.map { download ->
                 download.concurrentWith(this, rightShift)
             },
         )
@@ -85,12 +99,8 @@ public class NetworkEffect private constructor(
     /** Attaches a trusted runtime bound to primitive requests in this effect. */
     public fun withSelfBound(selfBound: Int): NetworkEffect {
         require(selfBound > 0) { "selfBound must be positive" }
-        return NetworkEffect(downloads.mapTo(mutableSetOf()) { it.copy(selfBound = selfBound) })
+        return of(downloads.map { it.copy(selfBound = selfBound) })
     }
-
-    /** Marks a repetition boundary whose concurrency syntax cannot establish. */
-    public fun withUnknownConcurrency(): NetworkEffect =
-        NetworkEffect(downloads.mapTo(mutableSetOf()) { it.copy(concurrency = null) })
 
     /**
      * Summarizes an unknown number of overlapping copies of this body.
@@ -100,29 +110,27 @@ public class NetworkEffect private constructor(
      * returned downloads for an enclosing repetition boundary.
      */
     public fun withUnknownRepetition(): NetworkEffect {
-        val concurrency = downloads.sumOf { it.selfBound ?: return withUnknownConcurrency() }
-        return NetworkEffect(
-            downloads.mapTo(mutableSetOf()) { it.copy(concurrency = concurrency) },
-        )
+        require(hasSelfBoundForEveryDownload) {
+            "unknown repetition requires a self bound for every download"
+        }
+        val concurrency = downloads.sumOf { requireNotNull(it.selfBound) }
+        return of(downloads.map { it.copy(concurrency = concurrency) })
     }
 
     /** `ReqBW(Phi) = max { r * n | (r, n) in Phi }`. */
     public fun requiredBandwidthBytesPerSecond(): Rational {
-        require(!hasUnresolvedConcurrency) {
-            "cannot compute required bandwidth with unresolved concurrency"
-        }
         return obligations.maxOfOrNull {
-            it.requiredRateBytesPerSecond * requireNotNull(it.concurrency)
+            it.requiredRateBytesPerSecond * it.concurrency
         }
             ?: Rational.ZERO
     }
 
     /** True when [other] is a safe over-approximation of this effect. */
     public fun isCoveredBy(other: NetworkEffect): Boolean =
-        !hasUnresolvedConcurrency && !other.hasUnresolvedConcurrency && obligations.all { pair ->
+        obligations.all { pair ->
             other.obligations.any {
                 it.requiredRateBytesPerSecond >= pair.requiredRateBytesPerSecond &&
-                    requireNotNull(it.concurrency) >= requireNotNull(pair.concurrency)
+                    it.concurrency >= pair.concurrency
             }
         }
 
@@ -134,10 +142,10 @@ public class NetworkEffect private constructor(
     public override fun toString(): String = obligations.joinToString(prefix = "{", postfix = "}")
 
     public companion object {
-        public val EMPTY: NetworkEffect = NetworkEffect(emptySet())
+        public val EMPTY: NetworkEffect = NetworkEffect(emptyList())
 
         public fun of(downloads: Collection<DownloadEffect>): NetworkEffect =
-            NetworkEffect(downloads.toSet())
+            NetworkEffect(normalize(downloads))
 
         public fun download(maxBytes: Long, completeTimeoutMillis: Long): NetworkEffect {
             require(maxBytes >= 0) { "maximum transfer size must be non-negative" }
@@ -146,7 +154,7 @@ public class NetworkEffect private constructor(
                 maxBytes.toBigInteger() * BigInteger.valueOf(1_000),
                 completeTimeoutMillis.toBigInteger(),
             )
-            return NetworkEffect(setOf(DownloadEffect(rate, concurrency = 1)))
+            return of(listOf(DownloadEffect(rate, concurrency = 1)))
         }
 
         public fun summary(rMaxBytesPerSecond: Long, nMax: Int): NetworkEffect {
@@ -157,19 +165,37 @@ public class NetworkEffect private constructor(
             )
         }
 
-        private fun normalize(downloads: Set<DownloadEffect>): Set<DownloadEffect> =
-            downloads.filterNotTo(mutableSetOf()) { download ->
-                downloads.any { candidate -> candidate.dominates(download) }
+        private fun normalize(downloads: Collection<DownloadEffect>): List<DownloadEffect> {
+            val normalized = mutableListOf<DownloadEffect>()
+            downloads.forEach { download ->
+                var merged = download
+                var index = 0
+                while (index < normalized.size) {
+                    val candidate = normalized[index]
+                    when {
+                        candidate.hasSameRateAndConcurrency(merged) -> {
+                            normalized[index] = candidate.mergeEquivalentSelfBound(merged)
+                            return@forEach
+                        }
+                        candidate.dominates(merged) -> {
+                            normalized[index] = candidate.mergeSelfBound(merged)
+                            return@forEach
+                        }
+                        merged.dominates(candidate) -> {
+                            merged = merged.mergeSelfBound(candidate)
+                            normalized.removeAt(index)
+                        }
+                        else -> index++
+                    }
+                }
+                normalized += merged
             }
+            return normalized
+        }
     }
 
     private fun DownloadEffect.concurrentWith(
         other: NetworkEffect,
         concurrencyShift: Int,
-    ): DownloadEffect =
-        if (concurrency == null || other.hasUnknownConcurrency) {
-            copy(concurrency = null)
-        } else {
-            copy(concurrency = concurrency + concurrencyShift)
-        }
+    ): DownloadEffect = copy(concurrency = concurrency + concurrencyShift)
 }

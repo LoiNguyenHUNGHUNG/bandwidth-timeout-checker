@@ -398,7 +398,18 @@ internal class KotlinNetworkEffectVisitor(
         val hasUnknownRepetition = invokedCallbacks.hasUnknownRepetition
         val callbackEffect =
             if (call.isForEach() && hasUnknownRepetition) {
-                invokedCallbacks.immediate.withUnknownRepetition()
+                if (invokedCallbacks.immediate.hasSelfBoundForEveryDownload) {
+                    invokedCallbacks.immediate.withUnknownRepetition()
+                } else {
+                    problem(
+                        key = "unknown-for-each-self-bound:${context.function.displayName()}:" +
+                            call.source?.startOffset,
+                        source = call.source ?: context.function.source,
+                        message = "Unknown forEach repetition contains network work without " +
+                            "a self bound. Use an annotated client for every launched download.",
+                    )
+                    NetworkEffect.EMPTY
+                }
             } else {
                 invokedCallbacks.immediate
             }
@@ -665,9 +676,14 @@ internal class KotlinNetworkEffectVisitor(
                 infer(loop.block, context),
             ),
         )
-        return KotlinExpressionEffect(
-            immediate = oneIteration.immediate.withUnknownConcurrency(),
+        if (oneIteration.immediate == NetworkEffect.EMPTY) return oneIteration
+        problem(
+            key = "unbounded-loop:${context.function.displayName()}:${loop.source?.startOffset}",
+            source = loop.source ?: context.function.source,
+            message = "Cannot infer network work in a general loop. Use a supported bounded " +
+                "collection operation or add a loop-bound rule.",
         )
+        return KotlinExpressionEffect()
     }
 
     private fun inferChildren(

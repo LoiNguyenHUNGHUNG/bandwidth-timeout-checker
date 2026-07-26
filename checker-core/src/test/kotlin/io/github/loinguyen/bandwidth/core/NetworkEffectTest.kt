@@ -2,6 +2,7 @@ package io.github.loinguyen.bandwidth.core
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class NetworkEffectTest {
@@ -36,15 +37,14 @@ class NetworkEffectTest {
 
         val result = body.withUnknownRepetition().withUnknownRepetition()
 
-        assertEquals(listOf(DownloadEffect(Rational.of(1_000), 5, selfBound = 2)), result.obligations)
+        assertEquals(listOf(DownloadEffect(Rational.of(1_000), 5, selfBound = 5)), result.obligations)
     }
 
     @Test
-    fun `keeps unknown concurrency unresolved without a self bound`() {
-        val result = NetworkEffect.download(1_000, 1_000)
-            .withUnknownConcurrency()
-
-        assertTrue(result.hasUnresolvedConcurrency)
+    fun `rejects unknown repetition without a self bound`() {
+        assertFailsWith<IllegalArgumentException> {
+            NetworkEffect.download(1_000, 1_000).withUnknownRepetition()
+        }
     }
 
     @Test
@@ -128,5 +128,20 @@ class NetworkEffectTest {
 
         assertEquals(listOf(DownloadEffect(Rational.of(6), 15)), result.obligations)
         assertTrue(NetworkEffect.summary(1, 1).isCoveredBy(result))
+    }
+
+    @Test
+    fun `normalization accumulates self bounds of dominated effects`() {
+        val result = NetworkEffect.of(
+            listOf(
+                DownloadEffect(Rational.of(6), 2, selfBound = 3),
+                DownloadEffect(Rational.of(1), 1, selfBound = 2),
+            ),
+        )
+
+        assertEquals(
+            listOf(DownloadEffect(Rational.of(6), 2, selfBound = 5)),
+            result.obligations,
+        )
     }
 }
