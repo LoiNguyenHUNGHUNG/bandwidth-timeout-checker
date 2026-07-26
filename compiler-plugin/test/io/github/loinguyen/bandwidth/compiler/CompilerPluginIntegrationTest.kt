@@ -11,7 +11,7 @@ import kotlin.test.assertNotEquals
 
 class CompilerPluginIntegrationTest {
     @Test
-    fun `caps parallel downloads through a bounded client`() {
+    fun `keeps inferred structured concurrency with a bounded client`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.BoundedClient
@@ -37,8 +37,8 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
-        result.assertOutputContains("ReqBW=2000 bytes/s")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 3)}")
+        result.assertOutputContains("ReqBW=3000 bytes/s")
     }
 
     @Test
@@ -125,6 +125,40 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `uses self bound for forEach launches in a view model scope`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download(url: String) = Unit
+
+            fun loadImages(
+                urls: List<String>,
+                viewModelScope: CoroutineScope,
+                @BoundedClient(k = 4) imageClient: NetworkClient,
+            ) {
+                urls.forEach { url ->
+                    viewModelScope.launch { imageClient.download(url) }
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for loadImages: {(900, 4)}",
+        )
+        result.assertOutputContains("ReqBW=3600 bytes/s")
+    }
+
+    @Test
     fun `adds independent bounded clients inside one coroutine scope`() {
         val result = compile(
             """
@@ -157,8 +191,8 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 4)}")
-        result.assertOutputContains("ReqBW=4000 bytes/s")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 5)}")
+        result.assertOutputContains("ReqBW=5000 bytes/s")
     }
 
     @Test

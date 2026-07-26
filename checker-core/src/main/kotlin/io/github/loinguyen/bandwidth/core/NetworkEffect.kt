@@ -2,12 +2,7 @@ package io.github.loinguyen.bandwidth.core
 
 import java.math.BigInteger
 
-/**
- * A rate/concurrency obligation `(r, n)` from the paper.
- *
- * [requiredRateBytesPerSecond] is the minimum service rate of one download and
- * [concurrency] is the maximum total number of downloads active with it.
- */
+/** A discharged rate/concurrency obligation `(r, n)` from the paper. */
 public data class EffectPair(
     public val requiredRateBytesPerSecond: Rational,
     public val concurrency: Int,
@@ -26,126 +21,91 @@ public data class EffectPair(
 }
 
 /**
- * A runtime network scheduler. [id] preserves sharing while effects compose;
- * it is intentionally absent from the discharged public obligation.
+ * One primitive download instance before final concurrency discharge.
+ *
+ * [concurrency] is known only after Kotlin syntax establishes it. [selfBound] is a
+ * trusted runtime-client bound for instances of this download kind, used when repetition makes [concurrency]
+ * unknown. It is deliberately not a client identity: distinct clients may
+ * overlap, so a known global concurrency must never be reduced by this value.
  */
-public data class NetworkPool(
-    public val id: String,
-    public val maxConcurrentRequests: Int,
+public data class DownloadEffect(
+    public val requiredRateBytesPerSecond: Rational,
+    public val concurrency: Int?,
+    public val selfBound: Int? = null,
 ) {
     init {
-        require(id.isNotBlank()) { "network pool id must not be blank" }
-        require(maxConcurrentRequests > 0) {
-            "network pool limit must be positive"
+        require(requiredRateBytesPerSecond >= Rational.ZERO) {
+            "required rate must be non-negative"
         }
+        require(concurrency == null || concurrency >= 0) {
+            "concurrency must be non-negative"
+        }
+        require(selfBound == null || selfBound > 0) { "selfBound must be positive" }
     }
+
+    internal fun discharged(): EffectPair? =
+        (concurrency ?: selfBound)?.let { EffectPair(requiredRateBytesPerSecond, it) }
 }
 
-private data class TrackedEffectPair(
-    val pair: EffectPair,
-    /** Null means syntax did not establish a finite concurrency bound. */
-    val inferredConcurrency: Int? = pair.concurrency,
-    val pools: Set<NetworkPool> = emptySet(),
-) {
-    fun discharged(): EffectPair? {
-        val capacity = pools.sumOf(NetworkPool::maxConcurrentRequests)
-        val concurrency = when (val inferred = inferredConcurrency) {
-            null -> capacity.takeIf { it > 0 }
-            else -> if (capacity == 0) inferred else minOf(inferred, capacity)
-        }
-        return concurrency?.let { pair.copy(concurrency = it) }
-    }
-}
-
-/**
- * A finite set of raw rate/concurrency obligations. Public obligations are
- * Pareto-normalized after runtime network-pool capacities are discharged.
- */
+/** A finite set of primitive download effects. */
 public class NetworkEffect private constructor(
-    private val trackedPairs: Set<TrackedEffectPair>,
+    private val downloads: Set<DownloadEffect>,
 ) {
     public val obligations: List<EffectPair>
-        get() = normalize(trackedPairs.mapNotNullTo(mutableSetOf()) { it.discharged() }).sortedWith(
+        get() = normalize(downloads.mapNotNullTo(mutableSetOf()) { it.discharged() }).sortedWith(
             compareByDescending<EffectPair> { it.requiredRateBytesPerSecond }
                 .thenByDescending { it.concurrency },
         )
 
-    /** True when a final bandwidth check lacks both inferred n and nMax. */
+    /** True when neither program syntax nor a client bound establishes `n`. */
     public val hasUnresolvedConcurrency: Boolean
-        get() = trackedPairs.any { it.discharged() == null }
+        get() = downloads.any { it.discharged() == null }
 
     public val maxConcurrency: Int
         get() = obligations.maxOfOrNull(EffectPair::concurrency) ?: 0
 
     private val rawMaxConcurrency: Int
-        get() = trackedPairs.maxOfOrNull { it.inferredConcurrency ?: Int.MAX_VALUE } ?: 0
+        get() = downloads.maxOfOrNull { it.concurrency ?: Int.MAX_VALUE } ?: 0
 
-    private val hasUnknownRawConcurrency: Boolean
-        get() = trackedPairs.any { it.inferredConcurrency == null }
+    private val hasUnknownConcurrency: Boolean
+        get() = downloads.any { it.concurrency == null }
 
-    /**
-     * Sequential join: `Norm(Phi1 union Phi2)`.
-     */
+    /** Sequential join: `Norm(Phi1 union Phi2)`. */
     public fun then(other: NetworkEffect): NetworkEffect =
-        NetworkEffect(trackedPairs + other.trackedPairs)
+        NetworkEffect(downloads + other.downloads)
 
-    /**
-     * Parallel composition from Table 2 of the paper.
-     */
+    /** Parallel composition from Table 2 of the paper. */
     public fun parallel(other: NetworkEffect): NetworkEffect {
         val leftShift: Int = other.rawMaxConcurrency
         val rightShift: Int = rawMaxConcurrency
-        val shiftedLeft = trackedPairs.mapTo(mutableSetOf()) { pair ->
-            pair.concurrentWith(
-                other = other,
-                concurrencyShift = leftShift,
-            )
-        }
-        val shiftedRight = other.trackedPairs.mapTo(mutableSetOf()) { pair ->
-            pair.concurrentWith(
-                other = this,
-                concurrencyShift = rightShift,
-            )
-        }
-        return NetworkEffect(shiftedLeft + shiftedRight)
+        return NetworkEffect(
+            downloads.mapTo(mutableSetOf()) { download ->
+                download.concurrentWith(other, leftShift)
+            } + other.downloads.mapTo(mutableSetOf()) { download ->
+                download.concurrentWith(this, rightShift)
+            },
+        )
     }
 
-    /**
-     * Conservatively models at most [maxConcurrentBodies] copies of the same
-     * launched body executing together.
-     */
+    /** Models at most [maxConcurrentBodies] overlapping copies of one body. */
     public fun boundedReplication(maxConcurrentBodies: Int): NetworkEffect {
         require(maxConcurrentBodies >= 0) { "replication bound must be non-negative" }
         var result: NetworkEffect = EMPTY
-        repeat(maxConcurrentBodies) {
-            result = result.parallel(this)
-        }
+        repeat(maxConcurrentBodies) { result = result.parallel(this) }
         return result
     }
 
-    /**
-     * Associates primitive requests in this effect with one runtime scheduler.
-     * The scheduler bound is discharged only after sequential/parallel effect
-     * composition has completed.
-     */
-    public fun through(pool: NetworkPool): NetworkEffect =
-        NetworkEffect(
-            trackedPairs.mapTo(mutableSetOf()) { pair ->
-                pair.copy(pools = setOf(pool))
-            },
-        )
+    /** Attaches a trusted runtime bound to primitive requests in this effect. */
+    public fun withSelfBound(selfBound: Int): NetworkEffect {
+        require(selfBound > 0) { "selfBound must be positive" }
+        return NetworkEffect(downloads.mapTo(mutableSetOf()) { it.copy(selfBound = selfBound) })
+    }
 
-    /** Marks a boundary whose asynchronous concurrency cannot be inferred. */
+    /** Marks a repetition boundary whose concurrency syntax cannot establish. */
     public fun withUnknownConcurrency(): NetworkEffect =
-        NetworkEffect(
-            trackedPairs.mapTo(mutableSetOf()) { pair ->
-                pair.copy(inferredConcurrency = null)
-            },
-        )
+        NetworkEffect(downloads.mapTo(mutableSetOf()) { it.copy(concurrency = null) })
 
-    /**
-     * `ReqBW(Phi) = max { r * n | (r, n) in Phi }`.
-     */
+    /** `ReqBW(Phi) = max { r * n | (r, n) in Phi }`. */
     public fun requiredBandwidthBytesPerSecond(): Rational {
         require(!hasUnresolvedConcurrency) {
             "cannot compute required bandwidth with unresolved concurrency"
@@ -154,9 +114,7 @@ public class NetworkEffect private constructor(
             ?: Rational.ZERO
     }
 
-    /**
-     * True when [other] is a safe over-approximation of this effect.
-     */
+    /** True when [other] is a safe over-approximation of this effect. */
     public fun isCoveredBy(other: NetworkEffect): Boolean =
         !hasUnresolvedConcurrency && !other.hasUnresolvedConcurrency && obligations.all { pair ->
             other.obligations.any {
@@ -166,9 +124,9 @@ public class NetworkEffect private constructor(
         }
 
     public override fun equals(other: Any?): Boolean =
-        other is NetworkEffect && trackedPairs == other.trackedPairs
+        other is NetworkEffect && downloads == other.downloads
 
-    public override fun hashCode(): Int = trackedPairs.hashCode()
+    public override fun hashCode(): Int = downloads.hashCode()
 
     public override fun toString(): String = obligations.joinToString(prefix = "{", postfix = "}")
 
@@ -176,29 +134,26 @@ public class NetworkEffect private constructor(
         public val EMPTY: NetworkEffect = NetworkEffect(emptySet())
 
         public fun of(pairs: Collection<EffectPair>): NetworkEffect =
-            NetworkEffect(pairs.mapTo(mutableSetOf()) { TrackedEffectPair(it) })
+            NetworkEffect(
+                pairs.mapTo(mutableSetOf()) {
+                    DownloadEffect(it.requiredRateBytesPerSecond, concurrency = it.concurrency)
+                },
+            )
 
         public fun download(maxBytes: Long, completeTimeoutMillis: Long): NetworkEffect {
             require(maxBytes >= 0) { "maximum transfer size must be non-negative" }
             require(completeTimeoutMillis > 0) { "complete-call timeout must be positive" }
-            val rate: Rational = Rational.of(
+            val rate = Rational.of(
                 maxBytes.toBigInteger() * BigInteger.valueOf(1_000),
                 completeTimeoutMillis.toBigInteger(),
             )
-            return of(listOf(EffectPair(rate, 1)))
+            return NetworkEffect(setOf(DownloadEffect(rate, concurrency = 1)))
         }
 
-        public fun summary(
-            rMaxBytesPerSecond: Long,
-            nMax: Int,
-        ): NetworkEffect {
+        public fun summary(rMaxBytesPerSecond: Long, nMax: Int): NetworkEffect {
             require(rMaxBytesPerSecond >= 0) { "rMax must be non-negative" }
             require(nMax >= 0) { "nMax must be non-negative" }
-            return if (nMax == 0) {
-                EMPTY
-            } else {
-                of(listOf(EffectPair(Rational.of(rMaxBytesPerSecond), nMax)))
-            }
+            return if (nMax == 0) EMPTY else of(listOf(EffectPair(Rational.of(rMaxBytesPerSecond), nMax)))
         }
 
         private fun normalize(pairs: Set<EffectPair>): Set<EffectPair> =
@@ -207,28 +162,13 @@ public class NetworkEffect private constructor(
             }
     }
 
-    private fun TrackedEffectPair.concurrentWith(
+    private fun DownloadEffect.concurrentWith(
         other: NetworkEffect,
         concurrencyShift: Int,
-    ): TrackedEffectPair = copy(
-        inferredConcurrency =
-            if (inferredConcurrency == null || other.hasUnknownRawConcurrency) {
-                null
-            } else {
-                inferredConcurrency + concurrencyShift
-            },
-        pools =
-            if (pools.isNotEmpty() && other.hasOnlyBoundedRequests) {
-                pools + other.concurrentPools
-            } else {
-                emptySet()
-            },
-    )
-
-    private val concurrentPools: Set<NetworkPool>
-        get() = trackedPairs.flatMapTo(mutableSetOf()) { it.pools }
-
-    private val hasOnlyBoundedRequests: Boolean
-        get() = trackedPairs.all { it.pools.isNotEmpty() }
-
+    ): DownloadEffect =
+        if (concurrency == null || other.hasUnknownConcurrency) {
+            copy(concurrency = null)
+        } else {
+            copy(concurrency = concurrency + concurrencyShift)
+        }
 }

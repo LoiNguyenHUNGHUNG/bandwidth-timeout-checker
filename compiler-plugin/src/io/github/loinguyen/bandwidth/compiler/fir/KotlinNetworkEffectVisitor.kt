@@ -1,7 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
 import io.github.loinguyen.bandwidth.core.NetworkEffect
-import io.github.loinguyen.bandwidth.core.NetworkPool
 import java.util.IdentityHashMap
 import org.jetbrains.kotlin.fir.FirElement
 import org.jetbrains.kotlin.fir.FirSession
@@ -286,7 +285,7 @@ internal class KotlinNetworkEffectVisitor(
         }
 
         val summary = functionSummary(target)
-        val invocation = call.networkPool(target)?.let(summary.invocation::through)
+        val invocation = call.clientSelfBound(target)?.let(summary.invocation::withSelfBound)
             ?: summary.invocation
         return KotlinExpressionEffect(
             immediate = evaluatedInputs.then(invocation),
@@ -730,22 +729,19 @@ internal class KotlinNetworkEffectVisitor(
         second: KotlinExpressionEffect,
     ): KotlinExpressionEffect = first.then(second)
 
-    private fun FirFunctionCall.networkPool(target: FirFunction): NetworkPool? {
+    private fun FirFunctionCall.clientSelfBound(target: FirFunction): Int? {
         if (target.downloadContract(session) == null) return null
-        val pools = receiverExpressions()
+        val bounds = receiverExpressions()
             .mapNotNull { receiver ->
                 val symbol = receiver.resolvedSymbol() ?: return@mapNotNull null
                 val declaration = symbol.fir
                     as? org.jetbrains.kotlin.fir.FirAnnotationContainer
                 val capacity = declaration?.boundedClientContract(session)?.k
                     ?: return@mapNotNull null
-                NetworkPool(
-                    id = "fir:${symbol::class.qualifiedName}:${System.identityHashCode(symbol)}",
-                    maxConcurrentRequests = capacity,
-                )
+                capacity
             }
             .distinct()
-        return pools.singleOrNull()
+        return bounds.singleOrNull()
     }
 
     private companion object {

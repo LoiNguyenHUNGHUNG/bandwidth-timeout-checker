@@ -6,63 +6,30 @@ import kotlin.test.assertTrue
 
 class NetworkEffectTest {
     @Test
-    fun `discharges one shared client bound after parallel composition`() {
-        val pool = NetworkPool(id = "images", maxConcurrentRequests = 2)
+    fun `keeps known concurrency separate from self bound`() {
         val download = NetworkEffect.download(
             maxBytes = 1_000,
             completeTimeoutMillis = 1_000,
-        ).through(pool)
+        ).withSelfBound(2)
 
         val result = download.boundedReplication(maxConcurrentBodies = 3)
-
-        assertEquals(listOf(EffectPair(Rational.of(1_000), 2)), result.obligations)
-        assertEquals(Rational.of(2_000), result.requiredBandwidthBytesPerSecond())
-    }
-
-    @Test
-    fun `adds independent client bounds in parallel`() {
-        val images = NetworkPool(id = "images", maxConcurrentRequests = 2)
-        val api = NetworkPool(id = "api", maxConcurrentRequests = 2)
-        val imageDownload = NetworkEffect.download(1_000, 1_000)
-            .through(images)
-            .boundedReplication(maxConcurrentBodies = 3)
-        val apiDownload = NetworkEffect.download(1_000, 1_000)
-            .through(api)
-            .boundedReplication(maxConcurrentBodies = 3)
-
-        val result = imageDownload.parallel(apiDownload)
-
-        assertEquals(listOf(EffectPair(Rational.of(1_000), 4)), result.obligations)
-        assertEquals(Rational.of(4_000), result.requiredBandwidthBytesPerSecond())
-    }
-
-    @Test
-    fun `uses inferred concurrency when bounded and unbounded work overlap`() {
-        val images = NetworkPool(id = "images", maxConcurrentRequests = 2)
-        val imageDownload = NetworkEffect.download(1_000, 1_000)
-            .through(images)
-            .boundedReplication(maxConcurrentBodies = 3)
-        val unboundedDownload = NetworkEffect.download(1_000, 1_000)
-
-        val result = imageDownload.parallel(unboundedDownload)
-
-        assertEquals(listOf(EffectPair(Rational.of(1_000), 4)), result.obligations)
-        assertEquals(Rational.of(4_000), result.requiredBandwidthBytesPerSecond())
-    }
-
-    @Test
-    fun `uses client capacity only when syntax leaves concurrency unknown`() {
-        val pool = NetworkPool(id = "images", maxConcurrentRequests = 3)
-        val result = NetworkEffect.download(1_000, 1_000)
-            .withUnknownConcurrency()
-            .through(pool)
 
         assertEquals(listOf(EffectPair(Rational.of(1_000), 3)), result.obligations)
         assertEquals(Rational.of(3_000), result.requiredBandwidthBytesPerSecond())
     }
 
     @Test
-    fun `keeps unknown concurrency unresolved without a client bound`() {
+    fun `uses self bound when repetition makes concurrency unknown`() {
+        val result = NetworkEffect.download(1_000, 1_000)
+            .withUnknownConcurrency()
+            .withSelfBound(3)
+
+        assertEquals(listOf(EffectPair(Rational.of(1_000), 3)), result.obligations)
+        assertEquals(Rational.of(3_000), result.requiredBandwidthBytesPerSecond())
+    }
+
+    @Test
+    fun `keeps unknown concurrency unresolved without a self bound`() {
         val result = NetworkEffect.download(1_000, 1_000)
             .withUnknownConcurrency()
 
