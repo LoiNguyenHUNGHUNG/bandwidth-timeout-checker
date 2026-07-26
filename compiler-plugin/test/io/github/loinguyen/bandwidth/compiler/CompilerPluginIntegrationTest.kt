@@ -540,6 +540,50 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `uses an interface contract through a Dagger bound NIA style dependency`() {
+        val result = compile(
+            """
+            import dagger.Binds
+            import dagger.Module
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import javax.inject.Inject
+
+            interface NiaNetworkDataSource {
+                @BandwidthEffect(rMaxBytesPerSecond = 900, nMax = 1)
+                suspend fun getNewsResources(): List<String>
+            }
+
+            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
+            suspend fun retrofitGetNewsResources(): List<String> = emptyList()
+
+            class RetrofitNiaNetwork @Inject constructor() : NiaNetworkDataSource {
+                override suspend fun getNewsResources(): List<String> =
+                    retrofitGetNewsResources()
+            }
+
+            @Module
+            interface NetworkModule {
+                @Binds
+                fun bindNetwork(implementation: RetrofitNiaNetwork): NiaNetworkDataSource
+            }
+
+            class SyncWorker @Inject constructor(
+                private val network: NiaNetworkDataSource,
+            ) {
+                suspend fun doWork() {
+                    network.getNewsResources()
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for SyncWorker.doWork: {(900, 1)}")
+    }
+
+    @Test
     fun `rejects an NIA style implementation exceeding its interface contract`() {
         val result = compile(
             """

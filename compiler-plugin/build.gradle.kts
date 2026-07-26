@@ -36,6 +36,7 @@ dependencies {
     testImplementation(libs.kotlin.compiler.embeddable)
     testImplementation(libs.kotlin.test.junit5)
     testImplementation(libs.kotlinx.coroutines.core)
+    testImplementation(libs.dagger)
     testImplementation(project(":plugin-annotations"))
 }
 
