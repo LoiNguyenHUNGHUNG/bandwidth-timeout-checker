@@ -1,21 +1,19 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
-import io.github.loinguyen.bandwidth.core.NetworkEffect
-
 /**
  * Accumulates sequential phases inside one structured coroutine scope.
  *
  * The handle type stays generic so FIR recognition remains in the visitor.
  */
 internal class CoroutinePhaseState<Handle : Any> {
-    private var result: NetworkEffect = NetworkEffect.EMPTY
+    private var result: KotlinExpressionEffect = KotlinExpressionEffect()
     private var lastLatent: LatentNetworkEffect? = null
-    private val activeChildren = linkedMapOf<Handle, NetworkEffect>()
-    private val untrackedChildren = mutableListOf<NetworkEffect>()
+    private val activeChildren = linkedMapOf<Handle, KotlinExpressionEffect>()
+    private val untrackedChildren = mutableListOf<KotlinExpressionEffect>()
 
     fun addChild(
         handle: Handle?,
-        effect: NetworkEffect,
+        effect: KotlinExpressionEffect,
     ) {
         if (handle == null) {
             untrackedChildren += effect
@@ -36,25 +34,26 @@ internal class CoroutinePhaseState<Handle : Any> {
     }
 
     fun recordStatement(effect: KotlinExpressionEffect) {
-        recordPhase(effect.immediate)
+        recordPhase(effect)
         lastLatent = effect.latent
     }
 
     fun finish(): KotlinExpressionEffect {
         recordPhase()
         return KotlinExpressionEffect(
-            immediate = result,
+            immediate = result.immediate,
             latent = lastLatent,
+            hasUnknownRepetition = result.hasUnknownRepetition,
         )
     }
 
-    private fun recordPhase(parent: NetworkEffect = NetworkEffect.EMPTY) {
+    private fun recordPhase(parent: KotlinExpressionEffect = KotlinExpressionEffect()) {
         result = result.then(activeEffect().parallel(parent))
     }
 
-    private fun activeEffect(): NetworkEffect =
+    private fun activeEffect(): KotlinExpressionEffect =
         (activeChildren.values + untrackedChildren)
-            .fold(NetworkEffect.EMPTY) { effect, child ->
+            .fold(KotlinExpressionEffect()) { effect, child ->
                 effect.parallel(child)
             }
 }

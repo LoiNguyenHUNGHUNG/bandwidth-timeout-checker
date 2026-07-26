@@ -20,6 +20,8 @@ internal val BANDWIDTH_EFFECT_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BandwidthEffect"))
 internal val BOUNDED_SCOPE_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BoundedScope"))
+internal val BOUNDED_CLIENT_ANNOTATION: ClassId =
+    ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BoundedClient"))
 
 private val MAX_BYTES: Name = Name.identifier("maxBytes")
 private val COMPLETE_TIMEOUT_MILLIS: Name = Name.identifier("completeTimeoutMillis")
@@ -35,6 +37,10 @@ internal data class DownloadContract(
 internal data class EffectContract(
     val rMaxBytesPerSecond: Long,
     val nMax: Int,
+)
+
+internal data class BoundedClientContract(
+    val k: Int,
 )
 
 internal data class AnnotationProblem(
@@ -64,6 +70,15 @@ internal fun FirAnnotationContainer.effectContract(session: FirSession): EffectC
     return EffectContract(rMax, nMax)
 }
 
+internal fun FirAnnotationContainer.boundedClientContract(
+    session: FirSession,
+): BoundedClientContract? {
+    val annotation: FirAnnotation = annotation(BOUNDED_CLIENT_ANNOTATION, session) ?: return null
+    val bound: Int = annotation.intArgument(K, session) ?: return null
+    if (bound <= 0) return null
+    return BoundedClientContract(bound)
+}
+
 internal fun FirDeclaration.validateBandwidthAnnotations(
     session: FirSession,
 ): List<AnnotationProblem> = buildList {
@@ -89,6 +104,17 @@ internal fun FirDeclaration.validateBandwidthAnnotations(
                 AnnotationProblem(
                     annotation.source ?: source,
                     "@BoundedScope k must be a positive constant.",
+                ),
+            )
+        }
+    }
+    container.annotation(BOUNDED_CLIENT_ANNOTATION, session)?.let { annotation ->
+        val bound: Int? = annotation.intArgument(K, session)
+        if (bound == null || bound <= 0) {
+            add(
+                AnnotationProblem(
+                    annotation.source ?: source,
+                    "@BoundedClient k must be a positive constant.",
                 ),
             )
         }

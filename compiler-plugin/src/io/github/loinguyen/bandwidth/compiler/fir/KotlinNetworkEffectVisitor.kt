@@ -67,6 +67,7 @@ internal class KotlinNetworkEffectVisitor(
         return KotlinFunctionEffect(
             invocation = bodyEffect.immediate,
             returned = context.returnedLatent.join(expressionResult),
+            hasUnknownRepetition = bodyEffect.hasUnknownRepetition,
         )
     }
 
@@ -199,6 +200,8 @@ internal class KotlinNetworkEffectVisitor(
         return KotlinExpressionEffect(
             immediate = alternatives.immediate.then(finallyEffect.immediate),
             latent = alternatives.latent,
+            hasUnknownRepetition =
+                alternatives.hasUnknownRepetition || finallyEffect.hasUnknownRepetition,
         )
     }
 
@@ -243,6 +246,9 @@ internal class KotlinNetworkEffectVisitor(
         if (target.isStructuredCoroutineScope()) {
             return inferStructuredCoroutineScope(call, context)
         }
+        if (target.isCoroutineBuilder()) {
+            return inferUnstructuredCoroutineBuilder(call, context)
+        }
         if (target.isAwaitAll()) {
             return inferInlineAwaitAll(call, context)
         }
@@ -282,9 +288,12 @@ internal class KotlinNetworkEffectVisitor(
         }
 
         val summary = functionSummary(target)
+        val invocation = call.clientSelfBound(target)?.let(summary.invocation::withSelfBound)
+            ?: summary.invocation
         return KotlinExpressionEffect(
-            immediate = evaluatedInputs.then(summary.invocation),
+            immediate = evaluatedInputs.then(invocation),
             latent = summary.returned,
+            hasUnknownRepetition = summary.hasUnknownRepetition,
         )
     }
 
@@ -333,12 +342,35 @@ internal class KotlinNetworkEffectVisitor(
             )
             return KotlinExpressionEffect()
         }
-        val parallelChildren = children.fold(NetworkEffect.EMPTY) { effect, child ->
+        val parallelChildren = children.fold(KotlinExpressionEffect()) { effect, child ->
             effect.parallel(inferCoroutineChild(child.lambda, context))
         }
         val receivers = inferReceivers(call, context)
-        return KotlinExpressionEffect(
-            immediate = receivers.immediate.then(parallelChildren),
+        return receivers.then(parallelChildren)
+    }
+
+    /**
+     * A launch/async body has its ordinary local effect. An enclosing forEach
+     * later recognizes the escaping builder and applies unknown repetition.
+     */
+    private fun inferUnstructuredCoroutineBuilder(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val lambda = call.visibleLambdaArgument()
+        val child = lambda?.let { inferCoroutineChild(it, context) }
+            ?: return KotlinExpressionEffect()
+        val inputs = sequence(
+            call.receiverExpressions().map { infer(it, context) } +
+                call.argumentList.arguments
+                    .filter { it.visibleLambda() !== lambda }
+                    .map { infer(it, context) },
+        )
+        return inputs.then(
+            KotlinExpressionEffect(
+                immediate = child.immediate,
+                hasUnknownRepetition = true,
+            ),
         )
     }
 
@@ -355,14 +387,40 @@ internal class KotlinNetworkEffectVisitor(
         val evaluatedArguments = argumentEffects.fold(NetworkEffect.EMPTY) { effect, argument ->
             effect.then(argument.immediate)
         }
-        val invokedCallbacks = argumentEffects.fold(NetworkEffect.EMPTY) { effect, argument ->
-            effect.then(argument.latent?.invocation ?: NetworkEffect.EMPTY)
+        val invokedCallbacks = argumentEffects.fold(KotlinExpressionEffect()) { effect, argument ->
+            effect.then(
+                KotlinExpressionEffect(
+                    immediate = argument.latent?.invocation ?: NetworkEffect.EMPTY,
+                    hasUnknownRepetition = argument.latent?.hasUnknownRepetition ?: false,
+                ),
+            )
         }
-        return KotlinExpressionEffect(
-            immediate = receiverEffects.immediate
-                .then(evaluatedArguments)
-                .then(invokedCallbacks),
-        )
+        val hasUnknownRepetition = invokedCallbacks.hasUnknownRepetition
+        val callbackEffect =
+            if (call.isForEach() && hasUnknownRepetition) {
+                if (invokedCallbacks.immediate.hasSelfBoundForEveryDownload) {
+                    invokedCallbacks.immediate.withUnknownRepetition()
+                } else {
+                    problem(
+                        key = "unknown-for-each-self-bound:${context.function.displayName()}:" +
+                            call.source?.startOffset,
+                        source = call.source ?: context.function.source,
+                        message = "Unknown forEach repetition contains network work without " +
+                            "a self bound. Use an annotated client for every launched download.",
+                    )
+                    NetworkEffect.EMPTY
+                }
+            } else {
+                invokedCallbacks.immediate
+            }
+        return KotlinExpressionEffect(immediate = receiverEffects.immediate)
+            .then(KotlinExpressionEffect(immediate = evaluatedArguments))
+            .then(
+                KotlinExpressionEffect(
+                    immediate = callbackEffect,
+                    hasUnknownRepetition = hasUnknownRepetition,
+                ),
+            )
     }
 
     private fun inferCoroutineStatements(
@@ -395,11 +453,12 @@ internal class KotlinNetworkEffectVisitor(
     private fun inferCoroutineChild(
         lambda: FirAnonymousFunctionExpression,
         context: KotlinEffectContext,
-    ): NetworkEffect {
+    ): KotlinExpressionEffect {
         val body = lambda.anonymousFunction.body
-        return body?.let { inferCoroutineStatements(it, context).immediate }
-            ?: infer(lambda, context).latent?.invocation
-            ?: NetworkEffect.EMPTY
+        return body?.let { inferCoroutineStatements(it, context) }
+            ?: KotlinExpressionEffect(
+                immediate = infer(lambda, context).latent?.invocation ?: NetworkEffect.EMPTY,
+            )
     }
 
     private fun FirElement.structuredChild(): StructuredChild? {
@@ -515,6 +574,7 @@ internal class KotlinNetworkEffectVisitor(
         return KotlinExpressionEffect(
             immediate = evaluatedInputs.then(latent.invocation),
             latent = latent.returned,
+            hasUnknownRepetition = latent.hasUnknownRepetition,
         )
     }
 
@@ -542,6 +602,7 @@ internal class KotlinNetworkEffectVisitor(
                 ?: NetworkEffect.EMPTY,
             returned = returnedContract?.toLatentEffect()
                 ?: inferred?.returned,
+            hasUnknownRepetition = inferred?.hasUnknownRepetition ?: false,
         )
     }
 
@@ -551,6 +612,10 @@ internal class KotlinNetworkEffectVisitor(
         argumentEffects: Map<FirValueParameter, KotlinExpressionEffect>,
         context: KotlinEffectContext,
     ) {
+        // launch/async are handled by structured coroutine rules, including
+        // their visible lambda bodies. They are not ordinary library callback
+        // contracts.
+        if (target.isCoroutineBuilder()) return
         target.valueParameters.forEach { parameter ->
             if (!parameter.returnTypeRef.coneType.isSomeFunctionType(session)) {
                 return@forEach
@@ -611,16 +676,14 @@ internal class KotlinNetworkEffectVisitor(
                 infer(loop.block, context),
             ),
         )
-        if (oneIteration.immediate != NetworkEffect.EMPTY) {
-            problem(
-                key = "loop:${context.function.displayName()}:${loop.source?.startOffset}",
-                source = loop.source ?: context.function.source,
-                message = "Cannot infer an effectful loop in " +
-                    "${context.function.displayName()}; the current checker requires " +
-                    "statically finite network structure.",
-            )
-        }
-        return KotlinExpressionEffect(immediate = oneIteration.immediate)
+        if (oneIteration.immediate == NetworkEffect.EMPTY) return oneIteration
+        problem(
+            key = "unbounded-loop:${context.function.displayName()}:${loop.source?.startOffset}",
+            source = loop.source ?: context.function.source,
+            message = "Cannot infer network work in a general loop. Use a supported bounded " +
+                "collection operation or add a loop-bound rule.",
+        )
+        return KotlinExpressionEffect()
     }
 
     private fun inferChildren(
@@ -637,11 +700,7 @@ internal class KotlinNetworkEffectVisitor(
                 override fun visitFunction(function: FirFunction) = Unit
             },
         )
-        return KotlinExpressionEffect(
-            immediate = children.fold(NetworkEffect.EMPTY) { effect, child ->
-                effect.then(child.immediate)
-            },
-        )
+        return sequence(children)
     }
 
     private fun inferReceivers(
@@ -689,31 +748,40 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     private fun sequence(effects: List<KotlinExpressionEffect>): KotlinExpressionEffect =
-        KotlinExpressionEffect(
-            immediate = effects.fold(NetworkEffect.EMPTY) { effect, next ->
-                effect.then(next.immediate)
-            },
-            latent = effects.lastOrNull()?.latent,
-        )
+        effects.fold(KotlinExpressionEffect()) { effect, next -> effect.then(next) }
 
     private fun choice(effects: List<KotlinExpressionEffect>): KotlinExpressionEffect =
-        KotlinExpressionEffect(
-            immediate = effects.fold(NetworkEffect.EMPTY) { effect, branch ->
-                effect.then(branch.immediate)
-            },
-            latent = effects.fold(null as LatentNetworkEffect?) { latent, branch ->
-                latent.join(branch.latent)
-            },
-        )
+        effects.fold(KotlinExpressionEffect()) { effect, branch ->
+            KotlinExpressionEffect(
+                immediate = effect.immediate.then(branch.immediate),
+                latent = effect.latent.join(branch.latent),
+                hasUnknownRepetition =
+                    effect.hasUnknownRepetition || branch.hasUnknownRepetition,
+            )
+        }
 
     private fun thenValue(
         first: KotlinExpressionEffect,
         second: KotlinExpressionEffect,
-    ): KotlinExpressionEffect =
-        KotlinExpressionEffect(
-            immediate = first.immediate.then(second.immediate),
-            latent = second.latent,
-        )
+    ): KotlinExpressionEffect = first.then(second)
+
+    private fun FirFunctionCall.clientSelfBound(target: FirFunction): Int? {
+        if (target.downloadContract(session) == null) return null
+        val bounds = receiverExpressions()
+            .mapNotNull { receiver ->
+                val symbol = receiver.resolvedSymbol() ?: return@mapNotNull null
+                val declaration = symbol.fir
+                    as? org.jetbrains.kotlin.fir.FirAnnotationContainer
+                val capacity = declaration?.boundedClientContract(session)?.k
+                    ?: return@mapNotNull null
+                capacity
+            }
+            .distinct()
+        return bounds.singleOrNull()
+    }
+
+    private fun FirFunctionCall.isForEach(): Boolean =
+        resolvedFunction()?.symbol?.callableId?.asSingleFqName()?.asString() in FOR_EACH_FQ_NAMES
 
     private companion object {
         data class StructuredChild(
@@ -739,6 +807,11 @@ internal class KotlinNetworkEffectVisitor(
             "kotlin.collections.forEachIndexed",
             "kotlin.sequences.forEach",
             "androidx.tracing.traceAsync",
+        )
+        val FOR_EACH_FQ_NAMES: Set<String> = setOf(
+            "kotlin.collections.forEach",
+            "kotlin.collections.forEachIndexed",
+            "kotlin.sequences.forEach",
         )
     }
 }
