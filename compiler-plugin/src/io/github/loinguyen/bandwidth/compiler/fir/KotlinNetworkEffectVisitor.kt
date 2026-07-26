@@ -1,6 +1,7 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
 import io.github.loinguyen.bandwidth.core.NetworkEffect
+import io.github.loinguyen.bandwidth.core.NetworkPool
 import java.util.IdentityHashMap
 import org.jetbrains.kotlin.fir.FirElement
 import org.jetbrains.kotlin.fir.FirSession
@@ -282,10 +283,11 @@ internal class KotlinNetworkEffectVisitor(
         }
 
         val summary = functionSummary(target)
+        val invocation = call.networkPool(target)?.let(summary.invocation::through)
+            ?: summary.invocation
         return KotlinExpressionEffect(
-            immediate = evaluatedInputs.then(summary.invocation),
+            immediate = evaluatedInputs.then(invocation),
             latent = summary.returned,
-            boundedClientK = call.boundedClientK(target),
         )
     }
 
@@ -698,7 +700,6 @@ internal class KotlinNetworkEffectVisitor(
             KotlinExpressionEffect(
                 immediate = effect.immediate.then(branch.immediate),
                 latent = effect.latent.join(branch.latent),
-                boundedClientK = effect.then(branch).boundedClientK,
             )
         }
 
@@ -707,16 +708,22 @@ internal class KotlinNetworkEffectVisitor(
         second: KotlinExpressionEffect,
     ): KotlinExpressionEffect = first.then(second)
 
-    private fun FirFunctionCall.boundedClientK(target: FirFunction): Int? {
+    private fun FirFunctionCall.networkPool(target: FirFunction): NetworkPool? {
         if (target.downloadContract(session) == null) return null
-        val bounds = receiverExpressions()
+        val pools = receiverExpressions()
             .mapNotNull { receiver ->
-                val declaration = receiver.resolvedSymbol()?.fir
+                val symbol = receiver.resolvedSymbol() ?: return@mapNotNull null
+                val declaration = symbol.fir
                     as? org.jetbrains.kotlin.fir.FirAnnotationContainer
-                declaration?.boundedClientContract(session)?.k
+                val capacity = declaration?.boundedClientContract(session)?.k
+                    ?: return@mapNotNull null
+                NetworkPool(
+                    id = "fir:${symbol::class.qualifiedName}:${System.identityHashCode(symbol)}",
+                    maxConcurrentRequests = capacity,
+                )
             }
             .distinct()
-        return bounds.singleOrNull()
+        return pools.singleOrNull()
     }
 
     private companion object {

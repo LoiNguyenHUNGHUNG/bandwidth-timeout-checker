@@ -71,6 +71,79 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `adds independent bounded clients inside one coroutine scope`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @BoundedClient(k = 2)
+            val imageClient = NetworkClient()
+
+            @BoundedClient(k = 2)
+            val apiClient = NetworkClient()
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            suspend fun load() = coroutineScope {
+                launch { imageClient.download() }
+                launch { imageClient.download() }
+                launch { imageClient.download() }
+                launch { apiClient.download() }
+                launch { apiClient.download() }
+                launch { apiClient.download() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 4)}")
+        result.assertOutputContains("ReqBW=4000 bytes/s")
+    }
+
+    @Test
+    fun `keeps a client bound through a repository wrapper`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.sendSomething() = Unit
+
+            class Repository(
+                @BoundedClient(k = 2) private val client: NetworkClient,
+            ) {
+                suspend fun load() {
+                    client.sendSomething()
+                }
+            }
+
+            suspend fun loadAll(repository: Repository) = coroutineScope {
+                launch { repository.load() }
+                launch { repository.load() }
+                launch { repository.load() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for loadAll: {(800, 2)}")
+        result.assertOutputContains("ReqBW=1600 bytes/s")
+    }
+
+    @Test
     fun `does not cap mixed bounded and unbounded downloads`() {
         val result = compile(
             """

@@ -26,38 +26,83 @@ public data class EffectPair(
 }
 
 /**
- * A finite, Pareto-normalized set of rate/concurrency obligations.
+ * A runtime network scheduler. [id] preserves sharing while effects compose;
+ * it is intentionally absent from the discharged public obligation.
+ */
+public data class NetworkPool(
+    public val id: String,
+    public val maxConcurrentRequests: Int,
+) {
+    init {
+        require(id.isNotBlank()) { "network pool id must not be blank" }
+        require(maxConcurrentRequests > 0) {
+            "network pool limit must be positive"
+        }
+    }
+}
+
+private data class TrackedEffectPair(
+    val pair: EffectPair,
+    val pools: Set<NetworkPool> = emptySet(),
+    val hasUnboundedRequest: Boolean = true,
+) {
+    fun discharged(): EffectPair =
+        if (hasUnboundedRequest) {
+            pair
+        } else {
+            pair.copy(
+                concurrency = minOf(
+                    pair.concurrency,
+                    pools.sumOf(NetworkPool::maxConcurrentRequests),
+                ),
+            )
+        }
+}
+
+/**
+ * A finite set of raw rate/concurrency obligations. Public obligations are
+ * Pareto-normalized after runtime network-pool capacities are discharged.
  */
 public class NetworkEffect private constructor(
-    pairs: Set<EffectPair>,
+    private val trackedPairs: Set<TrackedEffectPair>,
 ) {
-    private val pairs: Set<EffectPair> = normalize(pairs)
-
     public val obligations: List<EffectPair>
-        get() = pairs.sortedWith(
+        get() = normalize(trackedPairs.mapTo(mutableSetOf()) { it.discharged() }).sortedWith(
             compareByDescending<EffectPair> { it.requiredRateBytesPerSecond }
                 .thenByDescending { it.concurrency },
         )
 
     public val maxConcurrency: Int
-        get() = pairs.maxOfOrNull(EffectPair::concurrency) ?: 0
+        get() = obligations.maxOfOrNull(EffectPair::concurrency) ?: 0
+
+    private val rawMaxConcurrency: Int
+        get() = trackedPairs.maxOfOrNull { it.pair.concurrency } ?: 0
 
     /**
      * Sequential join: `Norm(Phi1 union Phi2)`.
      */
-    public fun then(other: NetworkEffect): NetworkEffect = of(pairs + other.pairs)
+    public fun then(other: NetworkEffect): NetworkEffect =
+        NetworkEffect(trackedPairs + other.trackedPairs)
 
     /**
      * Parallel composition from Table 2 of the paper.
      */
     public fun parallel(other: NetworkEffect): NetworkEffect {
-        val leftShift: Int = other.maxConcurrency
-        val rightShift: Int = maxConcurrency
-        val shiftedLeft: Set<EffectPair> = pairs
-            .mapTo(mutableSetOf()) { it.copy(concurrency = it.concurrency + leftShift) }
-        val shiftedRight: Set<EffectPair> = other.pairs
-            .mapTo(mutableSetOf()) { it.copy(concurrency = it.concurrency + rightShift) }
-        return of(shiftedLeft + shiftedRight)
+        val leftShift: Int = other.rawMaxConcurrency
+        val rightShift: Int = rawMaxConcurrency
+        val shiftedLeft = trackedPairs.mapTo(mutableSetOf()) { pair ->
+            pair.concurrentWith(
+                other = other,
+                concurrencyShift = leftShift,
+            )
+        }
+        val shiftedRight = other.trackedPairs.mapTo(mutableSetOf()) { pair ->
+            pair.concurrentWith(
+                other = this,
+                concurrencyShift = rightShift,
+            )
+        }
+        return NetworkEffect(shiftedLeft + shiftedRight)
     }
 
     /**
@@ -74,42 +119,39 @@ public class NetworkEffect private constructor(
     }
 
     /**
-     * Applies a runtime client limit to every request represented by this
-     * effect. Used only while all non-empty work in an expression is known to
-     * use the same bounded client.
+     * Associates primitive requests in this effect with one runtime scheduler.
+     * The scheduler bound is discharged only after sequential/parallel effect
+     * composition has completed.
      */
-    public fun capConcurrency(maxConcurrentRequests: Int): NetworkEffect {
-        require(maxConcurrentRequests >= 0) {
-            "maximum concurrent requests must be non-negative"
-        }
-        return of(
-            pairs.map { pair ->
-                pair.copy(concurrency = minOf(pair.concurrency, maxConcurrentRequests))
+    public fun through(pool: NetworkPool): NetworkEffect =
+        NetworkEffect(
+            trackedPairs.mapTo(mutableSetOf()) { pair ->
+                pair.copy(pools = setOf(pool), hasUnboundedRequest = false)
             },
         )
-    }
 
     /**
      * `ReqBW(Phi) = max { r * n | (r, n) in Phi }`.
      */
     public fun requiredBandwidthBytesPerSecond(): Rational =
-        pairs.maxOfOrNull { it.requiredRateBytesPerSecond * it.concurrency } ?: Rational.ZERO
+        obligations.maxOfOrNull { it.requiredRateBytesPerSecond * it.concurrency }
+            ?: Rational.ZERO
 
     /**
      * True when [other] is a safe over-approximation of this effect.
      */
     public fun isCoveredBy(other: NetworkEffect): Boolean =
-        pairs.all { pair ->
-            other.pairs.any {
+        obligations.all { pair ->
+            other.obligations.any {
                 it.requiredRateBytesPerSecond >= pair.requiredRateBytesPerSecond &&
                     it.concurrency >= pair.concurrency
             }
         }
 
     public override fun equals(other: Any?): Boolean =
-        other is NetworkEffect && pairs == other.pairs
+        other is NetworkEffect && trackedPairs == other.trackedPairs
 
-    public override fun hashCode(): Int = pairs.hashCode()
+    public override fun hashCode(): Int = trackedPairs.hashCode()
 
     public override fun toString(): String = obligations.joinToString(prefix = "{", postfix = "}")
 
@@ -117,7 +159,7 @@ public class NetworkEffect private constructor(
         public val EMPTY: NetworkEffect = NetworkEffect(emptySet())
 
         public fun of(pairs: Collection<EffectPair>): NetworkEffect =
-            NetworkEffect(pairs.toSet())
+            NetworkEffect(pairs.mapTo(mutableSetOf()) { TrackedEffectPair(it) })
 
         public fun download(maxBytes: Long, completeTimeoutMillis: Long): NetworkEffect {
             require(maxBytes >= 0) { "maximum transfer size must be non-negative" }
@@ -147,4 +189,19 @@ public class NetworkEffect private constructor(
                 pairs.any { candidate -> candidate.dominates(pair) }
             }
     }
+
+    private fun TrackedEffectPair.concurrentWith(
+        other: NetworkEffect,
+        concurrencyShift: Int,
+    ): TrackedEffectPair = copy(
+        pair = pair.copy(concurrency = pair.concurrency + concurrencyShift),
+        pools = pools + other.concurrentPools,
+        hasUnboundedRequest = hasUnboundedRequest || other.hasUnboundedRequest,
+    )
+
+    private val concurrentPools: Set<NetworkPool>
+        get() = trackedPairs.flatMapTo(mutableSetOf()) { it.pools }
+
+    private val hasUnboundedRequest: Boolean
+        get() = trackedPairs.any(TrackedEffectPair::hasUnboundedRequest)
 }
