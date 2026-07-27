@@ -71,7 +71,7 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `keeps one unstructured launch at local concurrency`() {
+    fun `models an external launch as long lived`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.BoundedClient
@@ -96,13 +96,13 @@ class CompilerPluginIntegrationTest {
 
         assertEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "Inferred bandwidth effect for onDownloadClicked: {(600, 1)}",
+            "Inferred bandwidth effect for onDownloadClicked: {(600, 3)}",
         )
-        result.assertOutputContains("ReqBW=600 bytes/s")
+        result.assertOutputContains("ReqBW=1800 bytes/s")
     }
 
     @Test
-    fun `keeps one unbounded-client launch at local concurrency`() {
+    fun `rejects an escaping launch without a bounded client`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
@@ -120,7 +120,78 @@ class CompilerPluginIntegrationTest {
             """,
         )
 
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Network work launched on an escaping coroutine scope requires a bounded client",
+        )
+    }
+
+    @Test
+    fun `keeps an explicit external scope long lived inside coroutine scope`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            suspend fun load(
+                externalScope: CoroutineScope,
+                @BoundedClient(k = 2) client: NetworkClient,
+            ) = coroutineScope {
+                externalScope.launch { client.download() }
+                client.download()
+            }
+            """,
+            reportEffects = true,
+        )
+
         assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 3)}")
+        result.assertOutputContains("ReqBW=3000 bytes/s")
+    }
+
+    @Test
+    fun `propagates escaping work through a function summary`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            fun spawn(
+                scope: CoroutineScope,
+                @BoundedClient(k = 4) client: NetworkClient,
+            ) {
+                scope.launch { client.download() }
+            }
+
+            suspend fun load(
+                scope: CoroutineScope,
+                @BoundedClient(k = 4) client: NetworkClient,
+            ) {
+                spawn(scope, client)
+                client.download()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(750, 5)}")
+        result.assertOutputContains("ReqBW=3750 bytes/s")
     }
 
     @Test

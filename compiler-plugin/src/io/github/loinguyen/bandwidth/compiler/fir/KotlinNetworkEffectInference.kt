@@ -49,7 +49,7 @@ internal class KotlinNetworkEffectInference(
         diagnosticReporter = reporter
         try {
             val inferred: KotlinFunctionEffect = inferFunctionEffect(function)
-            val inferredEffect: NetworkEffect = inferred.invocation
+            val inferredEffect: NetworkEffect = inferred.materialize()
             function.effectContract(session)?.let { contract ->
                 val declaredEffect: NetworkEffect = contract.toNetworkEffect()
                 if (!inferredEffect.isCoveredBy(declaredEffect)) {
@@ -74,7 +74,7 @@ internal class KotlinNetworkEffectInference(
             }
             function.returnTypeRef.effectContract(session)?.let { contract ->
                 val inferredLatent: NetworkEffect =
-                    inferred.returned?.invocation ?: NetworkEffect.EMPTY
+                    inferred.returned?.materialize() ?: NetworkEffect.EMPTY
                 val declaredLatent: NetworkEffect = contract.toNetworkEffect()
                 if (!inferredLatent.isCoveredBy(declaredLatent)) {
                     error(
@@ -106,7 +106,7 @@ internal class KotlinNetworkEffectInference(
     private fun inferFunctionEffect(function: FirFunction): KotlinFunctionEffect {
         function.downloadContract(session)?.let { contract ->
             return KotlinFunctionEffect(
-                invocation = NetworkEffect.download(
+                standard = NetworkEffect.download(
                     maxBytes = contract.maxBytes,
                     completeTimeoutMillis = contract.completeTimeoutMillis,
                 ),

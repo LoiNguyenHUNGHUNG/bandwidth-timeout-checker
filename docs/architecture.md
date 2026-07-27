@@ -27,6 +27,7 @@ FIR quantitative-effect visitor: Gamma |- e : tau |> Phi
   - primitive download -> singleton effect
   - sequence / choice -> sequential join
   - structured concurrency -> parallel composition
+  - escaping coroutine work -> separately propagated long-lived effect
   - opaque call -> declared latent effect
               |
               v
@@ -184,7 +185,11 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   invocation; unknown higher-order library calls still require contracts.
 - Keep aliased, reassigned, stored, or escaped child handles live until scope
   completion unless ownership can be proved.
-- Distinguish structured completion from escaped jobs.
+- [x] Distinguish structured completion from escaped jobs. An unqualified
+  `launch`/`async` in the current `coroutineScope`/`withContext` is a direct
+  child; work launched through any explicit scope receiver is long-lived. The
+  checker materializes this work once at function/program boundaries, in
+  parallel with ordinary work. Escaping network work requires bounded clients.
 - Compare inferred results against hand-written core fixtures.
 
 ### M4 - Enforced bounded network scopes

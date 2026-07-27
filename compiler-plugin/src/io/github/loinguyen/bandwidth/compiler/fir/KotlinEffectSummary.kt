@@ -7,66 +7,61 @@ import org.jetbrains.kotlin.fir.declarations.FirCallableDeclaration
 import org.jetbrains.kotlin.fir.declarations.FirFunction
 import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 
-/**
- * Effect suspended inside a Kotlin function value.
- *
- * [invocation] happens when the value is called. [returned] models a function
- * value returned by that call, allowing higher-order factories to compose.
- */
+/** Effect suspended inside a Kotlin function value. */
 internal data class LatentNetworkEffect(
-    val invocation: NetworkEffect,
+    val standard: NetworkEffect = NetworkEffect.EMPTY,
+    val longLived: NetworkEffect = NetworkEffect.EMPTY,
     val returned: LatentNetworkEffect? = null,
-    val hasUnknownRepetition: Boolean = false,
 ) {
     fun join(other: LatentNetworkEffect): LatentNetworkEffect =
         LatentNetworkEffect(
-            invocation = invocation.then(other.invocation),
+            standard = standard.then(other.standard),
+            longLived = longLived.then(other.longLived),
             returned = returned.join(other.returned),
-            hasUnknownRepetition = hasUnknownRepetition || other.hasUnknownRepetition,
         )
+
+    fun materialize(): NetworkEffect = standard.parallel(longLived)
 }
 
-/**
- * The effect component paired with the Kotlin type already resolved on FIR.
- */
+/** The effect component paired with Kotlin's already resolved type. */
 internal data class KotlinExpressionEffect(
-    val immediate: NetworkEffect = NetworkEffect.EMPTY,
+    val standard: NetworkEffect = NetworkEffect.EMPTY,
+    val longLived: NetworkEffect = NetworkEffect.EMPTY,
     val latent: LatentNetworkEffect? = null,
-    val hasUnknownRepetition: Boolean = false,
-)
+) {
+    fun materialize(): NetworkEffect = standard.parallel(longLived)
+}
 
 internal fun KotlinExpressionEffect.then(other: KotlinExpressionEffect): KotlinExpressionEffect =
     KotlinExpressionEffect(
-        immediate = immediate.then(other.immediate),
+        standard = standard.then(other.standard),
+        longLived = longLived.parallel(other.longLived),
         latent = other.latent,
-        hasUnknownRepetition = hasUnknownRepetition || other.hasUnknownRepetition,
     )
 
 internal fun KotlinExpressionEffect.parallel(other: KotlinExpressionEffect): KotlinExpressionEffect =
     KotlinExpressionEffect(
-        immediate = immediate.parallel(other.immediate),
-        hasUnknownRepetition = hasUnknownRepetition || other.hasUnknownRepetition,
+        standard = standard.parallel(other.standard),
+        longLived = longLived.parallel(other.longLived),
     )
 
-/**
- * Interprocedural summary keyed by the FIR function symbol.
- */
+/** Interprocedural summary keyed by the FIR function symbol. */
 internal data class KotlinFunctionEffect(
-    val invocation: NetworkEffect = NetworkEffect.EMPTY,
+    val standard: NetworkEffect = NetworkEffect.EMPTY,
+    val longLived: NetworkEffect = NetworkEffect.EMPTY,
     val returned: LatentNetworkEffect? = null,
-    val hasUnknownRepetition: Boolean = false,
 ) {
     fun asLatent(): LatentNetworkEffect =
         LatentNetworkEffect(
-            invocation = invocation,
+            standard = standard,
+            longLived = longLived,
             returned = returned,
-            hasUnknownRepetition = hasUnknownRepetition,
         )
+
+    fun materialize(): NetworkEffect = standard.parallel(longLived)
 }
 
-/**
- * Lexical environment for latent function values and returned callbacks.
- */
+/** Lexical environment for latent function values and returned callbacks. */
 internal class KotlinEffectContext(
     val function: FirFunction,
     private val session: FirSession,
@@ -75,10 +70,7 @@ internal class KotlinEffectContext(
     var returnedLatent: LatentNetworkEffect? = null
         private set
 
-    fun bind(
-        symbol: FirBasedSymbol<*>?,
-        latent: LatentNetworkEffect?,
-    ) {
+    fun bind(symbol: FirBasedSymbol<*>?, latent: LatentNetworkEffect?) {
         if (symbol == null || latent == null) return
         latentValues[symbol] = latentValues[symbol]?.join(latent) ?: latent
     }
@@ -104,11 +96,9 @@ internal class KotlinEffectContext(
 }
 
 internal fun EffectContract.toLatentEffect(): LatentNetworkEffect =
-    LatentNetworkEffect(invocation = toNetworkEffect())
+    LatentNetworkEffect(standard = toNetworkEffect())
 
-internal fun LatentNetworkEffect?.join(
-    other: LatentNetworkEffect?,
-): LatentNetworkEffect? = when {
+internal fun LatentNetworkEffect?.join(other: LatentNetworkEffect?): LatentNetworkEffect? = when {
     this == null -> other
     other == null -> this
     else -> join(other)
