@@ -187,9 +187,12 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   completion unless ownership can be proved.
 - [x] Distinguish structured completion from escaped jobs. An unqualified
   `launch`/`async` in the current `coroutineScope`/`withContext` is a direct
-  child; work launched through any explicit scope receiver is long-lived. The
-  checker materializes this work once at function/program boundaries, in
-  parallel with ordinary work. Escaping network work requires bounded clients.
+  child only when its context is absent or a recognized dispatcher. Explicit
+  scope receivers and job-replacing or unknown contexts are long-lived. Builder
+  blocks may be visible lambdas or latent callback values; unresolved callback
+  effects are rejected. The checker materializes long-lived work once at
+  function/program boundaries, in parallel with ordinary work. Escaping network
+  work requires bounded clients.
 - Compare inferred results against hand-written core fixtures.
 
 ### M4 - Enforced bounded network scopes
