@@ -1,6 +1,7 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
 import io.github.loinguyen.bandwidth.core.NetworkEffect
+import io.github.loinguyen.bandwidth.core.DownloadLifetime
 import java.util.IdentityHashMap
 import org.jetbrains.kotlin.fir.FirElement
 import org.jetbrains.kotlin.fir.FirSession
@@ -66,8 +67,7 @@ internal class KotlinNetworkEffectVisitor(
                 null
             }
         return KotlinFunctionEffect(
-            standard = bodyEffect.standard,
-            longLived = bodyEffect.longLived,
+            network = bodyEffect.network,
             returned = context.returnedLatent.join(expressionResult),
         )
     }
@@ -105,8 +105,7 @@ internal class KotlinNetworkEffectVisitor(
         val receivers = inferReceivers(callableReferenceAccess, data)
         val target = callableReferenceAccess.resolvedSymbol()?.fir as? FirFunction
         return KotlinExpressionEffect(
-            standard = receivers.standard,
-            longLived = receivers.longLived,
+            network = receivers.network,
             latent = target?.let(::functionSummary)?.asLatent(),
         )
     }
@@ -118,8 +117,7 @@ internal class KotlinNetworkEffectVisitor(
         val initializer = infer(property.initializer, data)
         data.bind(property.symbol, initializer.latent)
         return KotlinExpressionEffect(
-            standard = initializer.standard,
-            longLived = initializer.longLived,
+            network = initializer.network,
         )
     }
 
@@ -129,8 +127,7 @@ internal class KotlinNetworkEffectVisitor(
     ): KotlinExpressionEffect {
         val receivers = inferReceivers(propertyAccessExpression, data)
         return KotlinExpressionEffect(
-            standard = receivers.standard,
-            longLived = receivers.longLived,
+            network = receivers.network,
             latent = data.latentOf(propertyAccessExpression.resolvedSymbol()),
         )
     }
@@ -144,8 +141,7 @@ internal class KotlinNetworkEffectVisitor(
             ?.resolvedSymbol()
         data.bind(target, value.latent)
         return KotlinExpressionEffect(
-            standard = value.standard,
-            longLived = value.longLived,
+            network = value.network,
         )
     }
 
@@ -206,11 +202,7 @@ internal class KotlinNetworkEffectVisitor(
                 tryExpression.catches.map { infer(it.block, data) },
         )
         val finallyEffect = infer(tryExpression.finallyBlock, data)
-        return KotlinExpressionEffect(
-            standard = alternatives.standard.then(finallyEffect.standard),
-            longLived = alternatives.longLived.then(finallyEffect.longLived),
-            latent = alternatives.latent,
-        )
+        return alternatives.then(finallyEffect).copy(latent = alternatives.latent)
     }
 
     override fun visitLoop(
@@ -235,8 +227,7 @@ internal class KotlinNetworkEffectVisitor(
         val value = infer(returnExpression.result, data)
         data.recordReturn(value.latent)
         return KotlinExpressionEffect(
-            standard = value.standard,
-            longLived = value.longLived,
+            network = value.network,
         )
     }
 
@@ -296,12 +287,11 @@ internal class KotlinNetworkEffectVisitor(
 
         val summary = functionSummary(target)
         val invocation = call.clientSelfBound(target)?.let { bound ->
-            summary.copy(standard = summary.standard.withSelfBound(bound))
+            summary.copy(network = summary.network.withSelfBound(bound))
         } ?: summary
         return evaluatedInputs.then(
             KotlinExpressionEffect(
-                standard = invocation.standard,
-                longLived = invocation.longLived,
+                network = invocation.network,
                 latent = invocation.returned,
             ),
         ).copy(
@@ -355,12 +345,13 @@ internal class KotlinNetworkEffectVisitor(
             return KotlinExpressionEffect()
         }
         val resolvedChildren = children.map { inferCoroutineBuilder(it.call, context) }
-        val evaluatedInputs = sequence(resolvedChildren.map { it.inputs })
-        val parallelChildren = resolvedChildren.fold(KotlinExpressionEffect()) { effect, child ->
-            effect.parallel(child.body ?: KotlinExpressionEffect())
+        val phases = CoroutinePhaseState<Unit>()
+        phases.recordStatement(inferReceivers(call, context))
+        resolvedChildren.forEach { child ->
+            phases.recordStatement(child.inputs)
+            child.body?.let { phases.addChild(handle = null, effect = it) }
         }
-        val receivers = inferReceivers(call, context)
-        return receivers.then(evaluatedInputs).then(parallelChildren)
+        return phases.finish()
     }
 
     /** A launch/async on an unproven receiver may outlive this expression. */
@@ -371,7 +362,7 @@ internal class KotlinNetworkEffectVisitor(
         val resolved = inferCoroutineBuilder(call, context)
         val child = resolved.body ?: return resolved.inputs
         val inputs = resolved.inputs
-        val bodyTotal = child.materialize()
+        val bodyTotal = child.network
         if (!bodyTotal.hasSelfBoundForEveryDownload) {
             problem(
                 key = "escaping-coroutine-self-bound:${context.function.displayName()}:" +
@@ -381,12 +372,17 @@ internal class KotlinNetworkEffectVisitor(
                     "bounded client for every download.",
             )
             return inputs.then(
-                KotlinExpressionEffect(longLived = bodyTotal),
+                KotlinExpressionEffect(
+                    network = bodyTotal.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
+                ),
             )
         }
-        return KotlinExpressionEffect(
-            standard = inputs.standard,
-            longLived = inputs.longLived.parallel(bodyTotal.withUnknownRepetition()),
+        return inputs.then(
+            KotlinExpressionEffect(
+                network = bodyTotal.withUnknownRepetition(
+                    lifetime = DownloadLifetime.MAY_OUTLIVE_CALL,
+                ),
+            ),
         )
     }
 
@@ -421,15 +417,13 @@ internal class KotlinNetworkEffectVisitor(
                     .filter { it !== blockArgument }
                     .map { infer(it, context) } +
                 KotlinExpressionEffect(
-                    standard = blockValue.standard,
-                    longLived = blockValue.longLived,
+                    network = blockValue.network,
                 ),
         )
         val body = visibleLambda?.let { inferCoroutineChild(it, context) }
             ?: blockValue.latent?.let { latent ->
                 KotlinExpressionEffect(
-                    standard = latent.standard,
-                    longLived = latent.longLived,
+                    network = latent.network,
                     latent = latent.returned,
                 )
             }
@@ -458,8 +452,7 @@ internal class KotlinNetworkEffectVisitor(
         val invokedCallbacks = argumentEffects.fold(KotlinExpressionEffect()) { effect, argument ->
             effect.then(
                 KotlinExpressionEffect(
-                    standard = argument.latent?.standard ?: NetworkEffect.EMPTY,
-                    longLived = argument.latent?.longLived ?: NetworkEffect.EMPTY,
+                    network = argument.latent?.network ?: NetworkEffect.EMPTY,
                 ),
             )
         }
@@ -499,8 +492,7 @@ internal class KotlinNetworkEffectVisitor(
         val body = lambda.anonymousFunction.body
         return body?.let { inferCoroutineStatements(it, context) }
             ?: KotlinExpressionEffect(
-                standard = infer(lambda, context).latent?.standard ?: NetworkEffect.EMPTY,
-                longLived = infer(lambda, context).latent?.longLived ?: NetworkEffect.EMPTY,
+                network = infer(lambda, context).latent?.network ?: NetworkEffect.EMPTY,
             )
     }
 
@@ -618,8 +610,7 @@ internal class KotlinNetworkEffectVisitor(
         }
         return evaluatedInputs.then(
             KotlinExpressionEffect(
-                standard = latent.standard,
-                longLived = latent.longLived,
+                network = latent.network,
                 latent = latent.returned,
             ),
         )
@@ -628,7 +619,7 @@ internal class KotlinNetworkEffectVisitor(
     private fun functionSummary(target: FirFunction): KotlinFunctionEffect {
         target.downloadContract(session)?.let { contract ->
             return KotlinFunctionEffect(
-                standard = NetworkEffect.download(
+                network = NetworkEffect.download(
                     maxBytes = contract.maxBytes,
                     completeTimeoutMillis = contract.completeTimeoutMillis,
                 ),
@@ -644,10 +635,9 @@ internal class KotlinNetworkEffectVisitor(
                 (invocationContract == null || (returnsFunction && returnedContract == null))
         val inferred = if (shouldInfer) inferFunction(target) else null
         return KotlinFunctionEffect(
-            standard = invocationContract?.toNetworkEffect()
-                ?: inferred?.standard
+            network = invocationContract?.toNetworkEffect()
+                ?: inferred?.network
                 ?: NetworkEffect.EMPTY,
-            longLived = inferred?.longLived ?: NetworkEffect.EMPTY,
             returned = returnedContract?.toLatentEffect()
                 ?: inferred?.returned,
         )
@@ -685,7 +675,7 @@ internal class KotlinNetworkEffectVisitor(
             }
 
             if (contract == null) {
-            if (actual.materialize() != NetworkEffect.EMPTY) {
+                if (actual.materialize() != NetworkEffect.EMPTY) {
                     problem(
                         key = "higher-order-argument:${context.function.displayName()}:" +
                             "${call.source?.startOffset}:${parameter.name}",
@@ -704,10 +694,9 @@ internal class KotlinNetworkEffectVisitor(
                     key = "higher-order-contract:${context.function.displayName()}:" +
                         "${call.source?.startOffset}:${parameter.name}",
                     source = call.source ?: context.function.source,
-                message = "Higher-order argument effect ${actual.materialize().render()} is not " +
-                        "covered by @BandwidthEffect(" +
-                        "rMaxBytesPerSecond=${contract.rMaxBytesPerSecond}, " +
-                        "nMax=${contract.nMax}) on parameter '${parameter.name}'.",
+                    message = "Higher-order argument effect ${actual.materialize().render()} is " +
+                        "not covered by @BandwidthEffect contract " +
+                        "${declaredEffect.render()} on parameter '${parameter.name}'.",
                 )
             }
         }
@@ -830,8 +819,7 @@ internal class KotlinNetworkEffectVisitor(
     private fun choice(effects: List<KotlinExpressionEffect>): KotlinExpressionEffect =
         effects.fold(KotlinExpressionEffect()) { effect, branch ->
             KotlinExpressionEffect(
-                standard = effect.standard.then(branch.standard),
-                longLived = effect.longLived.then(branch.longLived),
+                network = effect.network.choice(branch.network),
                 latent = effect.latent.join(branch.latent),
             )
         }

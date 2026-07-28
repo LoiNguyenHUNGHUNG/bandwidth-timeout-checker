@@ -9,56 +9,49 @@ import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 
 /** Effect suspended inside a Kotlin function value. */
 internal data class LatentNetworkEffect(
-    val standard: NetworkEffect = NetworkEffect.EMPTY,
-    val longLived: NetworkEffect = NetworkEffect.EMPTY,
+    val network: NetworkEffect = NetworkEffect.EMPTY,
     val returned: LatentNetworkEffect? = null,
 ) {
     fun join(other: LatentNetworkEffect): LatentNetworkEffect =
         LatentNetworkEffect(
-            standard = standard.then(other.standard),
-            longLived = longLived.then(other.longLived),
+            network = network.choice(other.network),
             returned = returned.join(other.returned),
         )
 
-    fun materialize(): NetworkEffect = standard.parallel(longLived)
+    fun materialize(): NetworkEffect = network
 }
 
 /** The effect component paired with Kotlin's already resolved type. */
 internal data class KotlinExpressionEffect(
-    val standard: NetworkEffect = NetworkEffect.EMPTY,
-    val longLived: NetworkEffect = NetworkEffect.EMPTY,
+    val network: NetworkEffect = NetworkEffect.EMPTY,
     val latent: LatentNetworkEffect? = null,
 ) {
-    fun materialize(): NetworkEffect = standard.parallel(longLived)
+    fun materialize(): NetworkEffect = network
 }
 
 internal fun KotlinExpressionEffect.then(other: KotlinExpressionEffect): KotlinExpressionEffect =
     KotlinExpressionEffect(
-        standard = standard.then(other.standard),
-        longLived = longLived.parallel(other.longLived),
+        network = network.then(other.network),
         latent = other.latent,
     )
 
 internal fun KotlinExpressionEffect.parallel(other: KotlinExpressionEffect): KotlinExpressionEffect =
     KotlinExpressionEffect(
-        standard = standard.parallel(other.standard),
-        longLived = longLived.parallel(other.longLived),
+        network = network.parallel(other.network),
     )
 
 /** Interprocedural summary keyed by the FIR function symbol. */
 internal data class KotlinFunctionEffect(
-    val standard: NetworkEffect = NetworkEffect.EMPTY,
-    val longLived: NetworkEffect = NetworkEffect.EMPTY,
+    val network: NetworkEffect = NetworkEffect.EMPTY,
     val returned: LatentNetworkEffect? = null,
 ) {
     fun asLatent(): LatentNetworkEffect =
         LatentNetworkEffect(
-            standard = standard,
-            longLived = longLived,
+            network = network,
             returned = returned,
         )
 
-    fun materialize(): NetworkEffect = standard.parallel(longLived)
+    fun materialize(): NetworkEffect = network
 }
 
 /** Lexical environment for latent function values and returned callbacks. */
@@ -96,7 +89,7 @@ internal class KotlinEffectContext(
 }
 
 internal fun EffectContract.toLatentEffect(): LatentNetworkEffect =
-    LatentNetworkEffect(standard = toNetworkEffect())
+    LatentNetworkEffect(network = toNetworkEffect())
 
 internal fun LatentNetworkEffect?.join(other: LatentNetworkEffect?): LatentNetworkEffect? = when {
     this == null -> other

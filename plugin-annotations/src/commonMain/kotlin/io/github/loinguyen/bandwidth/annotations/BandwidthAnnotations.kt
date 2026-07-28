@@ -14,8 +14,25 @@ public annotation class NetworkDownload(
 )
 
 /**
- * Conservative effect contract for an opaque function, higher-order input, or
- * returned function type whose body is unavailable to the checker.
+ * One download entry in a [BandwidthEffect] contract.
+ *
+ * [mayOutliveCall] means work represented by this entry may remain active after
+ * the annotated function or callback returns.
+ */
+@Retention(AnnotationRetention.BINARY)
+public annotation class BandwidthDownload(
+    public val rMaxBytesPerSecond: Long,
+    public val nMax: Int,
+    public val mayOutliveCall: Boolean = false,
+)
+
+/**
+ * Conservative list of download effects for an opaque function, higher-order
+ * input, or returned function type whose body is unavailable to the checker.
+ *
+ * [rMaxBytesPerSecond] and [nMax] remain as source-compatible shorthand for one
+ * completing entry. New contracts can retain rate/concurrency/lifetime
+ * correlation in [downloads].
  */
 @Target(
     AnnotationTarget.FUNCTION,
@@ -24,8 +41,9 @@ public annotation class NetworkDownload(
 )
 @Retention(AnnotationRetention.BINARY)
 public annotation class BandwidthEffect(
-    public val rMaxBytesPerSecond: Long,
-    public val nMax: Int,
+    public val rMaxBytesPerSecond: Long = 0,
+    public val nMax: Int = 0,
+    public val downloads: Array<BandwidthDownload> = [],
 )
 
 /**

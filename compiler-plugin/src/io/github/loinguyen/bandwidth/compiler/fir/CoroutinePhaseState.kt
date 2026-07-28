@@ -11,8 +11,8 @@ internal class CoroutinePhaseState<Handle : Any> {
     private val untrackedChildren = mutableListOf<KotlinExpressionEffect>()
 
     fun addChild(handle: Handle?, effect: KotlinExpressionEffect) {
-        escaping = escaping.parallel(effect.longLived)
-        val structuredPart = effect.copy(longLived = NetworkEffect.EMPTY)
+        escaping = escaping.parallel(effect.network.escapingOnly())
+        val structuredPart = effect.copy(network = effect.network.completingOnly())
         if (handle == null) untrackedChildren += structuredPart else activeChildren[handle] = structuredPart
         lastLatent = null
     }
@@ -33,8 +33,7 @@ internal class CoroutinePhaseState<Handle : Any> {
     fun finish(): KotlinExpressionEffect {
         recordPhase()
         return KotlinExpressionEffect(
-            standard = result.standard,
-            longLived = result.longLived.parallel(escaping),
+            network = result.network.then(escaping),
             latent = lastLatent,
         )
     }

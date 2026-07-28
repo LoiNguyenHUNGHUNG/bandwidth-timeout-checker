@@ -1796,6 +1796,197 @@ class CompilerPluginIntegrationTest {
         result.assertOutputContains("Cannot infer network work in a general loop")
     }
 
+    @Test
+    fun `adds equal self bounds because independent clients may share a rate`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            fun load(
+                scope: CoroutineScope,
+                @BoundedClient(k = 2) firstClient: NetworkClient,
+                @BoundedClient(k = 2) secondClient: NetworkClient,
+            ) {
+                scope.launch {
+                    firstClient.download()
+                    secondClient.download()
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 4)}")
+        result.assertOutputContains("ReqBW=4000 bytes/s")
+    }
+
+    @Test
+    fun `awaitAll overlaps an earlier child with later callback evaluation`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun childDownload() = Unit
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun callbackInputDownload() = Unit
+
+            suspend fun callbackFactory(): suspend CoroutineScope.() -> Unit {
+                callbackInputDownload()
+                return {}
+            }
+
+            suspend fun load() = coroutineScope {
+                awaitAll(
+                    async { childDownload() },
+                    async(block = callbackFactory()),
+                )
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
+        result.assertOutputContains("ReqBW=2000 bytes/s")
+    }
+
+    @Test
+    fun `annotated escaping lifetime survives an interprocedural call`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.backgroundDownload() = Unit
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun foregroundDownload() = Unit
+
+            @BandwidthEffect(
+                downloads = [
+                    BandwidthDownload(
+                        rMaxBytesPerSecond = 1_000,
+                        nMax = 2,
+                        mayOutliveCall = true,
+                    ),
+                ],
+            )
+            fun start(
+                scope: CoroutineScope,
+                @BoundedClient(k = 2) client: NetworkClient,
+            ) {
+                scope.launch { client.backgroundDownload() }
+            }
+
+            suspend fun load(scope: CoroutineScope, client: NetworkClient) {
+                start(scope, client)
+                foregroundDownload()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 3)}")
+        result.assertOutputContains("ReqBW=3000 bytes/s")
+    }
+
+    @Test
+    fun `rejects a completing contract for visible escaping work`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            @BandwidthEffect(
+                downloads = [
+                    BandwidthDownload(
+                        rMaxBytesPerSecond = 1_000,
+                        nMax = 2,
+                    ),
+                ],
+            )
+            fun start(
+                scope: CoroutineScope,
+                @BoundedClient(k = 2) client: NetworkClient,
+            ) {
+                scope.launch { client.download() }
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("is not covered by @BandwidthEffect contract")
+    }
+
+    @Test
+    fun `try and finally escaping jobs remain mutually parallel`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.first() = Unit
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.second() = Unit
+
+            fun load(
+                scope: CoroutineScope,
+                @BoundedClient(k = 2) firstClient: NetworkClient,
+                @BoundedClient(k = 2) secondClient: NetworkClient,
+            ) {
+                try {
+                    scope.launch { firstClient.first() }
+                } finally {
+                    scope.launch { secondClient.second() }
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 4)}")
+        result.assertOutputContains("ReqBW=4000 bytes/s")
+    }
+
     private fun compile(
         source: String,
         reportEffects: Boolean = false,

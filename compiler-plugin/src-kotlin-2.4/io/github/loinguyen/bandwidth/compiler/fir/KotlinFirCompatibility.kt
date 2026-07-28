@@ -8,6 +8,7 @@ import org.jetbrains.kotlin.fir.analysis.checkers.declaration.FirDeclarationChec
 import org.jetbrains.kotlin.fir.declarations.FirNamedFunction
 import org.jetbrains.kotlin.fir.declarations.FirFunction
 import org.jetbrains.kotlin.fir.expressions.FirExpression
+import org.jetbrains.kotlin.fir.expressions.FirCollectionLiteral
 import org.jetbrains.kotlin.fir.expressions.FirFunctionTypeConversionExpression
 import org.jetbrains.kotlin.fir.analysis.checkers.processOverriddenFunctionsSafe
 
@@ -30,6 +31,9 @@ internal fun CheckerContext.bandwidthSourcePath(): String =
 
 internal fun FirElement.functionTypeConversionOperand(): FirExpression? =
     (this as? FirFunctionTypeConversionExpression)?.expression
+
+internal fun FirExpression.annotationArrayElements(): List<FirExpression>? =
+    (this as? FirCollectionLiteral)?.argumentList?.arguments
 
 internal fun FirFunction.overriddenEffectContracts(
     session: org.jetbrains.kotlin.fir.FirSession,
