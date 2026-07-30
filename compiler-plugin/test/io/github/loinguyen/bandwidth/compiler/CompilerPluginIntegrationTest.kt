@@ -692,6 +692,91 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `models repeated button presses that launch bounded network work`() {
+        val result = compile(
+            """
+            package androidx.compose.material3
+
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            fun Button(
+                onClick: () -> Unit,
+                content: () -> Unit,
+            ) = Unit
+
+            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            fun DownloadButton(
+                scope: CoroutineScope,
+                @BoundedClient(k = 3) client: NetworkClient,
+            ) {
+                Button(
+                    onClick = {
+                        scope.launch { client.download() }
+                    },
+                    content = {},
+                )
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for " +
+                "androidx.compose.material3.DownloadButton: {(700, 3)}",
+        )
+        result.assertOutputContains("ReqBW=2100 bytes/s")
+    }
+
+    @Test
+    fun `rejects repeated button network work without a bounded client`() {
+        val result = compile(
+            """
+            package androidx.compose.material3
+
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            fun Button(
+                onClick: () -> Unit,
+                content: () -> Unit,
+            ) = Unit
+
+            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            fun DownloadButton(
+                scope: CoroutineScope,
+                client: NetworkClient,
+            ) {
+                Button(
+                    onClick = {
+                        scope.launch { client.download() }
+                    },
+                    content = {},
+                )
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Network work launched on an escaping coroutine scope requires a " +
+                "bounded client for every download",
+        )
+    }
+
+    @Test
     fun `sums sequential callee self bounds inside forEach launches`() {
         val result = compile(
             """
