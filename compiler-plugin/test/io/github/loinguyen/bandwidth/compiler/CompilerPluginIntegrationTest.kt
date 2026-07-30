@@ -589,6 +589,109 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `uses an image loader bound for NIA style lazy feed items`() {
+        val result = compile(
+            """
+            package androidx.compose.foundation.lazy.staggeredgrid
+
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            class LazyStaggeredGridScope
+            class ImageLoader
+
+            fun LazyVerticalStaggeredGrid(
+                content: LazyStaggeredGridScope.() -> Unit,
+            ) = Unit
+
+            fun <T> LazyStaggeredGridScope.items(
+                items: List<T>,
+                contentType: (T) -> Any? = { null },
+                itemContent: (T) -> Unit,
+            ) = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            fun rememberAsyncImagePainter(
+                model: String,
+                imageLoader: ImageLoader,
+            ) = Unit
+
+            fun NewsFeed(
+                articles: List<String>,
+                @BoundedClient(k = 4) imageLoader: ImageLoader,
+            ) {
+                LazyVerticalStaggeredGrid {
+                    items(articles) { article ->
+                        rememberAsyncImagePainter(
+                            model = article,
+                            imageLoader = imageLoader,
+                        )
+                    }
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for " +
+                "androidx.compose.foundation.lazy.staggeredgrid.NewsFeed: {(900, 4)}",
+        )
+        result.assertOutputContains("ReqBW=3600 bytes/s")
+    }
+
+    @Test
+    fun `rejects NIA style lazy feed network work without a bounded client`() {
+        val result = compile(
+            """
+            package androidx.compose.foundation.lazy.staggeredgrid
+
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            class LazyStaggeredGridScope
+            class ImageLoader
+
+            fun LazyVerticalStaggeredGrid(
+                content: LazyStaggeredGridScope.() -> Unit,
+            ) = Unit
+
+            fun <T> LazyStaggeredGridScope.items(
+                items: List<T>,
+                contentType: (T) -> Any? = { null },
+                itemContent: (T) -> Unit,
+            ) = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            fun rememberAsyncImagePainter(
+                model: String,
+                imageLoader: ImageLoader,
+            ) = Unit
+
+            fun NewsFeed(
+                articles: List<String>,
+                imageLoader: ImageLoader,
+            ) {
+                LazyVerticalStaggeredGrid {
+                    items(articles) { article ->
+                        rememberAsyncImagePainter(
+                            model = article,
+                            imageLoader = imageLoader,
+                        )
+                    }
+                }
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "may have an unknown number of active item instances",
+        )
+        result.assertOutputContains("Use a bounded client for every download")
+    }
+
+    @Test
     fun `sums sequential callee self bounds inside forEach launches`() {
         val result = compile(
             """

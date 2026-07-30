@@ -254,6 +254,9 @@ internal class KotlinNetworkEffectVisitor(
         if (target.isAwaitAll()) {
             return inferInlineAwaitAll(call, context)
         }
+        if (target.isUnknownRepeatedCallbackFunction()) {
+            return inferUnknownRepeatedCallbackCall(call, target, context)
+        }
         if (target.isSequentialCallbackFunction()) {
             return inferSequentialCallbackCall(call, context)
         }
@@ -459,6 +462,76 @@ internal class KotlinNetworkEffectVisitor(
         return receiverEffects.then(evaluatedArguments).then(invokedCallbacks)
     }
 
+    /**
+     * Compose lazy-item DSLs retain an item callback and may create an unknown
+     * number of concurrently active item instances. Callback evaluation is
+     * therefore an unknown repetition boundary, rather than an ordinary
+     * sequential higher-order invocation.
+     */
+    private fun inferUnknownRepeatedCallbackCall(
+        call: FirFunctionCall,
+        target: FirFunction,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        fun effectOf(expression: FirExpression): KotlinExpressionEffect =
+            cachedEffects.getOrPut(expression) { infer(expression, context) }
+
+        val receiverEffects = sequence(call.receiverExpressions().map(::effectOf))
+        val argumentEffects = call.argumentEffectsByParameter(::effectOf)
+        val evaluatedArguments = sequence(call.argumentList.arguments.map(::effectOf))
+        val evaluatedInputs = receiverEffects.then(evaluatedArguments)
+
+        val callbackBody = argumentEffects
+            .filterKeys { it.returnTypeRef.coneType.isSomeFunctionType(session) }
+            .entries
+            .fold(KotlinExpressionEffect()) { effect, (parameter, argument) ->
+                val latent = argument.latent
+                if (latent == null) {
+                    problem(
+                        key = "unknown-repeated-callback:${context.function.displayName()}:" +
+                            "${call.source?.startOffset}:${parameter.name}",
+                        source = call.source ?: context.function.source,
+                        message = "Cannot infer the callback effect for ${target.displayName()}. " +
+                            "Keep the lazy-item callback visible or annotate its effect.",
+                    )
+                    effect
+                } else {
+                    effect.then(
+                        KotlinExpressionEffect(
+                            network = latent.network,
+                            latent = latent.returned,
+                        ),
+                    )
+                }
+            }
+        val bodyNetwork = callbackBody.network
+        if (bodyNetwork == NetworkEffect.EMPTY) return evaluatedInputs
+
+        if (!bodyNetwork.hasSelfBoundForEveryDownload) {
+            problem(
+                key = "unknown-repeated-network:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "Network work in ${target.displayName()} may have an unknown number " +
+                    "of active item instances. Use a bounded client for every download.",
+            )
+            return evaluatedInputs.then(
+                KotlinExpressionEffect(
+                    network = bodyNetwork.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
+                ),
+            )
+        }
+
+        return evaluatedInputs.then(
+            KotlinExpressionEffect(
+                network = bodyNetwork.withUnknownRepetition(
+                    lifetime = DownloadLifetime.MAY_OUTLIVE_CALL,
+                ),
+            ),
+        )
+    }
+
     private fun inferCoroutineStatements(
         block: FirBlock,
         context: KotlinEffectContext,
@@ -578,6 +651,10 @@ internal class KotlinNetworkEffectVisitor(
 
     private fun FirFunction.isSequentialCallbackFunction(): Boolean =
         symbol.callableId.asSingleFqName().asString() in SEQUENTIAL_CALLBACK_FQ_NAMES
+
+    private fun FirFunction.isUnknownRepeatedCallbackFunction(): Boolean =
+        symbol.callableId.asSingleFqName().asString() in
+            UNKNOWN_REPEATED_CALLBACK_FQ_NAMES
 
     private fun inferFunctionInvocation(
         call: FirImplicitInvokeCall,
@@ -831,21 +908,26 @@ internal class KotlinNetworkEffectVisitor(
 
     private fun FirFunctionCall.clientSelfBound(target: FirFunction): Int? {
         if (target.downloadContract(session) == null) return null
-        val bounds = receiverExpressions()
-            .mapNotNull { receiver ->
-                val symbol = receiver.resolvedSymbol() ?: return@mapNotNull null
-                val declaration = symbol.fir
-                    as? org.jetbrains.kotlin.fir.FirAnnotationContainer
-                val capacity = declaration?.boundedClientContract(session)?.k
-                    ?: return@mapNotNull null
-                capacity
-            }
+        val bounds = (receiverExpressions() + argumentList.arguments)
+            .mapNotNull { it.boundedClientCapacity() }
             .distinct()
         return bounds.singleOrNull()
     }
 
-    private fun FirFunctionCall.isForEach(): Boolean =
-        resolvedFunction()?.symbol?.callableId?.asSingleFqName()?.asString() in FOR_EACH_FQ_NAMES
+    private fun FirExpression.boundedClientCapacity(): Int? {
+        functionTypeConversionOperand()?.let { return it.boundedClientCapacity() }
+        val expression = when (this) {
+            is FirNamedArgumentExpression -> expression
+            is FirWrappedArgumentExpression -> expression
+            is FirSpreadArgumentExpression -> expression
+            is FirWrappedExpression -> expression
+            else -> this
+        }
+        if (expression !== this) return expression.boundedClientCapacity()
+        val declaration = expression.resolvedSymbol()?.fir
+            as? org.jetbrains.kotlin.fir.FirAnnotationContainer
+        return declaration?.boundedClientContract(session)?.k
+    }
 
     private companion object {
         data class StructuredChild(
@@ -882,11 +964,19 @@ internal class KotlinNetworkEffectVisitor(
             "kotlin.collections.forEachIndexed",
             "kotlin.sequences.forEach",
             "androidx.tracing.traceAsync",
+            "androidx.compose.foundation.lazy.LazyColumn",
+            "androidx.compose.foundation.lazy.LazyRow",
+            "androidx.compose.foundation.lazy.grid.LazyHorizontalGrid",
+            "androidx.compose.foundation.lazy.grid.LazyVerticalGrid",
+            "androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid",
         )
-        val FOR_EACH_FQ_NAMES: Set<String> = setOf(
-            "kotlin.collections.forEach",
-            "kotlin.collections.forEachIndexed",
-            "kotlin.sequences.forEach",
+        val UNKNOWN_REPEATED_CALLBACK_FQ_NAMES: Set<String> = setOf(
+            "androidx.compose.foundation.lazy.items",
+            "androidx.compose.foundation.lazy.itemsIndexed",
+            "androidx.compose.foundation.lazy.grid.items",
+            "androidx.compose.foundation.lazy.grid.itemsIndexed",
+            "androidx.compose.foundation.lazy.staggeredgrid.items",
+            "androidx.compose.foundation.lazy.staggeredgrid.itemsIndexed",
         )
     }
 }
