@@ -66,18 +66,38 @@ try {
 ```
 
 `@NetworkDownload` applies only at primitive/library boundaries.
-`@BandwidthEffect(rMaxBytesPerSecond, nMax)` supplies a conservative latent
-effect when a higher-order or library body is unavailable. Other effects are
-intended to be inferred.
+`@BandwidthEffect` supplies a conservative list of download effects when a
+higher-order or library body is unavailable. The original
+`rMaxBytesPerSecond`/`nMax` arguments remain shorthand for one completing
+download effect. Contracts that may outlive their call retain that fact:
+
+```kotlin
+@BandwidthEffect(
+    downloads = [
+        BandwidthDownload(
+            rMaxBytesPerSecond = 800_000,
+            nMax = 4,
+            mayOutliveCall = true,
+        ),
+    ],
+)
+fun startBackgroundSync()
+```
+
+The checker preserves the individual rate, concurrency, self-bound, and
+lifetime fields internally instead of collapsing them to one pair.
 
 `@BoundedClient(k)` attaches a configured self bound to instances of one
-primitive download kind. A raw download carries `(r, n, selfBound=k)`.
+primitive download kind. A raw download carries
+`(r, n, selfBound=k, lifetime)`.
 Recognized concurrency constructs compute `n` with ordinary parallel algebra.
-Only unknown `forEach` repetition uses self bounds: every retained download
-receives `n = sum(selfBound)` for the callback body, while retaining its own
-`selfBound` for an enclosing `forEach`. Unknown work outside this rule is
-rejected. The checker trusts the client configuration; for OkHttp, set the
-matching `Dispatcher.maxRequests` value.
+Escaping coroutine work also uses self bounds. A `launch` or `async` through
+an explicit or otherwise unproven scope receiver may outlive its expression
+and function, so its body is summarized with unknown repetition and retained
+as long-lived work. Such a body requires a bounded client for every download.
+An unqualified builder directly inside a recognized `coroutineScope` or
+`withContext` remains structured. The checker trusts the client configuration;
+for OkHttp, set the matching `Dispatcher.maxRequests` value.
 
 For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 `try/catch` expression, but recovery paths are still joined conservatively.
@@ -85,10 +105,10 @@ This avoids assigning zero bandwidth to `try { download() } catch { showError() 
 before the alternative relation is formalized.
 
 Visible function bodies are inferred. A `@BandwidthEffect` on a visible function
-is checked as an interface contract, while calls across opaque boundaries use
-the declared effect. Invoked higher-order parameters require their own
-`@BandwidthEffect(rMaxBytesPerSecond, nMax)`, and visible callback bodies are
-checked against that declaration.
+is checked as an interface contract, including lifetime, while calls across
+opaque boundaries use the declared effect list. Invoked higher-order parameters
+require their own `@BandwidthEffect`, and visible callback bodies are checked
+against that declaration.
 
 Higher-order effects remain latent while lambdas and function references are
 stored, aliased, returned, or captured, and are charged only when the function

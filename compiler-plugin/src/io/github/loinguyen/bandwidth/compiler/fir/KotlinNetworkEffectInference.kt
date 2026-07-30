@@ -49,15 +49,14 @@ internal class KotlinNetworkEffectInference(
         diagnosticReporter = reporter
         try {
             val inferred: KotlinFunctionEffect = inferFunctionEffect(function)
-            val inferredEffect: NetworkEffect = inferred.invocation
+            val inferredEffect: NetworkEffect = inferred.materialize()
             function.effectContract(session)?.let { contract ->
                 val declaredEffect: NetworkEffect = contract.toNetworkEffect()
                 if (!inferredEffect.isCoveredBy(declaredEffect)) {
                     error(
                         function.source,
                         "Inferred effect ${inferredEffect.render()} is not covered by " +
-                            "@BandwidthEffect(rMaxBytesPerSecond=" +
-                            "${contract.rMaxBytesPerSecond}, nMax=${contract.nMax}).",
+                            "@BandwidthEffect contract ${declaredEffect.render()}.",
                     )
                 }
             }
@@ -67,22 +66,21 @@ internal class KotlinNetworkEffectInference(
                     error(
                         function.source,
                         "Inferred override effect ${inferredEffect.render()} is not covered by " +
-                            "the overridden @BandwidthEffect(rMaxBytesPerSecond=" +
-                            "${contract.rMaxBytesPerSecond}, nMax=${contract.nMax}).",
+                            "the overridden @BandwidthEffect contract " +
+                            "${declaredEffect.render()}.",
                     )
                 }
             }
             function.returnTypeRef.effectContract(session)?.let { contract ->
                 val inferredLatent: NetworkEffect =
-                    inferred.returned?.invocation ?: NetworkEffect.EMPTY
+                    inferred.returned?.materialize() ?: NetworkEffect.EMPTY
                 val declaredLatent: NetworkEffect = contract.toNetworkEffect()
                 if (!inferredLatent.isCoveredBy(declaredLatent)) {
                     error(
                         function.source,
                         "Inferred returned latent effect ${inferredLatent.render()} is not " +
-                            "covered by @BandwidthEffect(" +
-                            "rMaxBytesPerSecond=${contract.rMaxBytesPerSecond}, " +
-                            "nMax=${contract.nMax}) on the return type.",
+                            "covered by @BandwidthEffect contract " +
+                            "${declaredLatent.render()} on the return type.",
                     )
                 }
             }
@@ -106,7 +104,7 @@ internal class KotlinNetworkEffectInference(
     private fun inferFunctionEffect(function: FirFunction): KotlinFunctionEffect {
         function.downloadContract(session)?.let { contract ->
             return KotlinFunctionEffect(
-                invocation = NetworkEffect.download(
+                network = NetworkEffect.download(
                     maxBytes = contract.maxBytes,
                     completeTimeoutMillis = contract.completeTimeoutMillis,
                 ),
@@ -153,7 +151,7 @@ internal class KotlinNetworkEffectInference(
 }
 
 internal fun EffectContract.toNetworkEffect(): NetworkEffect =
-    NetworkEffect.summary(rMaxBytesPerSecond, nMax)
+    network
 
 internal fun FirFunction.displayName(): String =
     symbol.callableId.asSingleFqName().asString()

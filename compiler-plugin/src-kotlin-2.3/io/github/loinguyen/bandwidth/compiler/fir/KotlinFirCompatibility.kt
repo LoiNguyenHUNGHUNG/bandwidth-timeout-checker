@@ -8,6 +8,7 @@ import org.jetbrains.kotlin.fir.analysis.checkers.declaration.FirDeclarationChec
 import org.jetbrains.kotlin.fir.declarations.FirSimpleFunction
 import org.jetbrains.kotlin.fir.declarations.FirFunction
 import org.jetbrains.kotlin.fir.expressions.FirExpression
+import org.jetbrains.kotlin.fir.expressions.FirArrayLiteral
 import org.jetbrains.kotlin.fir.analysis.checkers.processOverriddenFunctionsSafe
 
 internal fun bandwidthFunctionEffectCheckers(
@@ -28,6 +29,9 @@ internal fun CheckerContext.bandwidthSourcePath(): String =
     containingFilePath ?: "<unknown>"
 
 internal fun FirElement.functionTypeConversionOperand(): FirExpression? = null
+
+internal fun FirExpression.annotationArrayElements(): List<FirExpression>? =
+    (this as? FirArrayLiteral)?.argumentList?.arguments
 
 internal fun FirFunction.overriddenEffectContracts(
     session: org.jetbrains.kotlin.fir.FirSession,

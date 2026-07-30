@@ -1,32 +1,24 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
-/**
- * Accumulates sequential phases inside one structured coroutine scope.
- *
- * The handle type stays generic so FIR recognition remains in the visitor.
- */
+import io.github.loinguyen.bandwidth.core.NetworkEffect
+
+/** Accumulates sequential phases inside one structured coroutine scope. */
 internal class CoroutinePhaseState<Handle : Any> {
     private var result: KotlinExpressionEffect = KotlinExpressionEffect()
+    private var escaping: NetworkEffect = NetworkEffect.EMPTY
     private var lastLatent: LatentNetworkEffect? = null
     private val activeChildren = linkedMapOf<Handle, KotlinExpressionEffect>()
     private val untrackedChildren = mutableListOf<KotlinExpressionEffect>()
 
-    fun addChild(
-        handle: Handle?,
-        effect: KotlinExpressionEffect,
-    ) {
-        if (handle == null) {
-            untrackedChildren += effect
-        } else {
-            activeChildren[handle] = effect
-        }
+    fun addChild(handle: Handle?, effect: KotlinExpressionEffect) {
+        escaping = escaping.parallel(effect.network.escapingOnly())
+        val structuredPart = effect.copy(network = effect.network.completingOnly())
+        if (handle == null) untrackedChildren += structuredPart else activeChildren[handle] = structuredPart
         lastLatent = null
     }
 
     fun synchronize(handle: Handle): Boolean {
-        if (handle !in activeChildren) {
-            return false
-        }
+        if (handle !in activeChildren) return false
         recordPhase()
         activeChildren.remove(handle)
         lastLatent = null
@@ -41,9 +33,8 @@ internal class CoroutinePhaseState<Handle : Any> {
     fun finish(): KotlinExpressionEffect {
         recordPhase()
         return KotlinExpressionEffect(
-            immediate = result.immediate,
+            network = result.network.then(escaping),
             latent = lastLatent,
-            hasUnknownRepetition = result.hasUnknownRepetition,
         )
     }
 
@@ -53,7 +44,5 @@ internal class CoroutinePhaseState<Handle : Any> {
 
     private fun activeEffect(): KotlinExpressionEffect =
         (activeChildren.values + untrackedChildren)
-            .fold(KotlinExpressionEffect()) { effect, child ->
-                effect.parallel(child)
-            }
+            .fold(KotlinExpressionEffect()) { effect, child -> effect.parallel(child) }
 }

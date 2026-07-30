@@ -27,6 +27,7 @@ FIR quantitative-effect visitor: Gamma |- e : tau |> Phi
   - primitive download -> singleton effect
   - sequence / choice -> sequential join
   - structured concurrency -> parallel composition
+  - escaping coroutine work -> download effects tagged `MAY_OUTLIVE_CALL`
   - opaque call -> declared latent effect
               |
               v
@@ -75,8 +76,9 @@ Annotations are required only where inference cannot see enough:
 
 1. `@NetworkDownload(maxBytes, completeTimeoutMillis)` on primitive network
    operations or library adapters.
-2. `@BandwidthEffect(rMaxBytesPerSecond, nMax)` on opaque functions,
-   higher-order inputs, and opaque returned function types.
+2. `@BandwidthEffect` download-effect lists on opaque functions, higher-order
+   inputs, and opaque returned function types. `(rMaxBytesPerSecond, nMax)`
+   remains one-entry shorthand.
 3. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
    enforce the stated launch bound.
 4. `@BandwidthAlternative` on a whole `try/catch` expression when the
@@ -179,12 +181,21 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 - [x] Use direct `await` and `join` calls on local child handles to shorten
   conservatively inferred overlap windows.
 - [x] Treat `withContext` as a structured scope and inline
-  `awaitAll(async { ... }, ...)` as a parallel phase that completes at the call.
+  `awaitAll(async { ... }, ...)` as source-ordered child starts followed by one
+  synchronization point.
 - [x] Model trusted `forEach` and AndroidX `traceAsync` callbacks as sequential
   invocation; unknown higher-order library calls still require contracts.
 - Keep aliased, reassigned, stored, or escaped child handles live until scope
   completion unless ownership can be proved.
-- Distinguish structured completion from escaped jobs.
+- [x] Distinguish structured completion from escaped jobs. An unqualified
+  `launch`/`async` in the current `coroutineScope`/`withContext` is a direct
+  child only when its context is absent or a recognized dispatcher. Explicit
+  scope receivers and job-replacing or unknown contexts are tagged
+  `MAY_OUTLIVE_CALL`. Builder blocks may be visible lambdas or latent callback
+  values; unresolved callback effects are rejected. Lifetime-aware sequential
+  composition keeps escaping work parallel with later work without
+  rematerializing it at every call boundary. Escaping network work requires
+  bounded clients.
 - Compare inferred results against hand-written core fixtures.
 
 ### M4 - Enforced bounded network scopes

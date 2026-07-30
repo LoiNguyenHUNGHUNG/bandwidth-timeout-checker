@@ -15,7 +15,7 @@ class NetworkEffectTest {
 
         val result = download.boundedReplication(maxConcurrentBodies = 3)
 
-        assertEquals(listOf(DownloadEffect(Rational.of(1_000), 3, selfBound = 2)), result.obligations)
+        assertEquals(listOf(DownloadEffect(Rational.of(1_000), 3, selfBound = 6)), result.obligations)
         assertEquals(Rational.of(3_000), result.requiredBandwidthBytesPerSecond())
     }
 
@@ -143,5 +143,45 @@ class NetworkEffectTest {
             listOf(DownloadEffect(Rational.of(6), 2, selfBound = 5)),
             result.obligations,
         )
+    }
+
+    @Test
+    fun `normalization accumulates equal bounds without assuming shared client identity`() {
+        val result = NetworkEffect.of(
+            listOf(
+                DownloadEffect(Rational.of(1_000), 1, selfBound = 2),
+                DownloadEffect(Rational.of(1_000), 1, selfBound = 2),
+            ),
+        ).withUnknownRepetition()
+
+        assertEquals(
+            listOf(DownloadEffect(Rational.of(1_000), 4, selfBound = 4)),
+            result.obligations,
+        )
+    }
+
+    @Test
+    fun `sequential composition overlaps escaping work with later work`() {
+        val escaping = NetworkEffect.download(1_000, 1_000)
+            .withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+        val later = NetworkEffect.download(500, 1_000)
+
+        val result = escaping.then(later)
+
+        assertEquals(2, result.maxConcurrency)
+        assertEquals(Rational.of(2_000), result.requiredBandwidthBytesPerSecond())
+    }
+
+    @Test
+    fun `effect coverage preserves lifetime direction`() {
+        val completing = NetworkEffect.summary(1_000, 2)
+        val escaping = NetworkEffect.summary(
+            1_000,
+            2,
+            lifetime = DownloadLifetime.MAY_OUTLIVE_CALL,
+        )
+
+        assertTrue(completing.isCoveredBy(escaping))
+        assertTrue(!escaping.isCoveredBy(completing))
     }
 }
