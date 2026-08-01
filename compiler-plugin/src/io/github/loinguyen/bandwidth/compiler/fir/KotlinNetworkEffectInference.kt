@@ -39,6 +39,13 @@ internal class KotlinNetworkEffectInference(
         reportProblem = ::problem,
     )
 
+    /**
+     * Infers and validates [function] once for the current compilation.
+     *
+     * The inferred eager and returned latent effects are checked against direct,
+     * overridden, and return-type contracts. Optional informational reporting
+     * is emitted through the compiler message collector.
+     */
     fun analyze(
         function: FirFunction,
         context: CheckerContext,
@@ -101,6 +108,10 @@ internal class KotlinNetworkEffectInference(
         }
     }
 
+    /**
+     * Returns a cached or newly inferred summary for [function], using primitive
+     * contracts and annotated recursion boundaries when available.
+     */
     private fun inferFunctionEffect(function: FirFunction): KotlinFunctionEffect {
         function.downloadContract(session)?.let { contract ->
             return KotlinFunctionEffect(
@@ -128,6 +139,7 @@ internal class KotlinNetworkEffectInference(
         return result
     }
 
+    /** Reports a keyed inference [message] at most once. */
     private fun problem(
         key: String,
         source: KtSourceElement?,
@@ -138,6 +150,7 @@ internal class KotlinNetworkEffectInference(
         }
     }
 
+    /** Emits an FIR error at [source] while an analysis context is active. */
     private fun error(source: KtSourceElement?, message: String) {
         val context = diagnosticContext ?: return
         val reporter = diagnosticReporter ?: return
@@ -150,12 +163,15 @@ internal class KotlinNetworkEffectInference(
     }
 }
 
+/** Returns the quantitative network effect represented by this contract. */
 internal fun EffectContract.toNetworkEffect(): NetworkEffect =
     network
 
+/** Returns this function's fully qualified callable name for diagnostics. */
 internal fun FirFunction.displayName(): String =
     symbol.callableId.asSingleFqName().asString()
 
+/** Renders rate/concurrency obligations in a compact diagnostic format. */
 internal fun NetworkEffect.render(): String =
     obligations.joinToString(prefix = "{", postfix = "}") {
         "(${it.requiredRateBytesPerSecond}, ${it.concurrency})"

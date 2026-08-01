@@ -11,6 +11,7 @@ import org.jetbrains.kotlin.gradle.plugin.SubpluginOption
 
 @Suppress("unused") // Loaded by Gradle from the plugin marker.
 class BandwidthCheckerGradlePlugin : KotlinCompilerPluginSupportPlugin {
+    /** Registers the `bandwidthChecker` extension on [target]. */
     override fun apply(target: Project) {
         target.extensions.create(
             "bandwidthChecker",
@@ -18,16 +19,26 @@ class BandwidthCheckerGradlePlugin : KotlinCompilerPluginSupportPlugin {
         )
     }
 
+    /** Returns `true` because the checker supports every Kotlin compilation. */
     override fun isApplicable(kotlinCompilation: KotlinCompilation<*>): Boolean = true
 
+    /** Returns the compiler plugin identifier passed to Kotlin Gradle tooling. */
     override fun getCompilerPluginId(): String = BuildConfig.KOTLIN_PLUGIN_ID
 
+    /** Returns the coordinates of the compiler-plugin artifact Gradle must load. */
     override fun getPluginArtifact(): SubpluginArtifact = SubpluginArtifact(
         groupId = BuildConfig.KOTLIN_PLUGIN_GROUP,
         artifactId = BuildConfig.KOTLIN_PLUGIN_NAME,
         version = BuildConfig.KOTLIN_PLUGIN_VERSION,
     )
 
+    /**
+     * Adds the annotations dependency, orders the compiler plugin after
+     * Compose, and maps extension values to compiler options.
+     *
+     * @param kotlinCompilation the compilation being configured.
+     * @return a provider of options evaluated from the project extension.
+     */
     override fun applyToCompilation(
         kotlinCompilation: KotlinCompilation<*>,
     ): Provider<List<SubpluginOption>> {

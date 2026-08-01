@@ -34,6 +34,7 @@ internal class BandwidthFirCheckersExtension(
 private object BandwidthAnnotationChecker :
     FirDeclarationChecker<FirDeclaration>(MppCheckerKind.Common) {
     context(context: CheckerContext, reporter: DiagnosticReporter)
+    /** Reports every invalid bandwidth annotation attached to [declaration]. */
     override fun check(declaration: FirDeclaration) {
         declaration.validateBandwidthAnnotations(context.session).forEach { problem ->
             reporter.reportOn(

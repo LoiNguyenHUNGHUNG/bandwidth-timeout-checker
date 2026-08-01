@@ -13,6 +13,7 @@ import org.jetbrains.kotlin.diagnostics.rendering.Renderer
 internal object BandwidthDiagnostics : KtDiagnosticsContainer() {
     val ERROR by error1<PsiElement, String>()
 
+    /** Returns the renderer factory for bandwidth diagnostics. */
     override fun getRendererFactory(): BaseDiagnosticRendererFactory =
         BandwidthDiagnosticRendererFactory
 

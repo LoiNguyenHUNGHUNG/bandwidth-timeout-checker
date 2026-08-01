@@ -15,6 +15,13 @@ public class BoundedScopeGate(
 
     private val semaphore: Semaphore = Semaphore(permits)
 
+    /**
+     * Runs [block] after acquiring one permit and releases it when the block
+     * completes, fails, or is cancelled.
+     *
+     * @param block the suspending operation protected by this gate.
+     * @return the value returned by [block].
+     */
     public suspend fun <T> withPermit(block: suspend () -> T): T =
         semaphore.withPermit { block() }
 }

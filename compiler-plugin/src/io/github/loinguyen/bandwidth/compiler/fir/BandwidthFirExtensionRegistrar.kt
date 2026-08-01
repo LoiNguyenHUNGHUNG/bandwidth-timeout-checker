@@ -8,6 +8,7 @@ internal class BandwidthFirExtensionRegistrar(
     private val messages: MessageCollector,
     private val reportEffects: Boolean,
 ) : FirExtensionRegistrar() {
+    /** Registers the declaration checkers and their diagnostic definitions. */
     override fun ExtensionRegistrarContext.configurePlugin() {
         +{ session: FirSession ->
             BandwidthFirCheckersExtension(
