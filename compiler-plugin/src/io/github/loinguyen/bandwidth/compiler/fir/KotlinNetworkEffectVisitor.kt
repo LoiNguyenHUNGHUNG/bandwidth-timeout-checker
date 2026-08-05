@@ -54,6 +54,12 @@ internal class KotlinNetworkEffectVisitor(
         message: String,
     ) -> Unit,
 ) : FirVisitor<KotlinExpressionEffect, KotlinEffectContext>() {
+    /**
+     * Infers the eager effect and callback-valued return of [function].
+     *
+     * @param latentValues shared bindings for function values resolved across
+     * interprocedural analysis.
+     */
     fun inferFunctionBody(
         function: FirFunction,
         latentValues: MutableMap<FirBasedSymbol<*>, LatentNetworkEffect>,
@@ -72,12 +78,19 @@ internal class KotlinNetworkEffectVisitor(
         )
     }
 
+    /**
+     * Infers [element], treating a missing FIR node as an effect-free expression.
+     */
     fun infer(
         element: FirElement?,
         context: KotlinEffectContext,
     ): KotlinExpressionEffect =
         element?.accept(this, context) ?: KotlinExpressionEffect()
 
+    /**
+     * Infers an otherwise unsupported element through its conversion operand or
+     * non-function children.
+     */
     override fun visitElement(
         element: FirElement,
         data: KotlinEffectContext,
@@ -85,11 +98,16 @@ internal class KotlinNetworkEffectVisitor(
         element.functionTypeConversionOperand()?.let { infer(it, data) }
             ?: inferChildren(element, data)
 
+    /**
+     * Leaves a nested function declaration latent; its body is charged only on
+     * invocation.
+     */
     override fun visitFunction(
         function: FirFunction,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = KotlinExpressionEffect()
 
+    /** Wraps a visible anonymous function's summary as a latent value. */
     override fun visitAnonymousFunctionExpression(
         anonymousFunctionExpression: FirAnonymousFunctionExpression,
         data: KotlinEffectContext,
@@ -98,6 +116,10 @@ internal class KotlinNetworkEffectVisitor(
             latent = inferFunction(anonymousFunctionExpression.anonymousFunction).asLatent(),
         )
 
+    /**
+     * Evaluates a callable reference's receivers and returns the target summary
+     * as a latent value.
+     */
     override fun visitCallableReferenceAccess(
         callableReferenceAccess: FirCallableReferenceAccess,
         data: KotlinEffectContext,
@@ -110,6 +132,10 @@ internal class KotlinNetworkEffectVisitor(
         )
     }
 
+    /**
+     * Infers a property initializer and binds any resulting function value to
+     * the property symbol.
+     */
     override fun visitProperty(
         property: FirProperty,
         data: KotlinEffectContext,
@@ -121,6 +147,7 @@ internal class KotlinNetworkEffectVisitor(
         )
     }
 
+    /** Infers receiver work and restores the latent value bound to a property. */
     override fun visitPropertyAccessExpression(
         propertyAccessExpression: FirPropertyAccessExpression,
         data: KotlinEffectContext,
@@ -132,6 +159,10 @@ internal class KotlinNetworkEffectVisitor(
         )
     }
 
+    /**
+     * Infers an assigned value and conservatively joins its latent effect into
+     * the target symbol.
+     */
     override fun visitVariableAssignment(
         variableAssignment: FirVariableAssignment,
         data: KotlinEffectContext,
@@ -145,42 +176,53 @@ internal class KotlinNetworkEffectVisitor(
         )
     }
 
+    /** Forwards a type operator to its single operand. */
     override fun visitTypeOperatorCall(
         typeOperatorCall: FirTypeOperatorCall,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect =
         infer(typeOperatorCall.argumentList.arguments.singleOrNull(), data)
 
+    /** Forwards a wrapped argument to its underlying expression. */
     override fun visitWrappedArgumentExpression(
         wrappedArgumentExpression: FirWrappedArgumentExpression,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = infer(wrappedArgumentExpression.expression, data)
 
+    /** Forwards a named argument to its underlying expression. */
     override fun visitNamedArgumentExpression(
         namedArgumentExpression: FirNamedArgumentExpression,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = infer(namedArgumentExpression.expression, data)
 
+    /** Forwards a spread argument to its underlying expression. */
     override fun visitSpreadArgumentExpression(
         spreadArgumentExpression: FirSpreadArgumentExpression,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = infer(spreadArgumentExpression.expression, data)
 
+    /** Forwards a generic FIR wrapper to its underlying expression. */
     override fun visitWrappedExpression(
         wrappedExpression: FirWrappedExpression,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = infer(wrappedExpression.expression, data)
 
+    /** Infers an ordinary resolved function call. */
     override fun visitFunctionCall(
         functionCall: FirFunctionCall,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = inferCall(functionCall, data)
 
+    /** Infers invocation of a Kotlin function value. */
     override fun visitImplicitInvokeCall(
         implicitInvokeCall: FirImplicitInvokeCall,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = inferCall(implicitInvokeCall, data)
 
+    /**
+     * Sequentially evaluates each branch condition with its result, then joins
+     * the branches as alternatives.
+     */
     override fun visitWhenExpression(
         whenExpression: FirWhenExpression,
         data: KotlinEffectContext,
@@ -193,6 +235,10 @@ internal class KotlinNetworkEffectVisitor(
         },
     )
 
+    /**
+     * Joins the try and catch paths as alternatives and appends the finally
+     * effect to every path.
+     */
     override fun visitTryExpression(
         tryExpression: FirTryExpression,
         data: KotlinEffectContext,
@@ -205,21 +251,28 @@ internal class KotlinNetworkEffectVisitor(
         return alternatives.then(finallyEffect).copy(latent = alternatives.latent)
     }
 
+    /** Applies the general-loop inference rule to [loop]. */
     override fun visitLoop(
         loop: FirLoop,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = inferLoop(loop, data)
 
+    /** Applies the general-loop inference rule to [whileLoop]. */
     override fun visitWhileLoop(
         whileLoop: FirWhileLoop,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = inferLoop(whileLoop, data)
 
+    /** Applies the general-loop inference rule to [doWhileLoop]. */
     override fun visitDoWhileLoop(
         doWhileLoop: FirDoWhileLoop,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = inferLoop(doWhileLoop, data)
 
+    /**
+     * Infers the returned expression and records callback-valued returns in the
+     * enclosing function context.
+     */
     override fun visitReturnExpression(
         returnExpression: FirReturnExpression,
         data: KotlinEffectContext,
@@ -231,6 +284,7 @@ internal class KotlinNetworkEffectVisitor(
         )
     }
 
+    /** Sequentially composes every statement in [block]. */
     override fun visitBlock(
         block: FirBlock,
         data: KotlinEffectContext,
@@ -238,6 +292,10 @@ internal class KotlinNetworkEffectVisitor(
         block.statements.map { infer(it, data) },
     )
 
+    /**
+     * Dispatches a resolved call to specialized coroutine or callback rules,
+     * falling back to ordinary argument evaluation and function summarization.
+     */
     private fun inferCall(
         call: FirFunctionCall,
         context: KotlinEffectContext,
@@ -264,6 +322,7 @@ internal class KotlinNetworkEffectVisitor(
             return inferSequentialCallbackCall(call, context)
         }
         val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        /** Infers [expression] at most once for this call site. */
         fun effectOf(expression: FirExpression): KotlinExpressionEffect =
             cachedEffects.getOrPut(expression) { infer(expression, context) }
 
@@ -334,6 +393,10 @@ internal class KotlinNetworkEffectVisitor(
         return thenValue(evaluatedInputs, inferCoroutineStatements(body, context))
     }
 
+    /**
+     * Infers `awaitAll` when every argument is an inline structured `async`
+     * child and composes their start phases before the common synchronization.
+     */
     private fun inferInlineAwaitAll(
         call: FirFunctionCall,
         context: KotlinEffectContext,
@@ -444,11 +507,16 @@ internal class KotlinNetworkEffectVisitor(
         return CoroutineBuilderEffect(inputs = inputs, body = body)
     }
 
+    /**
+     * Evaluates receivers and arguments, then invokes every latent callback once
+     * in argument order.
+     */
     private fun inferSequentialCallbackCall(
         call: FirFunctionCall,
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
         val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        /** Infers [expression] at most once for this call site. */
         fun effectOf(expression: FirExpression): KotlinExpressionEffect =
             cachedEffects.getOrPut(expression) { infer(expression, context) }
 
@@ -477,6 +545,7 @@ internal class KotlinNetworkEffectVisitor(
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
         val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        /** Infers [expression] at most once for this call site. */
         fun effectOf(expression: FirExpression): KotlinExpressionEffect =
             cachedEffects.getOrPut(expression) { infer(expression, context) }
 
@@ -553,6 +622,7 @@ internal class KotlinNetworkEffectVisitor(
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
         val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        /** Infers [expression] at most once for this call site. */
         fun effectOf(expression: FirExpression): KotlinExpressionEffect =
             cachedEffects.getOrPut(expression) { infer(expression, context) }
 
@@ -611,6 +681,10 @@ internal class KotlinNetworkEffectVisitor(
         )
     }
 
+    /**
+     * Divides a structured coroutine [block] into overlap phases, recognizing
+     * direct child starts and handle-specific waits.
+     */
     private fun inferCoroutineStatements(
         block: FirBlock,
         context: KotlinEffectContext,
@@ -637,6 +711,10 @@ internal class KotlinNetworkEffectVisitor(
         return phases.finish()
     }
 
+    /**
+     * Infers a visible coroutine [lambda] as structured statements, with a
+     * latent-summary fallback when no block is available.
+     */
     private fun inferCoroutineChild(
         lambda: FirAnonymousFunctionExpression,
         context: KotlinEffectContext,
@@ -648,6 +726,10 @@ internal class KotlinNetworkEffectVisitor(
             )
     }
 
+    /**
+     * Unwraps this statement as a proven structured coroutine child, retaining
+     * a local property symbol as its synchronization handle when present.
+     */
     private fun FirElement.structuredChild(): StructuredChild? {
         functionTypeConversionOperand()?.let { return it.structuredChild() }
         return when (this) {
@@ -668,6 +750,9 @@ internal class KotlinNetworkEffectVisitor(
         }
     }
 
+    /**
+     * Returns the local child handle directly awaited or joined by this element.
+     */
     private fun FirElement.coroutineWaitedHandle(): FirBasedSymbol<*>? {
         functionTypeConversionOperand()?.let { return it.coroutineWaitedHandle() }
         val call =
@@ -688,12 +773,14 @@ internal class KotlinNetworkEffectVisitor(
             .firstOrNull()
     }
 
+    /** Returns the call's single visible lambda argument, if unambiguous. */
     private fun FirFunctionCall.visibleLambdaArgument(): FirAnonymousFunctionExpression? =
         argumentList.arguments
             .asSequence()
             .mapNotNull { it.visibleLambda() }
             .singleOrNull()
 
+    /** Unwraps this expression to a directly visible anonymous function. */
     private fun FirExpression.visibleLambda(): FirAnonymousFunctionExpression? {
         functionTypeConversionOperand()?.let { return it.visibleLambda() }
         return when (this) {
@@ -706,6 +793,7 @@ internal class KotlinNetworkEffectVisitor(
         }
     }
 
+    /** Recursively flattens FIR vararg containers into source argument expressions. */
     private fun FirExpression.flattenVarargArguments(): List<FirExpression> =
         if (this is FirVarargArgumentsExpression) {
             arguments.flatMap { it.flattenVarargArguments() }
@@ -713,32 +801,44 @@ internal class KotlinNetworkEffectVisitor(
             listOf(this)
         }
 
+    /** Returns this call's resolved FIR function, if resolution succeeded. */
     private fun FirFunctionCall.resolvedFunction(): FirFunction? =
         (resolvedSymbol() as? FirFunctionSymbol<*>)?.fir
 
+    /** Returns whether this function is a modeled structured coroutine scope. */
     private fun FirFunction.isStructuredCoroutineScope(): Boolean =
         symbol.callableId.asSingleFqName().asString() in STRUCTURED_COROUTINE_SCOPE_FQ_NAMES
 
+    /** Returns whether this function is a modeled coroutine child builder. */
     private fun FirFunction.isCoroutineBuilder(): Boolean =
         symbol.callableId.asSingleFqName().asString() in COROUTINE_BUILDER_FQ_NAMES
 
+    /** Returns whether this function directly synchronizes one coroutine child. */
     private fun FirFunction.isCoroutineWait(): Boolean =
         symbol.callableId.asSingleFqName().asString() in COROUTINE_WAIT_FQ_NAMES
 
+    /** Returns whether this function is the modeled `awaitAll` overload family. */
     private fun FirFunction.isAwaitAll(): Boolean =
         symbol.callableId.asSingleFqName().asString() == AWAIT_ALL_FQ_NAME
 
+    /** Returns whether this function invokes its callbacks sequentially once. */
     private fun FirFunction.isSequentialCallbackFunction(): Boolean =
         symbol.callableId.asSingleFqName().asString() in SEQUENTIAL_CALLBACK_FQ_NAMES
 
+    /** Returns whether this UI function retains callbacks for serial events. */
     private fun FirFunction.isSerialEventCallbackFunction(): Boolean =
         symbol.callableId.asSingleFqName().asString() in
             SERIAL_EVENT_CALLBACK_FQ_NAMES
 
+    /** Returns whether this function may create an unknown number of callback instances. */
     private fun FirFunction.isUnknownRepeatedCallbackFunction(): Boolean =
         symbol.callableId.asSingleFqName().asString() in
             UNKNOWN_REPEATED_CALLBACK_FQ_NAMES
 
+    /**
+     * Materializes the latent effect of an implicitly invoked function value
+     * after its receiver and argument inputs have been evaluated.
+     */
     private fun inferFunctionInvocation(
         call: FirImplicitInvokeCall,
         invokedValue: FirExpression?,
@@ -776,6 +876,10 @@ internal class KotlinNetworkEffectVisitor(
         )
     }
 
+    /**
+     * Resolves [target] through primitive, declared, cached, or inferred eager
+     * and returned-latent effects.
+     */
     private fun functionSummary(target: FirFunction): KotlinFunctionEffect {
         target.downloadContract(session)?.let { contract ->
             return KotlinFunctionEffect(
@@ -803,6 +907,10 @@ internal class KotlinNetworkEffectVisitor(
         )
     }
 
+    /**
+     * Requires resolvable latent effects for function-valued arguments and
+     * checks them against parameter contracts when supplied.
+     */
     private fun validateHigherOrderArguments(
         call: FirFunctionCall,
         target: FirFunction,
@@ -862,6 +970,10 @@ internal class KotlinNetworkEffectVisitor(
         }
     }
 
+    /**
+     * Infers one representative iteration and rejects effectful general loops
+     * because no finite repetition bound is known.
+     */
     private fun inferLoop(
         loop: FirLoop,
         context: KotlinEffectContext,
@@ -882,6 +994,10 @@ internal class KotlinNetworkEffectVisitor(
         return KotlinExpressionEffect()
     }
 
+    /**
+     * Sequentially infers direct non-function children of an otherwise
+     * unhandled FIR element.
+     */
     private fun inferChildren(
         element: FirElement,
         context: KotlinEffectContext,
@@ -889,16 +1005,19 @@ internal class KotlinNetworkEffectVisitor(
         val children = mutableListOf<KotlinExpressionEffect>()
         element.acceptChildren(
             object : FirVisitorVoid() {
+                /** Adds the inferred effect of [element] to the child sequence. */
                 override fun visitElement(element: FirElement) {
                     children += infer(element, context)
                 }
 
+                /** Skips nested function bodies because they remain latent. */
                 override fun visitFunction(function: FirFunction) = Unit
             },
         )
         return sequence(children)
     }
 
+    /** Sequentially infers the distinct receivers of [expression]. */
     private fun inferReceivers(
         expression: FirQualifiedAccessExpression,
         context: KotlinEffectContext,
@@ -906,6 +1025,7 @@ internal class KotlinNetworkEffectVisitor(
         expression.receiverExpressions().map { infer(it, context) },
     )
 
+    /** Returns explicit, dispatch, and extension receivers without identity duplicates. */
     private fun FirQualifiedAccessExpression.receiverExpressions(): List<FirExpression> {
         val result = mutableListOf<FirExpression>()
         listOf(explicitReceiver, dispatchReceiver, extensionReceiver).forEach { receiver ->
@@ -916,6 +1036,10 @@ internal class KotlinNetworkEffectVisitor(
         return result
     }
 
+    /**
+     * Maps resolved value parameters to their evaluated argument effects,
+     * sequencing multiple expressions assigned to the same vararg parameter.
+     */
     private fun FirFunctionCall.argumentEffectsByParameter(
         effectOf: (FirExpression) -> KotlinExpressionEffect,
     ): Map<FirValueParameter, KotlinExpressionEffect> {
@@ -928,6 +1052,7 @@ internal class KotlinNetworkEffectVisitor(
         }
     }
 
+    /** Returns the resolved argument mapped to the parameter named [name]. */
     private fun FirFunctionCall.argumentForParameter(name: String): FirExpression? {
         val mapping = (argumentList as? FirResolvedArgumentList)?.mapping ?: return null
         return mapping.entries.firstOrNull { (_, parameter) ->
@@ -935,6 +1060,10 @@ internal class KotlinNetworkEffectVisitor(
         }?.key
     }
 
+    /**
+     * Returns whether this builder is an unqualified direct child whose context
+     * cannot replace the structured parent job.
+     */
     private fun FirFunctionCall.isProvenStructuredChild(): Boolean {
         if (resolvedFunction()?.isCoroutineBuilder() != true || explicitReceiver?.source != null) {
             return false
@@ -943,6 +1072,7 @@ internal class KotlinNetworkEffectVisitor(
         return coroutineContext.isKnownDispatcherOnly()
     }
 
+    /** Returns whether this expression resolves to a recognized dispatcher value. */
     private fun FirExpression.isKnownDispatcherOnly(): Boolean {
         functionTypeConversionOperand()?.let { return it.isKnownDispatcherOnly() }
         val unwrapped = when (this) {
@@ -958,6 +1088,7 @@ internal class KotlinNetworkEffectVisitor(
         return callableId in DISPATCHER_CONTEXT_FQ_NAMES
     }
 
+    /** Returns the symbol referenced by a resolved qualified access. */
     private fun FirElement.resolvedSymbol(): FirBasedSymbol<*>? =
         when (this) {
             is FirQualifiedAccessExpression ->
@@ -965,6 +1096,7 @@ internal class KotlinNetworkEffectVisitor(
             else -> null
         }
 
+    /** Forwards a source-located, deduplication-keyed inference problem. */
     private fun problem(
         key: String,
         source: KtSourceElement?,
@@ -973,9 +1105,11 @@ internal class KotlinNetworkEffectVisitor(
         reportProblem(key, source, message)
     }
 
+    /** Sequentially folds [effects] from an empty expression effect. */
     private fun sequence(effects: List<KotlinExpressionEffect>): KotlinExpressionEffect =
         effects.fold(KotlinExpressionEffect()) { effect, next -> effect.then(next) }
 
+    /** Conservatively joins [effects] as mutually exclusive branches. */
     private fun choice(effects: List<KotlinExpressionEffect>): KotlinExpressionEffect =
         effects.fold(KotlinExpressionEffect()) { effect, branch ->
             KotlinExpressionEffect(
@@ -984,11 +1118,16 @@ internal class KotlinNetworkEffectVisitor(
             )
         }
 
+    /** Sequences [first] before [second] and returns the latter's latent value. */
     private fun thenValue(
         first: KotlinExpressionEffect,
         second: KotlinExpressionEffect,
     ): KotlinExpressionEffect = first.then(second)
 
+    /**
+     * Returns the unique bounded-client capacity attached to a primitive
+     * download call's receivers or arguments.
+     */
     private fun FirFunctionCall.clientSelfBound(target: FirFunction): Int? {
         if (target.downloadContract(session) == null) return null
         val bounds = (receiverExpressions() + argumentList.arguments)
@@ -997,6 +1136,7 @@ internal class KotlinNetworkEffectVisitor(
         return bounds.singleOrNull()
     }
 
+    /** Resolves a `@BoundedClient` capacity from this expression's declaration. */
     private fun FirExpression.boundedClientCapacity(): Int? {
         functionTypeConversionOperand()?.let { return it.boundedClientCapacity() }
         val expression = when (this) {

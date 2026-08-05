@@ -13,6 +13,12 @@ class BandwidthCompilerPluginRegistrar : CompilerPluginRegistrar() {
     override val pluginId: String = BuildConfig.KOTLIN_PLUGIN_ID
     override val supportsK2: Boolean = true
 
+    /**
+     * Registers the FIR checker when enabled in [configuration].
+     *
+     * The configured message collector and effect-reporting flag are forwarded
+     * to the version-aligned FIR extension.
+     */
     override fun ExtensionStorage.registerExtensions(configuration: CompilerConfiguration) {
         if (!configuration.get(BandwidthConfiguration.ENABLED, true)) return
 

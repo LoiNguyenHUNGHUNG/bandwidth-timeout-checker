@@ -12,12 +12,17 @@ internal data class LatentNetworkEffect(
     val network: NetworkEffect = NetworkEffect.EMPTY,
     val returned: LatentNetworkEffect? = null,
 ) {
+    /**
+     * Conservatively joins this latent effect with [other], including callbacks
+     * returned by either function value.
+     */
     fun join(other: LatentNetworkEffect): LatentNetworkEffect =
         LatentNetworkEffect(
             network = network.choice(other.network),
             returned = returned.join(other.returned),
         )
 
+    /** Returns the network work performed when this function value is invoked. */
     fun materialize(): NetworkEffect = network
 }
 
@@ -26,15 +31,26 @@ internal data class KotlinExpressionEffect(
     val network: NetworkEffect = NetworkEffect.EMPTY,
     val latent: LatentNetworkEffect? = null,
 ) {
+    /** Returns the eager network effect of evaluating the expression. */
     fun materialize(): NetworkEffect = network
 }
 
+/**
+ * Sequentially composes expression effects, preserving only the value produced
+ * by [other] as the resulting latent value.
+ */
 internal fun KotlinExpressionEffect.then(other: KotlinExpressionEffect): KotlinExpressionEffect =
     KotlinExpressionEffect(
         network = network.then(other.network),
         latent = other.latent,
     )
 
+/**
+ * Composes the eager work of two concurrently evaluated expressions.
+ *
+ * Latent values are discarded because parallel composition does not select a
+ * single resulting Kotlin value.
+ */
 internal fun KotlinExpressionEffect.parallel(other: KotlinExpressionEffect): KotlinExpressionEffect =
     KotlinExpressionEffect(
         network = network.parallel(other.network),
@@ -45,12 +61,14 @@ internal data class KotlinFunctionEffect(
     val network: NetworkEffect = NetworkEffect.EMPTY,
     val returned: LatentNetworkEffect? = null,
 ) {
+    /** Converts this interprocedural summary to a storable latent function effect. */
     fun asLatent(): LatentNetworkEffect =
         LatentNetworkEffect(
             network = network,
             returned = returned,
         )
 
+    /** Returns the network work performed by invoking the summarized function. */
     fun materialize(): NetworkEffect = network
 }
 
@@ -63,11 +81,20 @@ internal class KotlinEffectContext(
     var returnedLatent: LatentNetworkEffect? = null
         private set
 
+    /**
+     * Associates [latent] with [symbol], joining it with any prior branch value.
+     *
+     * Null symbols and non-function values are ignored.
+     */
     fun bind(symbol: FirBasedSymbol<*>?, latent: LatentNetworkEffect?) {
         if (symbol == null || latent == null) return
         latentValues[symbol] = latentValues[symbol]?.join(latent) ?: latent
     }
 
+    /**
+     * Resolves the latent effect of [symbol] from lexical bindings or an
+     * annotation on the declaration or its return type.
+     */
     fun latentOf(symbol: FirBasedSymbol<*>?): LatentNetworkEffect? {
         symbol ?: return null
         latentValues[symbol]?.let { return it }
@@ -82,15 +109,22 @@ internal class KotlinEffectContext(
             ?.toLatentEffect()
     }
 
+    /** Joins a callback-valued return into this function's returned effect. */
     fun recordReturn(latent: LatentNetworkEffect?) {
         if (latent == null) return
         returnedLatent = returnedLatent?.join(latent) ?: latent
     }
 }
 
+/** Converts this annotation contract to a latent function-value effect. */
 internal fun EffectContract.toLatentEffect(): LatentNetworkEffect =
     LatentNetworkEffect(network = toNetworkEffect())
 
+/**
+ * Null-aware conservative join for optional latent effects.
+ *
+ * @return the non-null operand, their join, or `null` when both are absent.
+ */
 internal fun LatentNetworkEffect?.join(other: LatentNetworkEffect?): LatentNetworkEffect? = when {
     this == null -> other
     other == null -> this

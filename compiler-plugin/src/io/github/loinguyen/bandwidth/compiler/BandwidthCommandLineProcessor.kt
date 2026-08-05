@@ -15,6 +15,12 @@ class BandwidthCommandLineProcessor : CommandLineProcessor {
         REPORT_EFFECTS_OPTION,
     )
 
+    /**
+     * Parses a supported Boolean option into [configuration].
+     *
+     * @throws IllegalArgumentException if [value] is not a strict Boolean.
+     * @throws IllegalStateException if [option] is not declared by this plugin.
+     */
     override fun processOption(
         option: AbstractCliOption,
         value: String,

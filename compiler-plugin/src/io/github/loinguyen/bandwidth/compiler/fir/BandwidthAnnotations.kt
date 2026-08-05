@@ -65,11 +65,21 @@ internal data class AnnotationProblem(
     val message: String,
 )
 
+/**
+ * Finds the annotation identified by [classId] on this container.
+ *
+ * @return the resolved annotation, or `null` when it is absent.
+ */
 internal fun FirAnnotationContainer.annotation(
     classId: ClassId,
     session: FirSession,
 ): FirAnnotation? = getAnnotationByClassId(classId, session)
 
+/**
+ * Parses a valid `@NetworkDownload` contract from this container.
+ *
+ * @return the parsed contract, or `null` when the annotation is absent or invalid.
+ */
 internal fun FirAnnotationContainer.downloadContract(session: FirSession): DownloadContract? {
     val annotation: FirAnnotation = annotation(NETWORK_DOWNLOAD_ANNOTATION, session) ?: return null
     val maxBytes: Long = annotation.longArgument(MAX_BYTES, session) ?: return null
@@ -79,6 +89,12 @@ internal fun FirAnnotationContainer.downloadContract(session: FirSession): Downl
     return DownloadContract(maxBytes, timeoutMillis)
 }
 
+/**
+ * Parses and combines the shorthand and list entries in a valid
+ * `@BandwidthEffect` annotation.
+ *
+ * @return the parsed effect, or `null` when the annotation is absent or invalid.
+ */
 internal fun FirAnnotationContainer.effectContract(session: FirSession): EffectContract? {
     val annotation: FirAnnotation = annotation(BANDWIDTH_EFFECT_ANNOTATION, session) ?: return null
     val effects = mutableListOf<NetworkEffect>()
@@ -104,6 +120,11 @@ internal fun FirAnnotationContainer.effectContract(session: FirSession): EffectC
     )
 }
 
+/**
+ * Parses a positive `@BoundedClient` capacity from this container.
+ *
+ * @return the bound, or `null` when the annotation is absent or invalid.
+ */
 internal fun FirAnnotationContainer.boundedClientContract(
     session: FirSession,
 ): BoundedClientContract? {
@@ -113,6 +134,12 @@ internal fun FirAnnotationContainer.boundedClientContract(
     return BoundedClientContract(bound)
 }
 
+/**
+ * Validates every supported bandwidth annotation on this declaration and its
+ * callable return type.
+ *
+ * @return all source-located validation problems found on the declaration.
+ */
 internal fun FirDeclaration.validateBandwidthAnnotations(
     session: FirSession,
 ): List<AnnotationProblem> = buildList {
@@ -161,6 +188,7 @@ internal fun FirDeclaration.validateBandwidthAnnotations(
     }
 }
 
+/** Appends validation problems for one `@NetworkDownload` [annotation]. */
 private fun MutableList<AnnotationProblem>.validateDownloadAnnotation(
     annotation: FirAnnotation,
     session: FirSession,
@@ -185,6 +213,7 @@ private fun MutableList<AnnotationProblem>.validateDownloadAnnotation(
     }
 }
 
+/** Appends validation problems for one `@BandwidthEffect` [annotation]. */
 private fun MutableList<AnnotationProblem>.validateEffectAnnotation(
     annotation: FirAnnotation,
     session: FirSession,
@@ -237,19 +266,29 @@ private fun MutableList<AnnotationProblem>.validateEffectAnnotation(
     }
 }
 
+/** Returns the integral constant [name] as a [Long], or `null` if unavailable. */
 private fun FirAnnotation.longArgument(name: Name, session: FirSession): Long? =
     argument(name)?.constantValue(session).integralLongValue()
 
+/**
+ * Returns the integral constant [name] as an [Int], or `null` when unavailable
+ * or outside the [Int] range.
+ */
 private fun FirAnnotation.intArgument(name: Name, session: FirSession): Int? =
     argument(name)?.constantValue(session)
         .integralLongValue()
         ?.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }
         ?.toInt()
 
+/** Parses every `BandwidthDownload` entry in this annotation's `downloads` argument. */
 private fun FirAnnotation.downloadContracts(session: FirSession): List<BandwidthDownloadContract> {
     return argument(DOWNLOADS)?.downloadContracts(session).orEmpty()
 }
 
+/**
+ * Recursively extracts `BandwidthDownload` constructor arguments from FIR
+ * array, vararg, and wrapper expressions.
+ */
 private fun FirExpression.downloadContracts(
     session: FirSession,
 ): List<BandwidthDownloadContract> {
@@ -294,21 +333,26 @@ private fun FirExpression.downloadContracts(
     }
 }
 
+/** Returns the resolved call argument mapped to the parameter named [name]. */
 private fun FirFunctionCall.argument(name: Name): FirExpression? {
     val mapping = (argumentList as? FirResolvedArgumentList)?.mapping ?: return null
     return mapping.entries.firstOrNull { (_, parameter) -> parameter.name == name }?.key
 }
 
+/** Returns the constant Boolean [name], or `null` when it cannot be evaluated. */
 private fun FirAnnotation.booleanArgument(name: Name, session: FirSession): Boolean? =
     argument(name)?.constantValue(session) as? Boolean
 
+/** Returns the raw annotation argument named [name], if present. */
 private fun FirAnnotation.argument(name: Name): FirExpression? =
     argumentMapping.mapping[name]
 
+/** Evaluates this expression as a compiler-known literal when possible. */
 private fun FirExpression.constantValue(session: FirSession): Any? =
     (this as? FirLiteralExpression)?.value
         ?: evaluateAs<FirLiteralExpression>(session)?.value
 
+/** Converts a boxed Kotlin integral value to [Long], rejecting other values. */
 private fun Any?.integralLongValue(): Long? =
     when (this) {
         is Byte -> toLong()

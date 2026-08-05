@@ -32,6 +32,10 @@ public data class DownloadEffect(
         require(selfBound == null || selfBound > 0) { "selfBound must be positive" }
     }
 
+    /**
+     * Returns whether this entry strictly dominates [other] within the same
+     * lifetime component.
+     */
     internal fun dominates(other: DownloadEffect): Boolean {
         if (lifetime != other.lifetime) return false
         return requiredRateBytesPerSecond >= other.requiredRateBytesPerSecond &&
@@ -40,11 +44,17 @@ public data class DownloadEffect(
                 concurrency > other.concurrency)
     }
 
+    /** Returns whether [other] has the same lifetime, rate, and concurrency. */
     internal fun hasSameRateAndConcurrency(other: DownloadEffect): Boolean =
         lifetime == other.lifetime &&
         requiredRateBytesPerSecond == other.requiredRateBytesPerSecond &&
             concurrency == other.concurrency
 
+    /**
+     * Merges the trusted self bounds of equivalent or dominating entries.
+     *
+     * A missing bound on either entry makes the merged bound unknown.
+     */
     internal fun mergeSelfBound(other: DownloadEffect): DownloadEffect =
         copy(
             selfBound = when {
@@ -53,6 +63,10 @@ public data class DownloadEffect(
             },
         )
 
+    /**
+     * Returns whether this materialized obligation covers [other], allowing an
+     * escaping lifetime to cover a completing lifetime.
+     */
     internal fun materiallyCovers(other: DownloadEffect): Boolean =
         requiredRateBytesPerSecond >= other.requiredRateBytesPerSecond &&
             concurrency >= other.concurrency &&
@@ -175,19 +189,38 @@ public class NetworkEffect private constructor(
             }
         }
 
+    /** Returns whether [other] contains the same normalized component entries. */
     public override fun equals(other: Any?): Boolean =
         other is NetworkEffect && downloads == other.downloads
 
+    /** Returns a hash code consistent with [equals]. */
     public override fun hashCode(): Int = downloads.hashCode()
 
+    /** Returns the materialized obligations in set notation. */
     public override fun toString(): String = obligations.joinToString(prefix = "{", postfix = "}")
 
     public companion object {
         public val EMPTY: NetworkEffect = NetworkEffect(emptyList())
 
+        /**
+         * Creates an effect from [downloads] and removes dominated entries.
+         *
+         * @return a normalized immutable effect.
+         */
         public fun of(downloads: Collection<DownloadEffect>): NetworkEffect =
             NetworkEffect(normalize(downloads))
 
+        /**
+         * Creates the singleton effect of a transfer with a complete-call
+         * timeout.
+         *
+         * @param maxBytes the maximum number of transferred bytes.
+         * @param completeTimeoutMillis the positive end-to-end timeout in milliseconds.
+         * @return an effect requiring `maxBytes * 1000 / completeTimeoutMillis`
+         * bytes per second at concurrency one.
+         * @throws IllegalArgumentException if [maxBytes] is negative or
+         * [completeTimeoutMillis] is not positive.
+         */
         public fun download(maxBytes: Long, completeTimeoutMillis: Long): NetworkEffect {
             require(maxBytes >= 0) { "maximum transfer size must be non-negative" }
             require(completeTimeoutMillis > 0) { "complete-call timeout must be positive" }
@@ -198,6 +231,15 @@ public class NetworkEffect private constructor(
             return of(listOf(DownloadEffect(rate, concurrency = 1)))
         }
 
+        /**
+         * Creates a single-entry effect from a declared rate and concurrency.
+         *
+         * @param rMaxBytesPerSecond the non-negative required rate.
+         * @param nMax the non-negative maximum concurrency.
+         * @param lifetime whether the summarized work completes with or may outlive its call.
+         * @return [EMPTY] when [nMax] is zero; otherwise the declared effect.
+         * @throws IllegalArgumentException if the rate or concurrency is negative.
+         */
         public fun summary(
             rMaxBytesPerSecond: Long,
             nMax: Int,
@@ -210,6 +252,10 @@ public class NetworkEffect private constructor(
             )
         }
 
+        /**
+         * Pareto-normalizes [downloads] independently within each lifetime and
+         * combines self bounds when entries collapse.
+         */
         private fun normalize(downloads: Collection<DownloadEffect>): List<DownloadEffect> {
             val normalized = mutableListOf<DownloadEffect>()
             downloads.forEach { download ->
@@ -238,11 +284,16 @@ public class NetworkEffect private constructor(
             return normalized
         }
 
+        /** Creates an effect from already separated completing and escaping components. */
         private fun fromComponents(
             completing: Collection<DownloadEffect>,
             escaping: Collection<DownloadEffect>,
         ): NetworkEffect = NetworkEffect(normalize(completing + escaping))
 
+        /**
+         * Applies the parallel-composition concurrency shifts to [left] and
+         * [right], then normalizes the result.
+         */
         private fun parallelDownloads(
             left: Collection<DownloadEffect>,
             right: Collection<DownloadEffect>,
@@ -255,6 +306,10 @@ public class NetworkEffect private constructor(
             )
         }
 
+        /**
+         * Normalizes obligations after completing and escaping components have
+         * been materialized together.
+         */
         private fun normalizeMaterialized(
             downloads: Collection<DownloadEffect>,
         ): List<DownloadEffect> {
@@ -282,15 +337,19 @@ public class NetworkEffect private constructor(
         }
     }
 
+    /** Returns entries whose work completes with the current call. */
     private fun completingDownloads(): List<DownloadEffect> =
         downloads.filter { it.lifetime == DownloadLifetime.COMPLETES_WITH_CALL }
 
+    /** Returns entries whose work may outlive the current call. */
     private fun escapingDownloads(): List<DownloadEffect> =
         downloads.filter { it.lifetime == DownloadLifetime.MAY_OUTLIVE_CALL }
 
+    /** Materializes completing and escaping entries as mutually parallel work. */
     private fun materializedDownloads(): List<DownloadEffect> =
         parallelDownloads(completingDownloads(), escapingDownloads())
 
+    /** Returns whether this lifetime is at least as conservative as [other]. */
     private fun DownloadLifetime.covers(other: DownloadLifetime): Boolean =
         this == other || this == DownloadLifetime.MAY_OUTLIVE_CALL
 
