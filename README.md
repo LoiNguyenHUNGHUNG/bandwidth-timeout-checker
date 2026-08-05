@@ -131,6 +131,98 @@ contract. Trusted library models cover sequential `forEach` callbacks and
 AndroidX `traceAsync`; these invoke a visible callback once for peak-bandwidth
 inference rather than treating it as concurrent work.
 
+## Candidate Android case studies
+
+A primitive transfer without a complete-call deadline is modeled with
+`timeout = infinity`, so `rate = size / timeout = 0`. It contributes no direct
+bandwidth requirement, but it still counts as concurrent work when it overlaps
+a finite-deadline transfer. If every transfer in an analyzed application has an
+infinite deadline, `ReqBW = 0` is correct but vacuous; the checker should report
+that no finite completion deadlines were found instead of presenting the result
+as a substantive verification.
+
+The following open-source applications contain real complete-call deadlines
+and network-resilience mechanisms. Source links identify the files to use when
+building integration fixtures.
+
+### Primary subjects
+
+#### Neko
+
+Neko is the strongest first end-to-end subject. Its shared OkHttp configuration
+sets a one-minute `callTimeout`, 15-second connect/read timeouts, a global
+dispatcher bound of 30, a per-host bound of 20, a 5 MiB cache, request
+priorities, and request-rate limits. Image attempts are retried three times with
+2, 4, and 8 second delays, while the download worker responds to connectivity
+and unmetered-network changes.
+
+- [NetworkHelper.kt](https://github.com/nekomangaorg/Neko/blob/main/app/src/main/java/eu/kanade/tachiyomi/network/NetworkHelper.kt)
+- [Downloader.kt](https://github.com/nekomangaorg/Neko/blob/main/app/src/main/java/eu/kanade/tachiyomi/data/download/Downloader.kt)
+- [DownloadJob.kt](https://github.com/nekomangaorg/Neko/blob/main/app/src/main/java/eu/kanade/tachiyomi/data/download/DownloadJob.kt)
+
+Candidate workflows are one manga page, one concurrently downloaded chapter,
+an image retry chain, and multiple chapters sharing the bounded client. The
+complete deadline applies to each primitive attempt; sequential retries extend
+recovery time without increasing peak concurrency.
+
+#### Nextcloud
+
+Nextcloud is the best mixed finite/infinite subject. Its ordinary API client
+uses 60-second connect/read timeouts and a 120-second complete-call timeout.
+Large file downloads deliberately derive size-sensitive read timeouts and set
+`callTimeout(0)`, while chunked uploads remember completed chunks and resume
+from the next missing byte. The expected result is a positive bandwidth
+requirement for ordinary API calls and rate zero for open-ended file transfers.
+
+- [NextcloudClient.kt](https://github.com/nextcloud/android-library/blob/master/library/src/main/java/com/nextcloud/common/NextcloudClient.kt)
+- [DownloadFileRemoteOperation.kt](https://github.com/nextcloud/android-library/blob/master/library/src/main/java/com/owncloud/android/lib/resources/files/DownloadFileRemoteOperation.kt)
+- [ChunkedFileUploadRemoteOperation.java](https://github.com/nextcloud/android-library/blob/master/library/src/main/java/com/owncloud/android/lib/resources/files/ChunkedFileUploadRemoteOperation.java)
+- [AutoUploadWorker.kt](https://github.com/nextcloud/android/blob/master/app/src/main/java/com/nextcloud/client/jobs/autoUpload/AutoUploadWorker.kt)
+
+#### Fedilab
+
+Fedilab uses a 60-second complete timeout for ordinary Mastodon requests and a
+120-second timeout for posting. Its network-constrained background worker
+fetches at most ten timeline pages and advances from the newest cached status,
+making it useful for finite calls inside repeated, cache-backed feed loading.
+
+- [Helper.java](https://github.com/stom79/Fedilab/blob/develop/app/src/main/java/app/fedilab/android/mastodon/helper/Helper.java)
+- [FetchHomeWorker.java](https://github.com/stom79/Fedilab/blob/develop/app/src/main/java/app/fedilab/android/mastodon/jobs/FetchHomeWorker.java)
+
+### Additional subjects
+
+- **Jellyfin:** ordinary SDK API requests have a 30-second complete deadline,
+  a 6-second connection timeout, and a 30-second socket timeout. Coil images
+  and Media3 streams are separate paths and must not inherit the API deadline.
+  See [ApiModule.kt](https://github.com/jellyfin/jellyfin-android/blob/master/app/src/main/java/org/jellyfin/mobile/app/ApiModule.kt),
+  [HttpClientOptions.kt](https://github.com/jellyfin/jellyfin-sdk-kotlin/blob/v1.7.1/jellyfin-api/src/commonMain/kotlin/org/jellyfin/sdk/api/client/HttpClientOptions.kt),
+  and [OkHttpFactory.kt](https://github.com/jellyfin/jellyfin-sdk-kotlin/blob/v1.7.1/jellyfin-api-okhttp/src/jvmMain/kotlin/org/jellyfin/sdk/api/okhttp/OkHttpFactory.kt).
+- **Proton VPN:** API calls use a 30-second complete timeout, 5-second connect
+  timeout, and 20-second read/write timeouts. DNS-over-HTTPS and alternative
+  routing provide route-level resilience. See
+  [VpnApiClient.kt](https://github.com/ProtonVPN/android-app/blob/master/app/src/main/java/com/protonvpn/android/api/VpnApiClient.kt),
+  [DohEnabled.kt](https://github.com/ProtonVPN/android-app/blob/master/app/src/main/java/com/protonvpn/android/api/DohEnabled.kt),
+  and [ShouldSkipPrimaryApiRoute.kt](https://github.com/ProtonVPN/android-app/blob/master/app/src/main/java/com/protonvpn/android/appconfig/usecase/ShouldSkipPrimaryApiRoute.kt).
+- **Readrops:** its Retrofit clients use a one-minute complete timeout. RSS
+  synchronization is network-constrained, database-backed, and processes feed
+  metadata in bounded batches. See
+  [ApiModule.kt](https://github.com/readrops/Readrops/blob/develop/api/src/main/java/com/readrops/api/ApiModule.kt),
+  [SyncWorker.kt](https://github.com/readrops/Readrops/blob/develop/app/src/main/java/com/readrops/app/sync/SyncWorker.kt),
+  and [Synchronizer.kt](https://github.com/readrops/Readrops/blob/develop/app/src/main/java/com/readrops/app/sync/Synchronizer.kt).
+
+### Infinite-timeout baselines
+
+These applications primarily configure connection or per-read stall timeouts,
+not complete-call deadlines. They remain useful for confirming that the checker
+reports a vacuous result rather than treating a stall timeout as a completion
+deadline.
+
+- [Now in Android NetworkModule.kt](https://github.com/android/nowinandroid/blob/main/core/network/src/main/kotlin/com/google/samples/apps/nowinandroid/core/network/di/NetworkModule.kt)
+- [AntennaPod AntennapodHttpClient.java](https://github.com/AntennaPod/AntennaPod/blob/develop/net/common/src/main/java/de/danoeh/antennapod/net/common/AntennapodHttpClient.java)
+- [Signal SignalRestClient.kt](https://github.com/signalapp/Signal-Android/blob/main/lib/network/src/main/java/org/signal/network/rest/SignalRestClient.kt)
+- [NewPipe DownloaderImpl.java](https://github.com/TeamNewPipe/NewPipe/blob/dev/app/src/main/java/org/schabi/newpipe/DownloaderImpl.java)
+- [NewPipe DownloadMission.java](https://github.com/TeamNewPipe/NewPipe/blob/dev/app/src/main/java/us/shandian/giga/get/DownloadMission.java)
+
 ## Build
 
 Requirements: JDK 21 or newer.
