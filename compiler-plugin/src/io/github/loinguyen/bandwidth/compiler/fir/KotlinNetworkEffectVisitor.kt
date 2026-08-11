@@ -310,7 +310,7 @@ internal class KotlinNetworkEffectVisitor(
             return inferUnstructuredCoroutineBuilder(call, context)
         }
         if (target.isAwaitAll()) {
-            return inferInlineAwaitAll(call, context)
+            return inferAwaitAll(call, context)
         }
         if (target.isSerialEventCallbackFunction()) {
             return inferSerialEventCallbackCall(call, target, context)
@@ -394,14 +394,36 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     /**
-     * Infers `awaitAll` when every argument is an inline structured `async`
-     * child and composes their start phases before the common synchronization.
+     * Infers `awaitAll` for inline async arguments or a directly mapped async
+     * collection, composing all child starts before the common synchronization.
+     * Stored mapped collections are synchronized by the enclosing phase tracker.
      */
-    private fun inferInlineAwaitAll(
+    private fun inferAwaitAll(
         call: FirFunctionCall,
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
         val arguments = call.argumentList.arguments.flatMap { it.flattenVarargArguments() }
+        if (arguments.isEmpty()) {
+            val repeatedReceiver = call.receiverExpressions()
+                .mapNotNull { it.repeatedStructuredChildren() }
+                .singleOrNull()
+            if (repeatedReceiver != null) {
+                val repeated = inferRepeatedCoroutineChildren(repeatedReceiver, context)
+                val phases = CoroutinePhaseState<Unit>()
+                phases.recordStatement(repeated.inputs)
+                repeated.body?.let { phases.addChild(handle = null, effect = it) }
+                return phases.finish()
+            }
+            problem(
+                key = "await-all-collection:${context.function.displayName()}:" +
+                    "${call.source?.startOffset}",
+                source = call.source ?: context.function.source,
+                message = "Cannot infer awaitAll for an untracked Deferred collection. " +
+                    "Create the collection with a visible map { async { ... } } expression " +
+                    "inside the same structured coroutine scope.",
+            )
+            return inferReceivers(call, context)
+        }
         val children = arguments.mapNotNull { it.structuredChild() }
         if (children.size != arguments.size) {
             problem(
@@ -421,6 +443,62 @@ internal class KotlinNetworkEffectVisitor(
             child.body?.let { phases.addChild(handle = null, effect = it) }
         }
         return phases.finish()
+    }
+
+    /**
+     * Infers a collection `map { async { ... } }` as an unknown number of
+     * concurrently active structured children.
+     *
+     * The collection source and non-callback arguments are evaluated once.
+     * Each mapped async body may overlap every other body, so all downloads in
+     * one iteration need trusted self bounds before replication is finite.
+     */
+    private fun inferRepeatedCoroutineChildren(
+        children: RepeatedStructuredChildren,
+        context: KotlinEffectContext,
+    ): CoroutineBuilderEffect {
+        val mapCall = children.mapCall
+        val callback = mapCall.visibleLambdaArgument()
+        val inputs = sequence(
+            mapCall.receiverExpressions().map { infer(it, context) } +
+                mapCall.argumentList.arguments
+                    .filter { it.visibleLambda() !== callback }
+                    .map { infer(it, context) },
+        )
+        val child = inferCoroutineBuilder(children.builderCall, context)
+        val perElement = child.inputs.then(child.body ?: KotlinExpressionEffect())
+        val network = perElement.network
+        if (network == NetworkEffect.EMPTY) {
+            return CoroutineBuilderEffect(inputs = inputs, body = KotlinExpressionEffect())
+        }
+        if (network.escapingOnly() != NetworkEffect.EMPTY) {
+            problem(
+                key = "mapped-async-escaping:${context.function.displayName()}:" +
+                    "${mapCall.source?.startOffset}",
+                source = mapCall.source ?: context.function.source,
+                message = "Cannot infer map { async { ... } } when an async body starts " +
+                    "network work that may outlive that child. Keep nested work structured.",
+            )
+            return CoroutineBuilderEffect(inputs = inputs, body = perElement)
+        }
+        if (!network.hasSelfBoundForEveryDownload) {
+            problem(
+                key = "mapped-async-self-bound:${context.function.displayName()}:" +
+                    "${mapCall.source?.startOffset}",
+                source = mapCall.source ?: context.function.source,
+                message = "Mapped async children may overlap across an unknown number of " +
+                    "collection elements. Use a bounded client for every download.",
+            )
+            return CoroutineBuilderEffect(inputs = inputs, body = perElement)
+        }
+        return CoroutineBuilderEffect(
+            inputs = inputs,
+            body = KotlinExpressionEffect(
+                network = network.withUnknownRepetition(
+                    lifetime = DownloadLifetime.COMPLETES_WITH_CALL,
+                ),
+            ),
+        )
     }
 
     /** A launch/async on an unproven receiver may outlive this expression. */
@@ -692,6 +770,16 @@ internal class KotlinNetworkEffectVisitor(
         val phases = CoroutinePhaseState<FirBasedSymbol<*>>()
 
         block.statements.forEach { statement ->
+            val repeatedChildren = statement.repeatedStructuredChildren()
+            if (repeatedChildren != null) {
+                val resolved = inferRepeatedCoroutineChildren(repeatedChildren, context)
+                phases.recordStatement(resolved.inputs)
+                resolved.body?.let {
+                    phases.addChild(handle = repeatedChildren.handle, effect = it)
+                }
+                return@forEach
+            }
+
             val child = statement.structuredChild()
             if (child != null) {
                 val resolved = inferCoroutineBuilder(child.call, context)
@@ -709,6 +797,35 @@ internal class KotlinNetworkEffectVisitor(
         }
 
         return phases.finish()
+    }
+
+    /**
+     * Unwraps this element as an eager collection `map` whose visible callback
+     * consists solely of one structured `async` child.
+     */
+    private fun FirElement.repeatedStructuredChildren(): RepeatedStructuredChildren? {
+        functionTypeConversionOperand()?.let { return it.repeatedStructuredChildren() }
+        return when (this) {
+            is FirFunctionCall -> {
+                if (resolvedFunction()?.isEagerCollectionMap() != true) return null
+                val body = visibleLambdaArgument()?.anonymousFunction?.body ?: return null
+                val child = body.statements.singleOrNull()?.structuredChild() ?: return null
+                RepeatedStructuredChildren(
+                    handle = null,
+                    mapCall = this,
+                    builderCall = child.call,
+                )
+            }
+            is FirProperty -> initializer
+                ?.repeatedStructuredChildren()
+                ?.copy(handle = symbol)
+            is FirWrappedArgumentExpression -> expression.repeatedStructuredChildren()
+            is FirNamedArgumentExpression -> expression.repeatedStructuredChildren()
+            is FirSpreadArgumentExpression -> expression.repeatedStructuredChildren()
+            is FirWrappedExpression -> expression.repeatedStructuredChildren()
+            is FirReturnExpression -> result.repeatedStructuredChildren()
+            else -> null
+        }
     }
 
     /**
@@ -764,7 +881,11 @@ internal class KotlinNetworkEffectVisitor(
                 is FirWrappedExpression -> return expression.coroutineWaitedHandle()
                 else -> return null
             }
-        if (call.resolvedFunction()?.isCoroutineWait() != true) {
+        val target = call.resolvedFunction()
+        val isSingleWait = target?.isCoroutineWait() == true
+        val isCollectionWait =
+            target?.isAwaitAll() == true && call.argumentList.arguments.isEmpty()
+        if (!isSingleWait && !isCollectionWait) {
             return null
         }
         return call.receiverExpressions()
@@ -820,6 +941,10 @@ internal class KotlinNetworkEffectVisitor(
     /** Returns whether this function is the modeled `awaitAll` overload family. */
     private fun FirFunction.isAwaitAll(): Boolean =
         symbol.callableId.asSingleFqName().asString() == AWAIT_ALL_FQ_NAME
+
+    /** Returns whether this function eagerly maps every collection element once. */
+    private fun FirFunction.isEagerCollectionMap(): Boolean =
+        symbol.callableId.asSingleFqName().asString() in EAGER_COLLECTION_MAP_FQ_NAMES
 
     /** Returns whether this function invokes its callbacks sequentially once. */
     private fun FirFunction.isSequentialCallbackFunction(): Boolean =
@@ -1177,6 +1302,12 @@ internal class KotlinNetworkEffectVisitor(
             val call: FirFunctionCall,
         )
 
+        data class RepeatedStructuredChildren(
+            val handle: FirBasedSymbol<*>?,
+            val mapCall: FirFunctionCall,
+            val builderCall: FirFunctionCall,
+        )
+
         data class CoroutineBuilderEffect(
             val inputs: KotlinExpressionEffect,
             val body: KotlinExpressionEffect?,
@@ -1201,6 +1332,10 @@ internal class KotlinNetworkEffectVisitor(
             "kotlinx.coroutines.Dispatchers.Unconfined",
         )
         const val AWAIT_ALL_FQ_NAME: String = "kotlinx.coroutines.awaitAll"
+        val EAGER_COLLECTION_MAP_FQ_NAMES: Set<String> = setOf(
+            "kotlin.collections.map",
+            "kotlin.collections.mapIndexed",
+        )
         val SEQUENTIAL_CALLBACK_FQ_NAMES: Set<String> = setOf(
             "kotlin.collections.forEach",
             "kotlin.collections.forEachIndexed",

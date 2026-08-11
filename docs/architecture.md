@@ -185,6 +185,9 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 - [x] Treat `withContext` as a structured scope and inline
   `awaitAll(async { ... }, ...)` as source-ordered child starts followed by one
   synchronization point.
+- [x] Model eager `map { async { ... } }` collections as unknown structured
+  fan-out requiring self-bounded downloads. Track a local collection handle so
+  direct or stored `awaitAll()` ends its overlap window.
 - [x] Model trusted `forEach` and AndroidX `traceAsync` callbacks as sequential
   invocation; unknown higher-order library calls still require contracts.
 - Keep aliased, reassigned, stored, or escaped child handles live until scope

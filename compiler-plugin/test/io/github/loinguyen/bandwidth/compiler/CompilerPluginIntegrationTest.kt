@@ -1411,6 +1411,125 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `awaitAll ends overlap from a mapped async collection`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.coroutineScope
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download(url: String) = Unit
+
+            @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000)
+            suspend fun afterAwaitAll() = Unit
+
+            suspend fun load(
+                urls: List<String>,
+                @BoundedClient(k = 4) client: NetworkClient,
+            ) = coroutineScope {
+                val jobs = urls.map { url ->
+                    async { client.download(url) }
+                }
+                jobs.awaitAll()
+                afterAwaitAll()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for load: {(1500, 1), (900, 4)}",
+        )
+        result.assertOutputContains("ReqBW=3600 bytes/s")
+    }
+
+    @Test
+    fun `infers a directly awaited mapped async collection`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.coroutineScope
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download(url: String) = Unit
+
+            suspend fun load(
+                urls: List<String>,
+                @BoundedClient(k = 3) client: NetworkClient,
+            ) = coroutineScope {
+                urls.map { url ->
+                    async { client.download(url) }
+                }.awaitAll()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(700, 3)}")
+        result.assertOutputContains("ReqBW=2100 bytes/s")
+    }
+
+    @Test
+    fun `rejects mapped async downloads without self bounds`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun download(url: String) = Unit
+
+            suspend fun load(urls: List<String>) = coroutineScope {
+                val jobs = urls.map { url ->
+                    async { download(url) }
+                }
+                jobs.awaitAll()
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Mapped async children may overlap across an unknown number of collection elements",
+        )
+        result.assertOutputContains("Use a bounded client for every download")
+    }
+
+    @Test
+    fun `rejects awaitAll on an untracked Deferred collection`() {
+        val result = compile(
+            """
+            import kotlinx.coroutines.Deferred
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.coroutineScope
+
+            suspend fun load(jobs: List<Deferred<Unit>>) = coroutineScope {
+                jobs.awaitAll()
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Cannot infer awaitAll for an untracked Deferred collection",
+        )
+    }
+
+    @Test
     fun `uses an interface contract through an NIA style implementation`() {
         val result = compile(
             """
