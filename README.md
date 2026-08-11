@@ -78,6 +78,7 @@ download effect. Contracts that may outlive their call retain that fact:
             rMaxBytesPerSecond = 800_000,
             nMax = 4,
             mayOutliveCall = true,
+            selfBound = 4,
         ),
     ],
 )
@@ -85,7 +86,9 @@ fun startBackgroundSync()
 ```
 
 The checker preserves the individual rate, concurrency, self-bound, and
-lifetime fields internally instead of collapsing them to one pair.
+lifetime fields instead of collapsing them to one pair. Set `selfBound` on an
+opaque download entry when a runtime client or scheduler enforces a shared
+limit across repeated invocations; zero leaves the bound unspecified.
 
 `@BoundedClient(k)` attaches a configured self bound to instances of one
 primitive download kind. A raw download carries

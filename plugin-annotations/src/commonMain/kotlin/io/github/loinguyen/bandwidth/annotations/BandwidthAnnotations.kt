@@ -17,13 +17,16 @@ public annotation class NetworkDownload(
  * One download entry in a [BandwidthEffect] contract.
  *
  * [mayOutliveCall] means work represented by this entry may remain active after
- * the annotated function or callback returns.
+ * the annotated function or callback returns. [selfBound] is a trusted runtime
+ * bound shared by repeated instances of this download kind; zero means that no
+ * bound is declared.
  */
 @Retention(AnnotationRetention.BINARY)
 public annotation class BandwidthDownload(
     public val rMaxBytesPerSecond: Long,
     public val nMax: Int,
     public val mayOutliveCall: Boolean = false,
+    public val selfBound: Int = 0,
 )
 
 /**

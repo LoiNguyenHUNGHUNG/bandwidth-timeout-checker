@@ -77,8 +77,9 @@ Annotations are required only where inference cannot see enough:
 1. `@NetworkDownload(maxBytes, completeTimeoutMillis)` on primitive network
    operations or library adapters.
 2. `@BandwidthEffect` download-effect lists on opaque functions, higher-order
-   inputs, and opaque returned function types. `(rMaxBytesPerSecond, nMax)`
-   remains one-entry shorthand.
+   inputs, and opaque returned function types. Entries retain
+   `(rMaxBytesPerSecond, nMax, selfBound, lifetime)`, where a zero `selfBound`
+   means unspecified. `(rMaxBytesPerSecond, nMax)` remains one-entry shorthand.
 3. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
    enforce the stated launch bound.
 4. `@BandwidthAlternative` on a whole `try/catch` expression when the
