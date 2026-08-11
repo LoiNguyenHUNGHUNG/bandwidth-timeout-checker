@@ -115,6 +115,12 @@ An unqualified builder directly inside a recognized `coroutineScope` or
 `withContext` remains structured. The checker trusts the client configuration;
 for OkHttp, set the matching `Dispatcher.maxRequests` value.
 
+An eager collection `map { async { ... } }` inside a structured scope creates
+an unknown number of concurrently active children. Every download in the async
+body therefore needs a self bound. A direct or stored collection `awaitAll()`
+ends that group's overlap with later statements; an untracked Deferred
+collection is rejected because its child effects are unknown.
+
 For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 `try/catch` expression, but recovery paths are still joined conservatively.
 This avoids assigning zero bandwidth to `try { download() } catch { showError() }`
@@ -275,7 +281,8 @@ artifacts must not mix versions.
 - [x] FIR-native annotation and contract diagnostics, recursion checks, and
   lifetime-aware general loop inference
 - [x] Structured `coroutineScope`/`withContext` inference with sequential parent
-  work, conservative `launch`/`async` overlap, and inline `awaitAll`
+  work, conservative `launch`/`async` overlap, inline `awaitAll`, and bounded
+  `map { async { ... } }` collections synchronized by `awaitAll()`
 - [x] Sequential `chunked(...).forEach` callback inference
 - [x] Version-selected FIR adapters and CI coverage for Kotlin 2.3 and 2.4
 - [ ] Path-sensitive, rate-sensitive branch refinement
