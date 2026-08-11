@@ -7,6 +7,7 @@ import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 
 class CompilerPluginIntegrationTest {
@@ -1594,6 +1595,150 @@ class CompilerPluginIntegrationTest {
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
             "Cannot infer awaitAll for an untracked Deferred collection",
+        )
+    }
+
+    @Test
+    fun `bounds flatMapMerge inner flows until collect`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.ExperimentalCoroutinesApi
+            import kotlinx.coroutines.flow.asFlow
+            import kotlinx.coroutines.flow.collect
+            import kotlinx.coroutines.flow.flatMapMerge
+            import kotlinx.coroutines.flow.flow
+
+            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
+            suspend fun download(url: String) = Unit
+
+            @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000)
+            suspend fun afterCollect() = Unit
+
+            @OptIn(ExperimentalCoroutinesApi::class)
+            suspend fun load(urls: List<String>) {
+                urls.asFlow()
+                    .flatMapMerge(concurrency = 4) { url ->
+                        flow { emit(download(url)) }
+                    }
+                    .collect()
+                afterCollect()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for load: {(1500, 1), (800, 4)}",
+        )
+        result.assertOutputContains("ReqBW=3200 bytes/s")
+    }
+
+    @Test
+    fun `tracks a stored flatMapMerge pipeline without running it eagerly`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.ExperimentalCoroutinesApi
+            import kotlinx.coroutines.flow.asFlow
+            import kotlinx.coroutines.flow.collect
+            import kotlinx.coroutines.flow.flatMapMerge
+            import kotlinx.coroutines.flow.flow
+
+            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
+            suspend fun download(url: String) = Unit
+
+            @OptIn(ExperimentalCoroutinesApi::class)
+            suspend fun buildOnly(urls: List<String>) {
+                val downloads = urls.asFlow()
+                    .flatMapMerge(concurrency = 3) { url ->
+                        flow { emit(download(url)) }
+                    }
+            }
+
+            @OptIn(ExperimentalCoroutinesApi::class)
+            suspend fun load(urls: List<String>) {
+                val downloads = urls.asFlow()
+                    .flatMapMerge(concurrency = 3) { url ->
+                        flow { emit(download(url)) }
+                    }
+                downloads.collect()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        assertFalse(
+            result.output.contains("Inferred bandwidth effect for buildOnly:"),
+            result.output,
+        )
+        result.assertOutputContains("Inferred bandwidth effect for load: {(700, 3)}")
+        result.assertOutputContains("ReqBW=2100 bytes/s")
+    }
+
+    @Test
+    fun `rejects Flow collector callbacks across compiler versions`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.flow.asFlow
+            import kotlinx.coroutines.flow.collect
+
+            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
+            suspend fun download(url: String) = Unit
+
+            suspend fun load(urls: List<String>) {
+                urls.asFlow().collect { url -> download(url) }
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Cannot infer collect with a collector callback consistently across supported " +
+                "Kotlin versions",
+        )
+    }
+
+    @Test
+    fun `rejects flatMapMerge without an explicit constant concurrency bound`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.ExperimentalCoroutinesApi
+            import kotlinx.coroutines.flow.asFlow
+            import kotlinx.coroutines.flow.collect
+            import kotlinx.coroutines.flow.flatMapMerge
+            import kotlinx.coroutines.flow.flow
+
+            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
+            suspend fun download(url: String) = Unit
+
+            @OptIn(ExperimentalCoroutinesApi::class)
+            suspend fun load(urls: List<String>, limit: Int) {
+                urls.asFlow()
+                    .flatMapMerge(concurrency = limit) { url ->
+                        flow { emit(download(url)) }
+                    }
+                    .collect()
+            }
+
+            @OptIn(ExperimentalCoroutinesApi::class)
+            suspend fun loadWithDefault(urls: List<String>) {
+                urls.asFlow()
+                    .flatMapMerge { url ->
+                        flow { emit(download(url)) }
+                    }
+                    .collect()
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "flatMapMerge concurrency must be an explicit positive constant",
         )
     }
 

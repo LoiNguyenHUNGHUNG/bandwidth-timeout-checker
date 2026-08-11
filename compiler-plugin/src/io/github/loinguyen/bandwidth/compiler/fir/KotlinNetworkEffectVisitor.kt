@@ -9,6 +9,7 @@ import org.jetbrains.kotlin.KtSourceElement
 import org.jetbrains.kotlin.fir.declarations.FirFunction
 import org.jetbrains.kotlin.fir.declarations.FirProperty
 import org.jetbrains.kotlin.fir.declarations.FirValueParameter
+import org.jetbrains.kotlin.fir.declarations.evaluateAs
 import org.jetbrains.kotlin.fir.expressions.FirAnonymousFunctionExpression
 import org.jetbrains.kotlin.fir.expressions.FirBlock
 import org.jetbrains.kotlin.fir.expressions.FirCallableReferenceAccess
@@ -16,6 +17,7 @@ import org.jetbrains.kotlin.fir.expressions.FirDoWhileLoop
 import org.jetbrains.kotlin.fir.expressions.FirExpression
 import org.jetbrains.kotlin.fir.expressions.FirFunctionCall
 import org.jetbrains.kotlin.fir.expressions.FirImplicitInvokeCall
+import org.jetbrains.kotlin.fir.expressions.FirLiteralExpression
 import org.jetbrains.kotlin.fir.expressions.FirLoop
 import org.jetbrains.kotlin.fir.expressions.FirNamedArgumentExpression
 import org.jetbrains.kotlin.fir.expressions.FirPropertyAccessExpression
@@ -57,8 +59,8 @@ internal class KotlinNetworkEffectVisitor(
     /**
      * Infers the eager effect and callback-valued return of [function].
      *
-     * @param latentValues shared bindings for function values resolved across
-     * interprocedural analysis.
+     * @param latentValues shared bindings for function and Flow values resolved
+     * across interprocedural analysis.
      */
     fun inferFunctionBody(
         function: FirFunction,
@@ -133,8 +135,8 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     /**
-     * Infers a property initializer and binds any resulting function value to
-     * the property symbol.
+     * Infers a property initializer and binds any resulting latent value to the
+     * property symbol.
      */
     override fun visitProperty(
         property: FirProperty,
@@ -311,6 +313,18 @@ internal class KotlinNetworkEffectVisitor(
         }
         if (target.isAwaitAll()) {
             return inferAwaitAll(call, context)
+        }
+        if (target.isFlowBuilder()) {
+            return inferFlowBuilder(call, context)
+        }
+        if (target.isFlowSourceBuilder()) {
+            return inferFlowSourceBuilder(call, context)
+        }
+        if (target.isFlatMapMerge()) {
+            return inferFlatMapMerge(call, context)
+        }
+        if (target.isFlowCollect()) {
+            return inferFlowCollect(call, context)
         }
         val repeatedCallbackMayOutliveCall = target.repeatedCallbackMayOutliveCall()
         if (repeatedCallbackMayOutliveCall != null) {
@@ -496,6 +510,191 @@ internal class KotlinNetworkEffectVisitor(
             inputs = inputs,
             body = KotlinExpressionEffect(
                 network = repeated.withLifetime(DownloadLifetime.COMPLETES_WITH_CALL),
+            ),
+        )
+    }
+
+    /**
+     * Defers a visible `flow { ... }` body until a terminal Flow operator
+     * materializes the returned value.
+     */
+    private fun inferFlowBuilder(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val callback = call.visibleLambdaArgument()
+        val body = callback?.anonymousFunction?.body
+        val evaluatedInputs = sequence(
+            call.receiverExpressions().map { infer(it, context) } +
+                call.argumentList.arguments
+                    .filter { it.visibleLambda() !== callback }
+                    .map { infer(it, context) },
+        )
+        if (body == null) {
+            problem(
+                key = "flow-builder:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "Cannot infer flow { ... } with a non-visible block. " +
+                    "Keep the Flow builder lambda visible.",
+            )
+            return evaluatedInputs
+        }
+        val bodyEffect = inferFunction(callback.anonymousFunction)
+        return evaluatedInputs.copy(
+            latent = LatentNetworkEffect(network = bodyEffect.network),
+        )
+    }
+
+    /**
+     * Treats `asFlow()` as a lazy source. A function-valued source is invoked
+     * repeatedly; collection and array sources have no intrinsic network work.
+     */
+    private fun inferFlowSourceBuilder(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val receivers = call.receiverExpressions().map { infer(it, context) }
+        val evaluatedInputs = sequence(
+            receivers + call.argumentList.arguments.map { infer(it, context) },
+        )
+        val producer = receivers.mapNotNull { it.latent }.singleOrNull()
+        val sourceNetwork = producer?.network?.let { network ->
+            repeatNetworkEffect(
+                effect = network,
+                key = "flow-source-repeat:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                missingBoundMessage = "Network work escaping a function-valued asFlow source " +
+                    "may overlap across an unknown number of values. Use a self bound for " +
+                    "every download.",
+            )
+        } ?: NetworkEffect.EMPTY
+        return evaluatedInputs.copy(
+            latent = LatentNetworkEffect(network = sourceNetwork),
+        )
+    }
+
+    /**
+     * Builds the lazy effect of `flatMapMerge(concurrency = k)`. Transform
+     * invocations repeat serially, while at most `k` returned inner flows are
+     * collected concurrently. Escaping work still crosses the core repetition
+     * boundary and therefore needs a self bound.
+     */
+    private fun inferFlatMapMerge(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val callbackArgument = call.argumentForParameter("transform")
+        val callback = callbackArgument?.visibleLambda()
+        val receiverEffects = call.receiverExpressions().map { infer(it, context) }
+        val nonCallbackArguments = call.argumentList.arguments
+            .filter { it !== callbackArgument }
+            .map { infer(it, context) }
+        val evaluatedInputs = sequence(receiverEffects + nonCallbackArguments)
+        val sourceFlow = receiverEffects.mapNotNull { it.latent }.singleOrNull()
+        if (sourceFlow == null) {
+            problem(
+                key = "flat-map-merge-source:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "Cannot infer the source Flow for flatMapMerge. Build it with a " +
+                    "visible flow { ... }, asFlow(), or flatMapMerge expression in the same " +
+                    "function.",
+            )
+        }
+
+        val concurrency = call.argumentForParameter("concurrency")?.positiveConstantInt()
+        if (concurrency == null) {
+            problem(
+                key = "flat-map-merge-concurrency:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "flatMapMerge concurrency must be an explicit positive constant.",
+            )
+        }
+
+        val transform = callback?.anonymousFunction?.let { function ->
+            val summary = inferFunction(function)
+            KotlinExpressionEffect(
+                network = summary.network,
+                latent = summary.returned,
+            )
+        }
+        val innerFlow = transform?.latent
+        if (innerFlow == null) {
+            problem(
+                key = "flat-map-merge-transform:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "Cannot infer the Flow returned by flatMapMerge's transform. " +
+                    "Return a Flow built with a visible flow { ... } expression.",
+            )
+        }
+
+        if (sourceFlow == null || concurrency == null || transform == null || innerFlow == null) {
+            return evaluatedInputs
+        }
+        val repeatedTransform = repeatNetworkEffect(
+            effect = transform.network,
+            key = "flat-map-merge-transform-repeat:${context.function.displayName()}:" +
+                call.source?.startOffset,
+            source = call.source ?: context.function.source,
+            missingBoundMessage = "Network work escaping a flatMapMerge transform may " +
+                "overlap across an unknown number of values. Use a self bound for every " +
+                "download.",
+        )
+        val repeatedInnerFlow = boundedRepeatedNetworkEffect(
+            effect = innerFlow.network,
+            maxConcurrentBodies = concurrency,
+            key = "flat-map-merge-inner-repeat:${context.function.displayName()}:" +
+                call.source?.startOffset,
+            source = call.source ?: context.function.source,
+            missingBoundMessage = "Network work escaping a flatMapMerge inner Flow may " +
+                "overlap across an unknown number of values. Use a self bound for every " +
+                "download.",
+        )
+        return evaluatedInputs.copy(
+            latent = LatentNetworkEffect(
+                network = sourceFlow.network
+                    .parallel(repeatedTransform)
+                    .parallel(repeatedInnerFlow),
+            ),
+        )
+    }
+
+    /** Materializes a tracked Flow at the no-argument `collect()` terminal. */
+    private fun inferFlowCollect(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val receiverEffects = call.receiverExpressions().map { infer(it, context) }
+        val argumentEffects = call.argumentList.arguments.map { infer(it, context) }
+        val evaluatedInputs = sequence(receiverEffects + argumentEffects)
+        val flow = receiverEffects.mapNotNull { it.latent }.singleOrNull()
+        if (flow == null) {
+            problem(
+                key = "flow-collect-source:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "Cannot infer collect on an untracked Flow. Build the Flow with a " +
+                    "visible flow { ... }, asFlow(), or flatMapMerge expression in the same " +
+                    "function.",
+            )
+        }
+        if (call.argumentList.arguments.isNotEmpty()) {
+            problem(
+                key = "flow-collector-callback:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "Cannot infer collect with a collector callback consistently " +
+                    "across supported Kotlin versions. Use no-argument collect() with " +
+                    "network work in a tracked upstream Flow.",
+            )
+        }
+        return evaluatedInputs.then(
+            KotlinExpressionEffect(
+                network = flow?.network ?: NetworkEffect.EMPTY,
             ),
         )
     }
@@ -845,6 +1044,22 @@ internal class KotlinNetworkEffectVisitor(
     private fun FirFunction.isAwaitAll(): Boolean =
         symbol.callableId.asSingleFqName().asString() == AWAIT_ALL_FQ_NAME
 
+    /** Returns whether this function is the lazy `flow { ... }` builder. */
+    private fun FirFunction.isFlowBuilder(): Boolean =
+        symbol.callableId.asSingleFqName().asString() == FLOW_BUILDER_FQ_NAME
+
+    /** Returns whether this function converts a source value into a lazy Flow. */
+    private fun FirFunction.isFlowSourceBuilder(): Boolean =
+        symbol.callableId.asSingleFqName().asString() in FLOW_SOURCE_BUILDER_FQ_NAMES
+
+    /** Returns whether this function merges inner flows with a fixed bound. */
+    private fun FirFunction.isFlatMapMerge(): Boolean =
+        symbol.callableId.asSingleFqName().asString() == FLAT_MAP_MERGE_FQ_NAME
+
+    /** Returns whether this function terminally collects a Flow. */
+    private fun FirFunction.isFlowCollect(): Boolean =
+        symbol.callableId.asSingleFqName().asString() in FLOW_COLLECT_FQ_NAMES
+
     /** Returns whether this function eagerly maps every collection element once. */
     private fun FirFunction.isEagerCollectionMap(): Boolean =
         symbol.callableId.asSingleFqName().asString() in EAGER_COLLECTION_MAP_FQ_NAMES
@@ -1051,6 +1266,29 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     /**
+     * Repeats [effect] an unknown number of times while bounding concurrently
+     * active completing bodies and preserving the unknown-repetition treatment
+     * of work that escapes a body.
+     */
+    private fun boundedRepeatedNetworkEffect(
+        effect: NetworkEffect,
+        maxConcurrentBodies: Int,
+        key: String,
+        source: KtSourceElement?,
+        missingBoundMessage: String,
+    ): NetworkEffect {
+        val repeated = repeatNetworkEffect(
+            effect = effect,
+            key = key,
+            source = source,
+            missingBoundMessage = missingBoundMessage,
+        )
+        return repeated.completingOnly()
+            .boundedReplication(maxConcurrentBodies)
+            .parallel(repeated.escapingOnly())
+    }
+
+    /**
      * Sequentially infers direct non-function children of an otherwise
      * unhandled FIR element.
      */
@@ -1114,6 +1352,30 @@ internal class KotlinNetworkEffectVisitor(
         return mapping.entries.firstOrNull { (_, parameter) ->
             parameter.name.asString() == name
         }?.key
+    }
+
+    /** Evaluates this expression as a positive compiler-known `Int`. */
+    private fun FirExpression.positiveConstantInt(): Int? {
+        functionTypeConversionOperand()?.let { return it.positiveConstantInt() }
+        val unwrapped = when (this) {
+            is FirNamedArgumentExpression -> expression
+            is FirWrappedArgumentExpression -> expression
+            is FirWrappedExpression -> expression
+            else -> this
+        }
+        if (unwrapped !== this) return unwrapped.positiveConstantInt()
+        val value = (unwrapped as? FirLiteralExpression)?.value
+            ?: unwrapped.evaluateAs<FirLiteralExpression>(session)?.value
+        val longValue = when (value) {
+            is Byte -> value.toLong()
+            is Short -> value.toLong()
+            is Int -> value.toLong()
+            is Long -> value
+            else -> return null
+        }
+        return longValue
+            .takeIf { it in 1..Int.MAX_VALUE.toLong() }
+            ?.toInt()
     }
 
     /**
@@ -1244,6 +1506,15 @@ internal class KotlinNetworkEffectVisitor(
             "kotlinx.coroutines.Dispatchers.Unconfined",
         )
         const val AWAIT_ALL_FQ_NAME: String = "kotlinx.coroutines.awaitAll"
+        const val FLOW_BUILDER_FQ_NAME: String = "kotlinx.coroutines.flow.flow"
+        const val FLAT_MAP_MERGE_FQ_NAME: String = "kotlinx.coroutines.flow.flatMapMerge"
+        val FLOW_SOURCE_BUILDER_FQ_NAMES: Set<String> = setOf(
+            "kotlinx.coroutines.flow.asFlow",
+        )
+        val FLOW_COLLECT_FQ_NAMES: Set<String> = setOf(
+            "kotlinx.coroutines.flow.collect",
+            "kotlinx.coroutines.flow.Flow.collect",
+        )
         val EAGER_COLLECTION_MAP_FQ_NAMES: Set<String> = setOf(
             "kotlin.collections.map",
             "kotlin.collections.mapIndexed",
