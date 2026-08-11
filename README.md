@@ -52,7 +52,7 @@ fun applyNetworkCallback(
 @BoundedScope(k = 4)
 val downloadScope = viewModelScope
 
-@BoundedClient(k = 4, enforced = true)
+@BoundedClient(k = 4)
 val imageClient = OkHttpClient.Builder()
     .dispatcher(Dispatcher().apply { maxRequests = 4 })
     .build()
@@ -79,7 +79,6 @@ download effect. Contracts that may outlive their call retain that fact:
             nMax = 4,
             mayOutliveCall = true,
             selfBound = 4,
-            selfBoundEnforced = true,
         ),
     ],
 )
@@ -87,20 +86,20 @@ fun startBackgroundSync()
 ```
 
 The checker preserves the individual rate, concurrency, self-bound, and
-lifetime fields instead of collapsing them to one pair. Set `selfBound` and
-`selfBoundEnforced = true` on an opaque download entry only when a runtime
-client or scheduler enforces a shared limit across repeated invocations; zero
-leaves the bound unspecified.
+lifetime fields instead of collapsing them to one pair. Set `selfBound` on an
+opaque download entry only when a runtime client or scheduler enforces a shared
+limit across repeated invocations; zero leaves the bound unspecified. A positive
+value is a trusted contract about that runtime limit.
 
-`@BoundedClient(k, enforced = true)` attaches a configured self bound to
-instances of one primitive download kind. A raw download carries
+`@BoundedClient(k)` attaches a configured self bound to instances of one
+primitive download kind. A raw download carries
 `(r, n, selfBound=k, lifetime)`.
 Recognized concurrency constructs compute `n` with ordinary parallel algebra.
 Every recognized repetition lowers to one core `repeat(effect)` rule. Downloads
 that complete within one invocation remain sequential. Downloads that escape
-an invocation may overlap later invocations, so each requires an explicitly
-runtime-enforced self bound. A bound without its enforcement flag remains
-visible as a declaration but is not used to make repetition finite.
+an invocation may overlap later invocations, so each requires a self bound.
+Ordinary, non-repeated use does not require one. Runtime verification for a
+specific client may be added separately without changing this usage rule.
 
 The frontend recognizes `while`, `do-while`, `for`/`forEach`, repeated UI
 callbacks such as button presses, and lazy scrolling/item callbacks as

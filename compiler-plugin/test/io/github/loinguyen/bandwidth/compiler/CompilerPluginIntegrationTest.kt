@@ -21,7 +21,7 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @BoundedClient(k = 2, enforced = true)
+            @BoundedClient(k = 2)
             val client = NetworkClient()
 
             @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
@@ -55,7 +55,7 @@ class CompilerPluginIntegrationTest {
             @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download() = Unit
 
-            suspend fun load(@BoundedClient(k = 3, enforced = true) client: NetworkClient) = coroutineScope {
+            suspend fun load(@BoundedClient(k = 3) client: NetworkClient) = coroutineScope {
                 launch { client.download() }
                 launch { client.download() }
                 launch { client.download() }
@@ -86,7 +86,7 @@ class CompilerPluginIntegrationTest {
 
             fun onDownloadClicked(
                 scope: CoroutineScope,
-                @BoundedClient(k = 3, enforced = true) client: NetworkClient,
+                @BoundedClient(k = 3) client: NetworkClient,
             ) {
                 scope.launch { client.download() }
             }
@@ -122,38 +122,7 @@ class CompilerPluginIntegrationTest {
 
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires an explicitly " +
-                "runtime-enforced bound",
-        )
-    }
-
-    @Test
-    fun `rejects a declared client bound without runtime enforcement`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.BoundedClient
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            import kotlinx.coroutines.CoroutineScope
-            import kotlinx.coroutines.launch
-
-            class NetworkClient
-
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.download() = Unit
-
-            fun onDownloadClicked(
-                scope: CoroutineScope,
-                @BoundedClient(k = 3) client: NetworkClient,
-            ) {
-                scope.launch { client.download() }
-            }
-            """,
-        )
-
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires an explicitly " +
-                "runtime-enforced bound",
+            "Network work launched on an escaping coroutine scope requires a self bound",
         )
     }
 
@@ -174,7 +143,7 @@ class CompilerPluginIntegrationTest {
 
             suspend fun load(
                 externalScope: CoroutineScope,
-                @BoundedClient(k = 2, enforced = true) client: NetworkClient,
+                @BoundedClient(k = 2) client: NetworkClient,
             ) = coroutineScope {
                 externalScope.launch { client.download() }
                 client.download()
@@ -204,14 +173,14 @@ class CompilerPluginIntegrationTest {
 
             fun spawn(
                 scope: CoroutineScope,
-                @BoundedClient(k = 4, enforced = true) client: NetworkClient,
+                @BoundedClient(k = 4) client: NetworkClient,
             ) {
                 scope.launch { client.download() }
             }
 
             suspend fun load(
                 scope: CoroutineScope,
-                @BoundedClient(k = 4, enforced = true) client: NetworkClient,
+                @BoundedClient(k = 4) client: NetworkClient,
             ) {
                 spawn(scope, client)
                 client.download()
@@ -304,8 +273,7 @@ class CompilerPluginIntegrationTest {
 
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires an explicitly " +
-                "runtime-enforced bound",
+            "Network work launched on an escaping coroutine scope requires a self bound",
         )
     }
 
@@ -325,7 +293,7 @@ class CompilerPluginIntegrationTest {
 
             fun load(
                 scope: CoroutineScope,
-                @BoundedClient(k = 4, enforced = true) client: NetworkClient,
+                @BoundedClient(k = 4) client: NetworkClient,
             ) {
                 val task: suspend CoroutineScope.() -> Unit = { client.download() }
                 scope.launch(block = task)
@@ -375,7 +343,7 @@ class CompilerPluginIntegrationTest {
             suspend fun NetworkClient.slow() = Unit
 
             suspend fun load(
-                @BoundedClient(k = 4, enforced = true) fastClient: NetworkClient,
+                @BoundedClient(k = 4) fastClient: NetworkClient,
                 slowClient: NetworkClient,
             ) {
                 coroutineScope { launch(Job()) { fastClient.fast() } }
@@ -419,7 +387,7 @@ class CompilerPluginIntegrationTest {
 
                 suspend fun load(
                     context: CoroutineContext,
-                    @BoundedClient(k = 4, enforced = true) client: NetworkClient,
+                    @BoundedClient(k = 4) client: NetworkClient,
                 ) = coroutineScope {
                     launch($coroutineContext) { client.download() }
                 }
@@ -523,7 +491,7 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `requires an enforced bound for a Job replacing context`() {
+    fun `requires a self bound for a Job replacing context`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
@@ -544,8 +512,7 @@ class CompilerPluginIntegrationTest {
 
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires an explicitly " +
-                "runtime-enforced bound",
+            "Network work launched on an escaping coroutine scope requires a self bound",
         )
     }
 
@@ -569,7 +536,7 @@ class CompilerPluginIntegrationTest {
 
             suspend fun load(
                 externalScope: CoroutineScope,
-                @BoundedClient(k = 4, enforced = true) fastClient: NetworkClient,
+                @BoundedClient(k = 4) fastClient: NetworkClient,
                 slowClient: NetworkClient,
             ) {
                 coroutineScope {
@@ -604,7 +571,7 @@ class CompilerPluginIntegrationTest {
             fun loadImages(
                 urls: List<String>,
                 viewModelScope: CoroutineScope,
-                @BoundedClient(k = 4, enforced = true) imageClient: NetworkClient,
+                @BoundedClient(k = 4) imageClient: NetworkClient,
             ) {
                 urls.forEach { url ->
                     viewModelScope.launch { imageClient.download(url) }
@@ -636,7 +603,6 @@ class CompilerPluginIntegrationTest {
                             nMax = 1,
                             mayOutliveCall = true,
                             selfBound = 2,
-                            selfBoundEnforced = true,
                         ),
                     ],
                 )
@@ -684,7 +650,7 @@ class CompilerPluginIntegrationTest {
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains("Escaping network work in repeated callback")
         result.assertOutputContains(
-            "Use an explicitly runtime-enforced bound for every download",
+            "Use a self bound for every download",
         )
     }
 
@@ -718,7 +684,7 @@ class CompilerPluginIntegrationTest {
 
             fun NewsFeed(
                 articles: List<String>,
-                @BoundedClient(k = 4, enforced = true) imageLoader: ImageLoader,
+                @BoundedClient(k = 4) imageLoader: ImageLoader,
             ) {
                 LazyVerticalStaggeredGrid {
                     items(articles) { article ->
@@ -789,7 +755,7 @@ class CompilerPluginIntegrationTest {
             "Escaping network work in repeated callback",
         )
         result.assertOutputContains(
-            "Use an explicitly runtime-enforced bound for every download",
+            "Use a self bound for every download",
         )
     }
 
@@ -816,7 +782,7 @@ class CompilerPluginIntegrationTest {
 
             fun DownloadButton(
                 scope: CoroutineScope,
-                @BoundedClient(k = 3, enforced = true) client: NetworkClient,
+                @BoundedClient(k = 3) client: NetworkClient,
             ) {
                 Button(
                     onClick = {
@@ -873,8 +839,8 @@ class CompilerPluginIntegrationTest {
 
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires an explicitly " +
-                "runtime-enforced bound for every download",
+            "Network work launched on an escaping coroutine scope requires a self bound " +
+                "for every download",
         )
     }
 
@@ -897,8 +863,8 @@ class CompilerPluginIntegrationTest {
             suspend fun NetworkClient.downloadSecondary() = Unit
 
             suspend fun foo(
-                @BoundedClient(k = 2, enforced = true) primaryClient: NetworkClient,
-                @BoundedClient(k = 3, enforced = true) secondaryClient: NetworkClient,
+                @BoundedClient(k = 2) primaryClient: NetworkClient,
+                @BoundedClient(k = 3) secondaryClient: NetworkClient,
             ) = coroutineScope {
                 primaryClient.downloadPrimary()
                 secondaryClient.downloadSecondary()
@@ -907,8 +873,8 @@ class CompilerPluginIntegrationTest {
             fun loadAll(
                 urls: List<String>,
                 viewModelScope: CoroutineScope,
-                @BoundedClient(k = 2, enforced = true) primaryClient: NetworkClient,
-                @BoundedClient(k = 3, enforced = true) secondaryClient: NetworkClient,
+                @BoundedClient(k = 2) primaryClient: NetworkClient,
+                @BoundedClient(k = 3) secondaryClient: NetworkClient,
             ) {
                 urls.forEach {
                     viewModelScope.launch { foo(primaryClient, secondaryClient) }
@@ -936,10 +902,10 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @BoundedClient(k = 2, enforced = true)
+            @BoundedClient(k = 2)
             val imageClient = NetworkClient()
 
-            @BoundedClient(k = 2, enforced = true)
+            @BoundedClient(k = 2)
             val apiClient = NetworkClient()
 
             @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
@@ -973,7 +939,7 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @BoundedClient(k = 1, enforced = true)
+            @BoundedClient(k = 1)
             val client = NetworkClient()
 
             @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
@@ -2113,7 +2079,6 @@ class CompilerPluginIntegrationTest {
                             rMaxBytesPerSecond = 700,
                             nMax = 1,
                             selfBound = 3,
-                            selfBoundEnforced = true,
                             mayOutliveCall = true,
                         ),
                     ],
@@ -2173,7 +2138,7 @@ class CompilerPluginIntegrationTest {
                 "number of iterations",
         )
         result.assertOutputContains(
-            "Use an explicitly runtime-enforced bound for every download",
+            "Use a self bound for every download",
         )
     }
 
@@ -2193,8 +2158,8 @@ class CompilerPluginIntegrationTest {
 
             fun load(
                 scope: CoroutineScope,
-                @BoundedClient(k = 2, enforced = true) firstClient: NetworkClient,
-                @BoundedClient(k = 2, enforced = true) secondClient: NetworkClient,
+                @BoundedClient(k = 2) firstClient: NetworkClient,
+                @BoundedClient(k = 2) secondClient: NetworkClient,
             ) {
                 scope.launch {
                     firstClient.download()
@@ -2276,7 +2241,7 @@ class CompilerPluginIntegrationTest {
             )
             fun start(
                 scope: CoroutineScope,
-                @BoundedClient(k = 2, enforced = true) client: NetworkClient,
+                @BoundedClient(k = 2) client: NetworkClient,
             ) {
                 scope.launch { client.backgroundDownload() }
             }
@@ -2316,7 +2281,6 @@ class CompilerPluginIntegrationTest {
                             nMax = 1,
                             mayOutliveCall = true,
                             selfBound = 4,
-                            selfBoundEnforced = true,
                         ),
                     ],
                 )
@@ -2339,49 +2303,6 @@ class CompilerPluginIntegrationTest {
                 "androidx.compose.material3.DownloadButton: {(500000, 4)}",
         )
         result.assertOutputContains("ReqBW=2000000 bytes/s")
-    }
-
-    @Test
-    fun `rejects an opaque self bound without runtime enforcement`() {
-        val result = compile(
-            """
-            package androidx.compose.material3
-
-            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
-            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
-
-            fun Button(
-                onClick: () -> Unit,
-                content: () -> Unit,
-            ) = Unit
-
-            interface ImageLibrary {
-                @BandwidthEffect(
-                    downloads = [
-                        BandwidthDownload(
-                            rMaxBytesPerSecond = 500_000,
-                            nMax = 1,
-                            mayOutliveCall = true,
-                            selfBound = 4,
-                        ),
-                    ],
-                )
-                fun startImageDownload(url: String)
-            }
-
-            fun DownloadButton(library: ImageLibrary, url: String) {
-                Button(
-                    onClick = { library.startImageDownload(url) },
-                    content = {},
-                )
-            }
-            """,
-        )
-
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains(
-            "Use an explicitly runtime-enforced bound for every download",
-        )
     }
 
     @Test
@@ -2436,7 +2357,7 @@ class CompilerPluginIntegrationTest {
             )
             fun start(
                 scope: CoroutineScope,
-                @BoundedClient(k = 2, enforced = true) client: NetworkClient,
+                @BoundedClient(k = 2) client: NetworkClient,
             ) {
                 scope.launch { client.download() }
             }
@@ -2466,8 +2387,8 @@ class CompilerPluginIntegrationTest {
 
             fun load(
                 scope: CoroutineScope,
-                @BoundedClient(k = 2, enforced = true) firstClient: NetworkClient,
-                @BoundedClient(k = 2, enforced = true) secondClient: NetworkClient,
+                @BoundedClient(k = 2) firstClient: NetworkClient,
+                @BoundedClient(k = 2) secondClient: NetworkClient,
             ) {
                 try {
                     scope.launch { firstClient.first() }

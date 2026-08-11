@@ -440,7 +440,7 @@ internal class KotlinNetworkEffectVisitor(
                 call.source?.startOffset,
             source = call.source ?: context.function.source,
             missingBoundMessage = "Network work launched on an escaping coroutine scope " +
-                "requires an explicitly runtime-enforced bound for every download.",
+                "requires a self bound for every download.",
         )
         return inputs.then(
             KotlinExpressionEffect(network = repeated),
@@ -576,7 +576,7 @@ internal class KotlinNetworkEffectVisitor(
             source = call.source ?: context.function.source,
             missingBoundMessage = "Escaping network work in repeated callback " +
                 "${target.displayName()} may overlap across an unknown number of " +
-                "invocations. Use an explicitly runtime-enforced bound for every download.",
+                "invocations. Use a self bound for every download.",
         )
         val invocationEffect = if (mayOutliveCall) {
             repeated.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
@@ -906,8 +906,7 @@ internal class KotlinNetworkEffectVisitor(
                 loop.source?.startOffset,
             source = loop.source ?: context.function.source,
             missingBoundMessage = "Escaping network work in a general loop may overlap across " +
-                "an unknown number of iterations. Use an explicitly runtime-enforced bound " +
-                "for every download.",
+                "an unknown number of iterations. Use a self bound for every download.",
         )
         return KotlinExpressionEffect(network = repeated)
     }
@@ -1072,7 +1071,7 @@ internal class KotlinNetworkEffectVisitor(
         return bounds.singleOrNull()
     }
 
-    /** Resolves an enforced `@BoundedClient` capacity from this expression. */
+    /** Resolves a `@BoundedClient` capacity from this expression. */
     private fun FirExpression.boundedClientCapacity(): Int? {
         functionTypeConversionOperand()?.let { return it.boundedClientCapacity() }
         val expression = when (this) {
@@ -1085,9 +1084,7 @@ internal class KotlinNetworkEffectVisitor(
         if (expression !== this) return expression.boundedClientCapacity()
         val declaration = expression.resolvedSymbol()?.fir
             as? org.jetbrains.kotlin.fir.FirAnnotationContainer
-        return declaration?.boundedClientContract(session)
-            ?.takeIf { it.enforced }
-            ?.k
+        return declaration?.boundedClientContract(session)?.k
     }
 
     private companion object {

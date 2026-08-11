@@ -39,9 +39,7 @@ private val N_MAX: Name = Name.identifier("nMax")
 private val DOWNLOADS: Name = Name.identifier("downloads")
 private val MAY_OUTLIVE_CALL: Name = Name.identifier("mayOutliveCall")
 private val SELF_BOUND: Name = Name.identifier("selfBound")
-private val SELF_BOUND_ENFORCED: Name = Name.identifier("selfBoundEnforced")
 private val K: Name = Name.identifier("k")
-private val ENFORCED: Name = Name.identifier("enforced")
 
 internal data class DownloadContract(
     val maxBytes: Long,
@@ -58,12 +56,10 @@ private data class BandwidthDownloadContract(
     val nMax: Int?,
     val mayOutliveCall: Boolean,
     val selfBound: Int?,
-    val selfBoundEnforced: Boolean,
 )
 
 internal data class BoundedClientContract(
     val k: Int,
-    val enforced: Boolean,
 )
 
 internal data class AnnotationProblem(
@@ -121,7 +117,7 @@ internal fun FirAnnotationContainer.effectContract(session: FirSession): EffectC
             DownloadLifetime.COMPLETES_WITH_CALL
         }
         val effect = NetworkEffect.summary(rate, concurrency, lifetime)
-        effects += if (selfBound == 0 || !download.selfBoundEnforced) {
+        effects += if (selfBound == 0) {
             effect
         } else {
             effect.withSelfBound(selfBound)
@@ -143,10 +139,7 @@ internal fun FirAnnotationContainer.boundedClientContract(
     val annotation: FirAnnotation = annotation(BOUNDED_CLIENT_ANNOTATION, session) ?: return null
     val bound: Int = annotation.intArgument(K, session) ?: return null
     if (bound <= 0) return null
-    return BoundedClientContract(
-        k = bound,
-        enforced = annotation.booleanArgument(ENFORCED, session) == true,
-    )
+    return BoundedClientContract(k = bound)
 }
 
 /**
@@ -327,7 +320,6 @@ private fun FirExpression.downloadContracts(
                 nMax = intArgument(N_MAX, session),
                 mayOutliveCall = booleanArgument(MAY_OUTLIVE_CALL, session) == true,
                 selfBound = intArgument(SELF_BOUND, session) ?: 0,
-                selfBoundEnforced = booleanArgument(SELF_BOUND_ENFORCED, session) == true,
             ),
         )
         is FirFunctionCall -> {
@@ -349,8 +341,6 @@ private fun FirExpression.downloadContracts(
                             .integralLongValue()
                             ?.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }
                             ?.toInt() ?: 0,
-                        selfBoundEnforced = argument(SELF_BOUND_ENFORCED)
-                            ?.constantValue(session) as? Boolean ?: false,
                     ),
                 )
             } else {

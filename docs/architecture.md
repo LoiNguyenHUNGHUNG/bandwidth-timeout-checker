@@ -79,12 +79,12 @@ Annotations are required only where inference cannot see enough:
    operations or library adapters.
 2. `@BandwidthEffect` download-effect lists on opaque functions, higher-order
    inputs, and opaque returned function types. Entries retain
-   `(rMaxBytesPerSecond, nMax, selfBound, selfBoundEnforced, lifetime)`, where a
-   zero `selfBound` means unspecified and an unenforced bound cannot discharge
-   an unknown-repetition obligation. `(rMaxBytesPerSecond, nMax)` remains
+   `(rMaxBytesPerSecond, nMax, selfBound, lifetime)`, where a zero `selfBound`
+   means unspecified. A positive value is a trusted contract that runtime
+   configuration establishes that limit. `(rMaxBytesPerSecond, nMax)` remains
    one-entry shorthand.
-3. `@BoundedClient(k, enforced = true)` on a client whose runtime configuration
-   establishes the same concurrency limit.
+3. `@BoundedClient(k)` on a client whose runtime configuration establishes the
+   same concurrency limit.
 4. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
    enforce the stated launch bound.
 5. `@BandwidthAlternative` on a whole `try/catch` expression when the
@@ -97,8 +97,9 @@ The MVP has no priorities and no download identifiers.
 The core exposes one `repeat(Phi)` rule. It splits `Phi` into work that completes
 with one invocation and work that escapes it. Completing work keeps its local
 peak effect. Escaping work may overlap across an unknown number of later
-invocations, so every escaping download must carry an explicitly enforced self
-bound before unknown replication is applied.
+invocations, so every escaping download must carry a self bound before unknown
+replication is applied. Usage determines this obligation: ordinary work outside
+`repeat` does not require a self bound.
 
 The Kotlin frontend only identifies repetition boundaries and the repeated
 body. General loops, `forEach`, retained button callbacks, and lazy scrolling or
@@ -217,7 +218,7 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   values; unresolved callback effects are rejected. Lifetime-aware sequential
   composition keeps escaping work parallel with later work without
   rematerializing it at every call boundary. Escaping network work requires
-  explicitly runtime-enforced client bounds.
+  self bounds.
 - Compare inferred results against hand-written core fixtures.
 
 ### M4 - Enforced bounded network scopes

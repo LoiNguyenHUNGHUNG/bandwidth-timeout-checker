@@ -19,8 +19,8 @@ public annotation class NetworkDownload(
  * [mayOutliveCall] means work represented by this entry may remain active after
  * the annotated function or callback returns. [selfBound] declares a bound
  * shared by repeated instances of this download kind; zero means that no bound
- * is declared. The checker uses that bound only when [selfBoundEnforced] is
- * `true`, which is a trusted assertion that runtime configuration enforces it.
+ * is declared. A positive value is a trusted contract that runtime configuration
+ * enforces the declared limit.
  */
 @Retention(AnnotationRetention.BINARY)
 public annotation class BandwidthDownload(
@@ -28,7 +28,6 @@ public annotation class BandwidthDownload(
     public val nMax: Int,
     public val mayOutliveCall: Boolean = false,
     public val selfBound: Int = 0,
-    public val selfBoundEnforced: Boolean = false,
 )
 
 /**
@@ -74,9 +73,9 @@ public annotation class BoundedScope(
 
 /**
  * Declares the maximum number of network requests a client can execute at
- * once. [enforced] is a trusted assertion that runtime configuration establishes
- * the same bound, for example through `OkHttpClient`'s `Dispatcher.maxRequests`.
- * Unenforced declarations are not used across unknown-repetition boundaries.
+ * once. This annotation is a trusted contract that runtime configuration
+ * establishes the same bound, for example through `OkHttpClient`'s
+ * `Dispatcher.maxRequests`.
  */
 @Target(
     AnnotationTarget.PROPERTY,
@@ -86,5 +85,4 @@ public annotation class BoundedScope(
 @Retention(AnnotationRetention.BINARY)
 public annotation class BoundedClient(
     public val k: Int,
-    public val enforced: Boolean = false,
 )
