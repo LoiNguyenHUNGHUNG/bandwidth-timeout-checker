@@ -1962,18 +1962,102 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `rejects an effectful general loop`() {
+    fun `infers completing network work in general loops`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
             @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun primitive() = Unit
+            fun primary() = Unit
 
-            fun repeated(count: Int) {
+            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
+            fun secondary() = Unit
+
+            fun whileLoop(count: Int) {
                 var index = 0
                 while (index < count) {
-                    primitive()
+                    primary()
+                    index += 1
+                }
+            }
+
+            fun doWhileLoop(count: Int) {
+                var index = 0
+                do {
+                    secondary()
+                    index += 1
+                } while (index < count)
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for whileLoop: {(1000, 1)}")
+        result.assertOutputContains("Inferred bandwidth effect for doWhileLoop: {(600, 1)}")
+    }
+
+    @Test
+    fun `models bounded escaping work across loop iterations`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+
+            interface NetworkLibrary {
+                @BandwidthEffect(
+                    downloads = [
+                        BandwidthDownload(
+                            rMaxBytesPerSecond = 700,
+                            nMax = 1,
+                            selfBound = 3,
+                            mayOutliveCall = true,
+                        ),
+                    ],
+                )
+                fun startDownload()
+            }
+
+            fun repeated(count: Int, library: NetworkLibrary) {
+                var index = 0
+                while (index < count) {
+                    library.startDownload()
+                    index += 1
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for repeated: {(700, 3)}")
+        result.assertOutputContains("ReqBW=2100 bytes/s")
+    }
+
+    @Test
+    fun `rejects unbounded escaping work across loop iterations`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+
+            interface NetworkLibrary {
+                @BandwidthEffect(
+                    downloads = [
+                        BandwidthDownload(
+                            rMaxBytesPerSecond = 700,
+                            nMax = 1,
+                            mayOutliveCall = true,
+                        ),
+                    ],
+                )
+                fun startDownload()
+            }
+
+            fun repeated(count: Int, library: NetworkLibrary) {
+                var index = 0
+                while (index < count) {
+                    library.startDownload()
                     index += 1
                 }
             }
@@ -1981,7 +2065,11 @@ class CompilerPluginIntegrationTest {
         )
 
         assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Cannot infer network work in a general loop")
+        result.assertOutputContains(
+            "Escaping network work in a general loop may overlap across an unknown " +
+                "number of iterations",
+        )
+        result.assertOutputContains("Use a bounded client for every download")
     }
 
     @Test

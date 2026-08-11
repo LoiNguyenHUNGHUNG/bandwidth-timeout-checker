@@ -170,8 +170,9 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   mutable branch assignments, and higher-order function returns.
 - [x] Require and check latent contracts on opaque higher-order inputs and
   returned function types.
-- [x] Cache per-function summaries and reject unsupported recursion and
-  effectful loops.
+- [x] Cache per-function summaries, reject unsupported recursion, and infer
+  general loops by keeping completing iterations sequential while applying
+  unknown repetition to bounded escaping work.
 - [x] Run annotation validation, effect inference, and diagnostics in the FIR
   frontend without an analysis-only IR pass.
 
