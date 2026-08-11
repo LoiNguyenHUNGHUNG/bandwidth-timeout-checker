@@ -117,7 +117,11 @@ internal fun FirAnnotationContainer.effectContract(session: FirSession): EffectC
             DownloadLifetime.COMPLETES_WITH_CALL
         }
         val effect = NetworkEffect.summary(rate, concurrency, lifetime)
-        effects += if (selfBound == 0) effect else effect.withSelfBound(selfBound)
+        effects += if (selfBound == 0) {
+            effect
+        } else {
+            effect.withSelfBound(selfBound)
+        }
     }
     return EffectContract(
         effects.fold(NetworkEffect.EMPTY) { result, effect -> result.choice(effect) },
@@ -125,9 +129,9 @@ internal fun FirAnnotationContainer.effectContract(session: FirSession): EffectC
 }
 
 /**
- * Parses a positive `@BoundedClient` capacity from this container.
+ * Parses a positive `@BoundedClient` declaration from this container.
  *
- * @return the bound, or `null` when the annotation is absent or invalid.
+ * @return the declaration, or `null` when the annotation is absent or invalid.
  */
 internal fun FirAnnotationContainer.boundedClientContract(
     session: FirSession,
@@ -135,7 +139,7 @@ internal fun FirAnnotationContainer.boundedClientContract(
     val annotation: FirAnnotation = annotation(BOUNDED_CLIENT_ANNOTATION, session) ?: return null
     val bound: Int = annotation.intArgument(K, session) ?: return null
     if (bound <= 0) return null
-    return BoundedClientContract(bound)
+    return BoundedClientContract(k = bound)
 }
 
 /**

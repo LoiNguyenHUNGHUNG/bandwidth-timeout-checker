@@ -312,14 +312,17 @@ internal class KotlinNetworkEffectVisitor(
         if (target.isAwaitAll()) {
             return inferInlineAwaitAll(call, context)
         }
-        if (target.isSerialEventCallbackFunction()) {
-            return inferSerialEventCallbackCall(call, target, context)
+        val repeatedCallbackMayOutliveCall = target.repeatedCallbackMayOutliveCall()
+        if (repeatedCallbackMayOutliveCall != null) {
+            return inferRepeatedCallbackCall(
+                call = call,
+                target = target,
+                context = context,
+                mayOutliveCall = repeatedCallbackMayOutliveCall,
+            )
         }
-        if (target.isUnknownRepeatedCallbackFunction()) {
-            return inferUnknownRepeatedCallbackCall(call, target, context)
-        }
-        if (target.isSequentialCallbackFunction()) {
-            return inferSequentialCallbackCall(call, context)
+        if (target.isSingleCallbackFunction()) {
+            return inferSingleCallbackCall(call, context)
         }
         val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
         /** Infers [expression] at most once for this call site. */
@@ -431,27 +434,16 @@ internal class KotlinNetworkEffectVisitor(
         val resolved = inferCoroutineBuilder(call, context)
         val child = resolved.body ?: return resolved.inputs
         val inputs = resolved.inputs
-        val bodyTotal = child.network
-        if (!bodyTotal.hasSelfBoundForEveryDownload) {
-            problem(
-                key = "escaping-coroutine-self-bound:${context.function.displayName()}:" +
-                    call.source?.startOffset,
-                source = call.source ?: context.function.source,
-                message = "Network work launched on an escaping coroutine scope requires a " +
-                    "bounded client for every download.",
-            )
-            return inputs.then(
-                KotlinExpressionEffect(
-                    network = bodyTotal.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
-                ),
-            )
-        }
+        val repeated = repeatNetworkEffect(
+            effect = child.network.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
+            key = "escaping-coroutine-self-bound:${context.function.displayName()}:" +
+                call.source?.startOffset,
+            source = call.source ?: context.function.source,
+            missingBoundMessage = "Network work launched on an escaping coroutine scope " +
+                "requires a self bound for every download.",
+        )
         return inputs.then(
-            KotlinExpressionEffect(
-                network = bodyTotal.withUnknownRepetition(
-                    lifetime = DownloadLifetime.MAY_OUTLIVE_CALL,
-                ),
-            ),
+            KotlinExpressionEffect(network = repeated),
         )
     }
 
@@ -511,7 +503,7 @@ internal class KotlinNetworkEffectVisitor(
      * Evaluates receivers and arguments, then invokes every latent callback once
      * in argument order.
      */
-    private fun inferSequentialCallbackCall(
+    private fun inferSingleCallbackCall(
         call: FirFunctionCall,
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
@@ -533,16 +525,12 @@ internal class KotlinNetworkEffectVisitor(
         return receiverEffects.then(evaluatedArguments).then(invokedCallbacks)
     }
 
-    /**
-     * UI frameworks invoke these callbacks serially, but an invocation's
-     * escaping work may remain active when a later event invokes the callback.
-     * Completing work therefore keeps its local concurrency, while escaping
-     * work crosses an unknown repetition boundary.
-     */
-    private fun inferSerialEventCallbackCall(
+    /** Infers a callback body once, then applies the core repetition rule. */
+    private fun inferRepeatedCallbackCall(
         call: FirFunctionCall,
         target: FirFunction,
         context: KotlinEffectContext,
+        mayOutliveCall: Boolean,
     ): KotlinExpressionEffect {
         val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
         /** Infers [expression] at most once for this call site. */
@@ -561,10 +549,10 @@ internal class KotlinNetworkEffectVisitor(
                 val latent = argument.latent
                 if (latent == null) {
                     problem(
-                        key = "serial-event-callback:${context.function.displayName()}:" +
+                        key = "repeated-callback:${context.function.displayName()}:" +
                             "${call.source?.startOffset}:${parameter.name}",
                         source = call.source ?: context.function.source,
-                        message = "Cannot infer the event callback effect for " +
+                        message = "Cannot infer the repeated callback effect for " +
                             "${target.displayName()}. Keep the callback visible or annotate " +
                             "its effect.",
                     )
@@ -581,103 +569,22 @@ internal class KotlinNetworkEffectVisitor(
         val bodyNetwork = callbackBody.network
         if (bodyNetwork == NetworkEffect.EMPTY) return evaluatedInputs
 
-        val completing = bodyNetwork.completingOnly()
-            .withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
-        val escaping = bodyNetwork.escapingOnly()
-        if (escaping == NetworkEffect.EMPTY) {
-            return evaluatedInputs.then(KotlinExpressionEffect(network = completing))
-        }
-
-        if (!escaping.hasSelfBoundForEveryDownload) {
-            problem(
-                key = "serial-event-network:${context.function.displayName()}:" +
-                    call.source?.startOffset,
-                source = call.source ?: context.function.source,
-                message = "Escaping network work in ${target.displayName()} may overlap across " +
-                    "an unknown number of event invocations. Use a bounded client for every " +
-                    "download.",
-            )
-            return evaluatedInputs.then(
-                KotlinExpressionEffect(network = completing.then(escaping)),
-            )
-        }
-
-        val repeatedEscaping = escaping.withUnknownRepetition(
-            lifetime = DownloadLifetime.MAY_OUTLIVE_CALL,
+        val repeated = repeatNetworkEffect(
+            effect = bodyNetwork,
+            key = "repeated-network:${context.function.displayName()}:" +
+                call.source?.startOffset,
+            source = call.source ?: context.function.source,
+            missingBoundMessage = "Escaping network work in repeated callback " +
+                "${target.displayName()} may overlap across an unknown number of " +
+                "invocations. Use a self bound for every download.",
         )
-        return evaluatedInputs.then(
-            KotlinExpressionEffect(network = completing.then(repeatedEscaping)),
-        )
-    }
-
-    /**
-     * Compose lazy-item DSLs retain an item callback and may create an unknown
-     * number of concurrently active item instances. Callback evaluation is
-     * therefore an unknown repetition boundary, rather than an ordinary
-     * sequential higher-order invocation.
-     */
-    private fun inferUnknownRepeatedCallbackCall(
-        call: FirFunctionCall,
-        target: FirFunction,
-        context: KotlinEffectContext,
-    ): KotlinExpressionEffect {
-        val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
-        /** Infers [expression] at most once for this call site. */
-        fun effectOf(expression: FirExpression): KotlinExpressionEffect =
-            cachedEffects.getOrPut(expression) { infer(expression, context) }
-
-        val receiverEffects = sequence(call.receiverExpressions().map(::effectOf))
-        val argumentEffects = call.argumentEffectsByParameter(::effectOf)
-        val evaluatedArguments = sequence(call.argumentList.arguments.map(::effectOf))
-        val evaluatedInputs = receiverEffects.then(evaluatedArguments)
-
-        val callbackBody = argumentEffects
-            .filterKeys { it.returnTypeRef.coneType.isSomeFunctionType(session) }
-            .entries
-            .fold(KotlinExpressionEffect()) { effect, (parameter, argument) ->
-                val latent = argument.latent
-                if (latent == null) {
-                    problem(
-                        key = "unknown-repeated-callback:${context.function.displayName()}:" +
-                            "${call.source?.startOffset}:${parameter.name}",
-                        source = call.source ?: context.function.source,
-                        message = "Cannot infer the callback effect for ${target.displayName()}. " +
-                            "Keep the lazy-item callback visible or annotate its effect.",
-                    )
-                    effect
-                } else {
-                    effect.then(
-                        KotlinExpressionEffect(
-                            network = latent.network,
-                            latent = latent.returned,
-                        ),
-                    )
-                }
-            }
-        val bodyNetwork = callbackBody.network
-        if (bodyNetwork == NetworkEffect.EMPTY) return evaluatedInputs
-
-        if (!bodyNetwork.hasSelfBoundForEveryDownload) {
-            problem(
-                key = "unknown-repeated-network:${context.function.displayName()}:" +
-                    call.source?.startOffset,
-                source = call.source ?: context.function.source,
-                message = "Network work in ${target.displayName()} may have an unknown number " +
-                    "of active item instances. Use a bounded client for every download.",
-            )
-            return evaluatedInputs.then(
-                KotlinExpressionEffect(
-                    network = bodyNetwork.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
-                ),
-            )
+        val invocationEffect = if (mayOutliveCall) {
+            repeated.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+        } else {
+            repeated
         }
-
         return evaluatedInputs.then(
-            KotlinExpressionEffect(
-                network = bodyNetwork.withUnknownRepetition(
-                    lifetime = DownloadLifetime.MAY_OUTLIVE_CALL,
-                ),
-            ),
+            KotlinExpressionEffect(network = invocationEffect),
         )
     }
 
@@ -821,19 +728,22 @@ internal class KotlinNetworkEffectVisitor(
     private fun FirFunction.isAwaitAll(): Boolean =
         symbol.callableId.asSingleFqName().asString() == AWAIT_ALL_FQ_NAME
 
-    /** Returns whether this function invokes its callbacks sequentially once. */
-    private fun FirFunction.isSequentialCallbackFunction(): Boolean =
-        symbol.callableId.asSingleFqName().asString() in SEQUENTIAL_CALLBACK_FQ_NAMES
+    /** Returns whether this function invokes its callback exactly once. */
+    private fun FirFunction.isSingleCallbackFunction(): Boolean =
+        symbol.callableId.asSingleFqName().asString() in SINGLE_CALLBACK_FQ_NAMES
 
-    /** Returns whether this UI function retains callbacks for serial events. */
-    private fun FirFunction.isSerialEventCallbackFunction(): Boolean =
-        symbol.callableId.asSingleFqName().asString() in
-            SERIAL_EVENT_CALLBACK_FQ_NAMES
-
-    /** Returns whether this function may create an unknown number of callback instances. */
-    private fun FirFunction.isUnknownRepeatedCallbackFunction(): Boolean =
-        symbol.callableId.asSingleFqName().asString() in
-            UNKNOWN_REPEATED_CALLBACK_FQ_NAMES
+    /**
+     * Returns whether this function repeatedly invokes callbacks that may
+     * outlive the call, or `null` when it is not a recognized repetition.
+     */
+    private fun FirFunction.repeatedCallbackMayOutliveCall(): Boolean? {
+        val fqName = symbol.callableId.asSingleFqName().asString()
+        return when (fqName) {
+            in IMMEDIATE_REPEATED_CALLBACK_FQ_NAMES -> false
+            in RETAINED_REPEATED_CALLBACK_FQ_NAMES -> true
+            else -> null
+        }
+    }
 
     /**
      * Materializes the latent effect of an implicitly invoked function value
@@ -990,27 +900,33 @@ internal class KotlinNetworkEffectVisitor(
         val iterationNetwork = oneIteration.network
         if (iterationNetwork == NetworkEffect.EMPTY) return KotlinExpressionEffect()
 
-        val completing = iterationNetwork.completingOnly()
-        val escaping = iterationNetwork.escapingOnly()
-        if (escaping == NetworkEffect.EMPTY) {
-            return KotlinExpressionEffect(network = completing)
-        }
-
-        if (!escaping.hasSelfBoundForEveryDownload) {
-            problem(
-                key = "unbounded-loop:${context.function.displayName()}:" +
-                    loop.source?.startOffset,
-                source = loop.source ?: context.function.source,
-                message = "Escaping network work in a general loop may overlap across an " +
-                    "unknown number of iterations. Use a bounded client for every download.",
-            )
-            return KotlinExpressionEffect(network = completing.then(escaping))
-        }
-
-        val repeatedEscaping = escaping.withUnknownRepetition(
-            lifetime = DownloadLifetime.MAY_OUTLIVE_CALL,
+        val repeated = repeatNetworkEffect(
+            effect = iterationNetwork,
+            key = "unbounded-loop:${context.function.displayName()}:" +
+                loop.source?.startOffset,
+            source = loop.source ?: context.function.source,
+            missingBoundMessage = "Escaping network work in a general loop may overlap across " +
+                "an unknown number of iterations. Use a self bound for every download.",
         )
-        return KotlinExpressionEffect(network = completing.then(repeatedEscaping))
+        return KotlinExpressionEffect(network = repeated)
+    }
+
+    /** Applies the core repetition rule and reports missing escaping bounds. */
+    private fun repeatNetworkEffect(
+        effect: NetworkEffect,
+        key: String,
+        source: KtSourceElement?,
+        missingBoundMessage: String,
+    ): NetworkEffect {
+        if (!effect.canRepeat) {
+            problem(
+                key = key,
+                source = source,
+                message = missingBoundMessage,
+            )
+            return effect
+        }
+        return effect.repeat()
     }
 
     /**
@@ -1155,7 +1071,7 @@ internal class KotlinNetworkEffectVisitor(
         return bounds.singleOrNull()
     }
 
-    /** Resolves a `@BoundedClient` capacity from this expression's declaration. */
+    /** Resolves a `@BoundedClient` capacity from this expression. */
     private fun FirExpression.boundedClientCapacity(): Int? {
         functionTypeConversionOperand()?.let { return it.boundedClientCapacity() }
         val expression = when (this) {
@@ -1201,13 +1117,15 @@ internal class KotlinNetworkEffectVisitor(
             "kotlinx.coroutines.Dispatchers.Unconfined",
         )
         const val AWAIT_ALL_FQ_NAME: String = "kotlinx.coroutines.awaitAll"
-        val SEQUENTIAL_CALLBACK_FQ_NAMES: Set<String> = setOf(
+        val SINGLE_CALLBACK_FQ_NAMES: Set<String> = setOf(
+            "androidx.tracing.traceAsync",
+        )
+        val IMMEDIATE_REPEATED_CALLBACK_FQ_NAMES: Set<String> = setOf(
             "kotlin.collections.forEach",
             "kotlin.collections.forEachIndexed",
             "kotlin.sequences.forEach",
-            "androidx.tracing.traceAsync",
         )
-        val SERIAL_EVENT_CALLBACK_FQ_NAMES: Set<String> = setOf(
+        val RETAINED_REPEATED_CALLBACK_FQ_NAMES: Set<String> = setOf(
             "androidx.compose.foundation.lazy.LazyColumn",
             "androidx.compose.foundation.lazy.LazyRow",
             "androidx.compose.foundation.lazy.grid.LazyHorizontalGrid",
@@ -1222,8 +1140,6 @@ internal class KotlinNetworkEffectVisitor(
             "androidx.compose.material3.FilledIconButton",
             "androidx.compose.material3.FilledTonalIconButton",
             "androidx.compose.material3.OutlinedIconButton",
-        )
-        val UNKNOWN_REPEATED_CALLBACK_FQ_NAMES: Set<String> = setOf(
             "androidx.compose.foundation.lazy.items",
             "androidx.compose.foundation.lazy.itemsIndexed",
             "androidx.compose.foundation.lazy.grid.items",
