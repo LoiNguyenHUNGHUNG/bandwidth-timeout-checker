@@ -96,20 +96,25 @@ leaves the bound unspecified.
 instances of one primitive download kind. A raw download carries
 `(r, n, selfBound=k, lifetime)`.
 Recognized concurrency constructs compute `n` with ordinary parallel algebra.
-Escaping coroutine work also uses self bounds. A `launch` or `async` through
-an explicit or otherwise unproven scope receiver may outlive its expression
-and function, so its body is summarized with unknown repetition and retained
-as long-lived work. Such a body requires an explicitly runtime-enforced bound
-for every download. A bound without its enforcement flag remains visible as a
-declaration but is not used to make unknown repetition finite.
+Every recognized repetition lowers to one core `repeat(effect)` rule. Downloads
+that complete within one invocation remain sequential. Downloads that escape
+an invocation may overlap later invocations, so each requires an explicitly
+runtime-enforced self bound. A bound without its enforcement flag remains
+visible as a declaration but is not used to make repetition finite.
+
+The frontend recognizes `while`, `do-while`, `for`/`forEach`, repeated UI
+callbacks such as button presses, and lazy scrolling/item callbacks as
+repetitions. Supporting another repeated construct only adds a frontend model;
+the quantitative rule remains unchanged. Callback contents may differ between
+invocations because their download annotations already describe worst-case
+effects.
+
+A `launch` or `async` through an explicit or otherwise unproven scope receiver
+may outlive its expression and function, so the launched body is made escaping
+before applying the same repetition rule.
 An unqualified builder directly inside a recognized `coroutineScope` or
 `withContext` remains structured. The checker trusts the client configuration;
 for OkHttp, set the matching `Dispatcher.maxRequests` value.
-
-General `while` and `do-while` loops preserve the peak effect of network work
-that completes within each iteration. Work that may escape an iteration is
-instead treated as unknown repetition and requires an explicitly enforced self
-bound for every download.
 
 For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 `try/catch` expression, but recovery paths are still joined conservatively.

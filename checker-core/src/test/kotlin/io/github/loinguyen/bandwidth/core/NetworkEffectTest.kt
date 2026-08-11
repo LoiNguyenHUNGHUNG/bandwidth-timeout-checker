@@ -48,6 +48,51 @@ class NetworkEffectTest {
     }
 
     @Test
+    fun `repeat keeps completing downloads sequential without bounds`() {
+        val result = NetworkEffect.download(1_000, 1_000).repeat()
+
+        assertEquals(
+            listOf(DownloadEffect(Rational.of(1_000), 1)),
+            result.obligations,
+        )
+    }
+
+    @Test
+    fun `repeat requires bounds only for escaping downloads`() {
+        val effect = NetworkEffect.download(1_000, 1_000).then(
+            NetworkEffect.download(500, 1_000)
+                .withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
+        )
+
+        assertFailsWith<IllegalArgumentException> { effect.repeat() }
+    }
+
+    @Test
+    fun `repeat overlaps bounded escaping downloads with completing work`() {
+        val effect = NetworkEffect.download(1_000, 1_000).then(
+            NetworkEffect.download(500, 1_000)
+                .withSelfBound(3)
+                .withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
+        )
+
+        val result = effect.repeat()
+
+        assertEquals(
+            listOf(
+                DownloadEffect(Rational.of(1_000), 4),
+                DownloadEffect(
+                    Rational.of(500),
+                    4,
+                    selfBound = 3,
+                    lifetime = DownloadLifetime.MAY_OUTLIVE_CALL,
+                ),
+            ),
+            result.obligations,
+        )
+        assertEquals(Rational.of(4_000), result.requiredBandwidthBytesPerSecond())
+    }
+
+    @Test
     fun `sequential join preserves rate-concurrency correlation`() {
         val fastSingle: NetworkEffect = NetworkEffect.of(
             listOf(DownloadEffect(Rational.of(10), 1)),

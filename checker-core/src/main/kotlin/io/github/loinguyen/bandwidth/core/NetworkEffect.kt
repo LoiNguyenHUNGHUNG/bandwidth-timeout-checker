@@ -94,6 +94,10 @@ public class NetworkEffect private constructor(
     public val hasSelfBoundForEveryDownload: Boolean
         get() = downloads.all { it.selfBound != null }
 
+    /** True when every download that can escape one invocation has a self bound. */
+    public val canRepeat: Boolean
+        get() = escapingDownloads().all { it.selfBound != null }
+
     public val maxConcurrency: Int
         get() = obligations.maxOfOrNull { it.concurrency } ?: 0
 
@@ -137,6 +141,27 @@ public class NetworkEffect private constructor(
     public fun withSelfBound(selfBound: Int): NetworkEffect {
         require(selfBound > 0) { "selfBound must be positive" }
         return of(downloads.map { it.copy(selfBound = selfBound) })
+    }
+
+    /**
+     * Models an unknown number of serial invocations of this effect.
+     *
+     * Downloads that complete with one invocation remain sequential across
+     * invocations. Downloads that escape may overlap with later invocations,
+     * so each must carry a trusted self bound.
+     */
+    public fun repeat(): NetworkEffect {
+        require(canRepeat) {
+            "repeat requires a self bound for every escaping download"
+        }
+        val completing = completingOnly()
+        val escaping = escapingOnly()
+        if (escaping == EMPTY) return completing
+        return completing.then(
+            escaping.withUnknownRepetition(
+                lifetime = DownloadLifetime.MAY_OUTLIVE_CALL,
+            ),
+        )
     }
 
     /**

@@ -622,6 +622,73 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `lowers forEach to the core repetition rule`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+
+            interface ImageLibrary {
+                @BandwidthEffect(
+                    downloads = [
+                        BandwidthDownload(
+                            rMaxBytesPerSecond = 400,
+                            nMax = 1,
+                            mayOutliveCall = true,
+                            selfBound = 2,
+                            selfBoundEnforced = true,
+                        ),
+                    ],
+                )
+                fun start(url: String)
+            }
+
+            fun loadImages(urls: List<String>, library: ImageLibrary) {
+                urls.forEach { url -> library.start(url) }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for loadImages: {(400, 2)}")
+        result.assertOutputContains("ReqBW=800 bytes/s")
+    }
+
+    @Test
+    fun `rejects unbounded escaping work in forEach`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+
+            interface ImageLibrary {
+                @BandwidthEffect(
+                    downloads = [
+                        BandwidthDownload(
+                            rMaxBytesPerSecond = 400,
+                            nMax = 1,
+                            mayOutliveCall = true,
+                        ),
+                    ],
+                )
+                fun start(url: String)
+            }
+
+            fun loadImages(urls: List<String>, library: ImageLibrary) {
+                urls.forEach { url -> library.start(url) }
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Escaping network work in repeated callback")
+        result.assertOutputContains(
+            "Use an explicitly runtime-enforced bound for every download",
+        )
+    }
+
+    @Test
     fun `uses an image loader bound for NIA style lazy feed items`() {
         val result = compile(
             """
@@ -719,7 +786,7 @@ class CompilerPluginIntegrationTest {
 
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "may have an unknown number of active item instances",
+            "Escaping network work in repeated callback",
         )
         result.assertOutputContains(
             "Use an explicitly runtime-enforced bound for every download",
