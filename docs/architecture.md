@@ -78,11 +78,15 @@ Annotations are required only where inference cannot see enough:
    operations or library adapters.
 2. `@BandwidthEffect` download-effect lists on opaque functions, higher-order
    inputs, and opaque returned function types. Entries retain
-   `(rMaxBytesPerSecond, nMax, selfBound, lifetime)`, where a zero `selfBound`
-   means unspecified. `(rMaxBytesPerSecond, nMax)` remains one-entry shorthand.
-3. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
+   `(rMaxBytesPerSecond, nMax, selfBound, selfBoundEnforced, lifetime)`, where a
+   zero `selfBound` means unspecified and an unenforced bound cannot discharge
+   an unknown-repetition obligation. `(rMaxBytesPerSecond, nMax)` remains
+   one-entry shorthand.
+3. `@BoundedClient(k, enforced = true)` on a client whose runtime configuration
+   establishes the same concurrency limit.
+4. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
    enforce the stated launch bound.
-4. `@BandwidthAlternative` on a whole `try/catch` expression when the
+5. `@BandwidthAlternative` on a whole `try/catch` expression when the
    programmer asserts that its network branches are comparable alternatives.
 
 The MVP has no priorities and no download identifiers.
@@ -197,7 +201,7 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   values; unresolved callback effects are rejected. Lifetime-aware sequential
   composition keeps escaping work parallel with later work without
   rematerializing it at every call boundary. Escaping network work requires
-  bounded clients.
+  explicitly runtime-enforced client bounds.
 - Compare inferred results against hand-written core fixtures.
 
 ### M4 - Enforced bounded network scopes

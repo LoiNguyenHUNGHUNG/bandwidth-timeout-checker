@@ -52,7 +52,7 @@ fun applyNetworkCallback(
 @BoundedScope(k = 4)
 val downloadScope = viewModelScope
 
-@BoundedClient(k = 4)
+@BoundedClient(k = 4, enforced = true)
 val imageClient = OkHttpClient.Builder()
     .dispatcher(Dispatcher().apply { maxRequests = 4 })
     .build()
@@ -79,6 +79,7 @@ download effect. Contracts that may outlive their call retain that fact:
             nMax = 4,
             mayOutliveCall = true,
             selfBound = 4,
+            selfBoundEnforced = true,
         ),
     ],
 )
@@ -86,26 +87,29 @@ fun startBackgroundSync()
 ```
 
 The checker preserves the individual rate, concurrency, self-bound, and
-lifetime fields instead of collapsing them to one pair. Set `selfBound` on an
-opaque download entry when a runtime client or scheduler enforces a shared
-limit across repeated invocations; zero leaves the bound unspecified.
+lifetime fields instead of collapsing them to one pair. Set `selfBound` and
+`selfBoundEnforced = true` on an opaque download entry only when a runtime
+client or scheduler enforces a shared limit across repeated invocations; zero
+leaves the bound unspecified.
 
-`@BoundedClient(k)` attaches a configured self bound to instances of one
-primitive download kind. A raw download carries
+`@BoundedClient(k, enforced = true)` attaches a configured self bound to
+instances of one primitive download kind. A raw download carries
 `(r, n, selfBound=k, lifetime)`.
 Recognized concurrency constructs compute `n` with ordinary parallel algebra.
 Escaping coroutine work also uses self bounds. A `launch` or `async` through
 an explicit or otherwise unproven scope receiver may outlive its expression
 and function, so its body is summarized with unknown repetition and retained
-as long-lived work. Such a body requires a bounded client for every download.
+as long-lived work. Such a body requires an explicitly runtime-enforced bound
+for every download. A bound without its enforcement flag remains visible as a
+declaration but is not used to make unknown repetition finite.
 An unqualified builder directly inside a recognized `coroutineScope` or
 `withContext` remains structured. The checker trusts the client configuration;
 for OkHttp, set the matching `Dispatcher.maxRequests` value.
 
 General `while` and `do-while` loops preserve the peak effect of network work
 that completes within each iteration. Work that may escape an iteration is
-instead treated as unknown repetition and requires a self bound for every
-download.
+instead treated as unknown repetition and requires an explicitly enforced self
+bound for every download.
 
 For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 `try/catch` expression, but recovery paths are still joined conservatively.

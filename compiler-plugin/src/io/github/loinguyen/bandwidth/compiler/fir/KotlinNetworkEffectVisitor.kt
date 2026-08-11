@@ -437,8 +437,8 @@ internal class KotlinNetworkEffectVisitor(
                 key = "escaping-coroutine-self-bound:${context.function.displayName()}:" +
                     call.source?.startOffset,
                 source = call.source ?: context.function.source,
-                message = "Network work launched on an escaping coroutine scope requires a " +
-                    "bounded client for every download.",
+                message = "Network work launched on an escaping coroutine scope requires an " +
+                    "explicitly runtime-enforced bound for every download.",
             )
             return inputs.then(
                 KotlinExpressionEffect(
@@ -594,8 +594,8 @@ internal class KotlinNetworkEffectVisitor(
                     call.source?.startOffset,
                 source = call.source ?: context.function.source,
                 message = "Escaping network work in ${target.displayName()} may overlap across " +
-                    "an unknown number of event invocations. Use a bounded client for every " +
-                    "download.",
+                    "an unknown number of event invocations. Use an explicitly " +
+                    "runtime-enforced bound for every download.",
             )
             return evaluatedInputs.then(
                 KotlinExpressionEffect(network = completing.then(escaping)),
@@ -663,7 +663,8 @@ internal class KotlinNetworkEffectVisitor(
                     call.source?.startOffset,
                 source = call.source ?: context.function.source,
                 message = "Network work in ${target.displayName()} may have an unknown number " +
-                    "of active item instances. Use a bounded client for every download.",
+                    "of active item instances. Use an explicitly runtime-enforced bound for " +
+                    "every download.",
             )
             return evaluatedInputs.then(
                 KotlinExpressionEffect(
@@ -1002,7 +1003,8 @@ internal class KotlinNetworkEffectVisitor(
                     loop.source?.startOffset,
                 source = loop.source ?: context.function.source,
                 message = "Escaping network work in a general loop may overlap across an " +
-                    "unknown number of iterations. Use a bounded client for every download.",
+                    "unknown number of iterations. Use an explicitly runtime-enforced bound " +
+                    "for every download.",
             )
             return KotlinExpressionEffect(network = completing.then(escaping))
         }
@@ -1155,7 +1157,7 @@ internal class KotlinNetworkEffectVisitor(
         return bounds.singleOrNull()
     }
 
-    /** Resolves a `@BoundedClient` capacity from this expression's declaration. */
+    /** Resolves an enforced `@BoundedClient` capacity from this expression. */
     private fun FirExpression.boundedClientCapacity(): Int? {
         functionTypeConversionOperand()?.let { return it.boundedClientCapacity() }
         val expression = when (this) {
@@ -1168,7 +1170,9 @@ internal class KotlinNetworkEffectVisitor(
         if (expression !== this) return expression.boundedClientCapacity()
         val declaration = expression.resolvedSymbol()?.fir
             as? org.jetbrains.kotlin.fir.FirAnnotationContainer
-        return declaration?.boundedClientContract(session)?.k
+        return declaration?.boundedClientContract(session)
+            ?.takeIf { it.enforced }
+            ?.k
     }
 
     private companion object {
