@@ -971,27 +971,46 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     /**
-     * Infers one representative iteration and rejects effectful general loops
-     * because no finite repetition bound is known.
+     * Infers the peak effect of a general loop with an unknown iteration count.
+     *
+     * Work that completes within an iteration remains sequential across
+     * iterations. Escaping work may overlap with every later iteration, so it
+     * crosses an unknown-repetition boundary and requires a self bound.
      */
     private fun inferLoop(
         loop: FirLoop,
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
-        val oneIteration = sequence(
-            listOf(
-                infer(loop.condition, context),
-                infer(loop.block, context),
-            ),
+        val iterationExpressions = if (loop is FirDoWhileLoop) {
+            listOf(loop.block, loop.condition)
+        } else {
+            listOf(loop.condition, loop.block)
+        }
+        val oneIteration = sequence(iterationExpressions.map { infer(it, context) })
+        val iterationNetwork = oneIteration.network
+        if (iterationNetwork == NetworkEffect.EMPTY) return KotlinExpressionEffect()
+
+        val completing = iterationNetwork.completingOnly()
+        val escaping = iterationNetwork.escapingOnly()
+        if (escaping == NetworkEffect.EMPTY) {
+            return KotlinExpressionEffect(network = completing)
+        }
+
+        if (!escaping.hasSelfBoundForEveryDownload) {
+            problem(
+                key = "unbounded-loop:${context.function.displayName()}:" +
+                    loop.source?.startOffset,
+                source = loop.source ?: context.function.source,
+                message = "Escaping network work in a general loop may overlap across an " +
+                    "unknown number of iterations. Use a bounded client for every download.",
+            )
+            return KotlinExpressionEffect(network = completing.then(escaping))
+        }
+
+        val repeatedEscaping = escaping.withUnknownRepetition(
+            lifetime = DownloadLifetime.MAY_OUTLIVE_CALL,
         )
-        if (oneIteration.materialize() == NetworkEffect.EMPTY) return oneIteration
-        problem(
-            key = "unbounded-loop:${context.function.displayName()}:${loop.source?.startOffset}",
-            source = loop.source ?: context.function.source,
-            message = "Cannot infer network work in a general loop. Use a supported bounded " +
-                "collection operation or add a loop-bound rule.",
-        )
-        return KotlinExpressionEffect()
+        return KotlinExpressionEffect(network = completing.then(repeatedEscaping))
     }
 
     /**

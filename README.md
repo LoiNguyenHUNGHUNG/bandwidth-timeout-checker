@@ -102,6 +102,11 @@ An unqualified builder directly inside a recognized `coroutineScope` or
 `withContext` remains structured. The checker trusts the client configuration;
 for OkHttp, set the matching `Dispatcher.maxRequests` value.
 
+General `while` and `do-while` loops preserve the peak effect of network work
+that completes within each iteration. Work that may escape an iteration is
+instead treated as unknown repetition and requires a self bound for every
+download.
+
 For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 `try/catch` expression, but recovery paths are still joined conservatively.
 This avoids assigning zero bandwidth to `try { download() } catch { showError() }`
@@ -128,11 +133,11 @@ bandwidthChecker {
 }
 ```
 
-The recursion-free milestone rejects unannotated recursion, effectful loops,
-and effectful callbacks passed to opaque higher-order APIs without a parameter
-contract. Trusted library models cover sequential `forEach` callbacks and
-AndroidX `traceAsync`; these invoke a visible callback once for peak-bandwidth
-inference rather than treating it as concurrent work.
+The recursion-free milestone rejects unannotated recursion, unbounded escaping
+work in general loops, and effectful callbacks passed to opaque higher-order
+APIs without a parameter contract. Trusted library models cover sequential
+`forEach` callbacks and AndroidX `traceAsync`; these invoke a visible callback
+once for peak-bandwidth inference rather than treating it as concurrent work.
 
 ## Candidate Android case studies
 
@@ -259,7 +264,8 @@ artifacts must not mix versions.
   `try/catch`
 - [x] Higher-order parameter contracts and visible callback checking
 - [x] Latent effects for stored, aliased, captured, and returned function values
-- [x] FIR-native annotation, contract, recursion, and loop diagnostics
+- [x] FIR-native annotation and contract diagnostics, recursion checks, and
+  lifetime-aware general loop inference
 - [x] Structured `coroutineScope`/`withContext` inference with sequential parent
   work, conservative `launch`/`async` overlap, and inline `awaitAll`
 - [x] Sequential `chunked(...).forEach` callback inference
