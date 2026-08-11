@@ -208,6 +208,12 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 - [x] Model eager `map { async { ... } }` collections as unknown structured
   fan-out requiring self-bounded downloads. Track a local collection handle so
   direct or stored `awaitAll()` ends its overlap window.
+- [x] Keep visible `flow`, collection `asFlow`, and `flatMapMerge` pipelines
+  latent until no-argument `collect()`. Require an explicit positive constant
+  concurrency bound, apply it to completing inner-flow work, and route escaping
+  transform and inner-flow work through the core repetition rule. Reject
+  collector callbacks until their incompatible Kotlin 2.3/2.4 FIR shapes are
+  normalized.
 - [x] Lower `forEach` through the core repetition rule and model AndroidX
   `traceAsync` as one callback invocation; unknown higher-order library calls
   still require contracts.

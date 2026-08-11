@@ -7,14 +7,14 @@ import org.jetbrains.kotlin.fir.declarations.FirCallableDeclaration
 import org.jetbrains.kotlin.fir.declarations.FirFunction
 import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 
-/** Effect suspended inside a Kotlin function value. */
+/** Effect suspended inside a value, such as a function or lazy Flow. */
 internal data class LatentNetworkEffect(
     val network: NetworkEffect = NetworkEffect.EMPTY,
     val returned: LatentNetworkEffect? = null,
 ) {
     /**
-     * Conservatively joins this latent effect with [other], including callbacks
-     * returned by either function value.
+     * Conservatively joins this latent effect with [other], including latent
+     * values returned when either operand is materialized.
      */
     fun join(other: LatentNetworkEffect): LatentNetworkEffect =
         LatentNetworkEffect(
@@ -22,7 +22,7 @@ internal data class LatentNetworkEffect(
             returned = returned.join(other.returned),
         )
 
-    /** Returns the network work performed when this function value is invoked. */
+    /** Returns the network work performed when this latent value is materialized. */
     fun materialize(): NetworkEffect = network
 }
 
@@ -72,7 +72,7 @@ internal data class KotlinFunctionEffect(
     fun materialize(): NetworkEffect = network
 }
 
-/** Lexical environment for latent function values and returned callbacks. */
+/** Lexical environment for latent function and Flow values. */
 internal class KotlinEffectContext(
     val function: FirFunction,
     private val session: FirSession,
@@ -84,7 +84,7 @@ internal class KotlinEffectContext(
     /**
      * Associates [latent] with [symbol], joining it with any prior branch value.
      *
-     * Null symbols and non-function values are ignored.
+     * Null symbols and expressions without latent values are ignored.
      */
     fun bind(symbol: FirBasedSymbol<*>?, latent: LatentNetworkEffect?) {
         if (symbol == null || latent == null) return
@@ -109,7 +109,7 @@ internal class KotlinEffectContext(
             ?.toLatentEffect()
     }
 
-    /** Joins a callback-valued return into this function's returned effect. */
+    /** Joins a latent-valued return into this function's returned effect. */
     fun recordReturn(latent: LatentNetworkEffect?) {
         if (latent == null) return
         returnedLatent = returnedLatent?.join(latent) ?: latent
