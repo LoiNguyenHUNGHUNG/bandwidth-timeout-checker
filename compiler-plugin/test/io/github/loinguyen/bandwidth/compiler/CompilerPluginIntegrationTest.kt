@@ -122,7 +122,7 @@ class CompilerPluginIntegrationTest {
 
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires a bounded client",
+            "Network work launched on an escaping coroutine scope requires a self bound",
         )
     }
 
@@ -273,7 +273,7 @@ class CompilerPluginIntegrationTest {
 
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires a bounded client",
+            "Network work launched on an escaping coroutine scope requires a self bound",
         )
     }
 
@@ -491,7 +491,7 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `requires a bounded client for a Job replacing context`() {
+    fun `requires a self bound for a Job replacing context`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
@@ -512,7 +512,7 @@ class CompilerPluginIntegrationTest {
 
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires a bounded client",
+            "Network work launched on an escaping coroutine scope requires a self bound",
         )
     }
 
@@ -586,6 +586,72 @@ class CompilerPluginIntegrationTest {
             "Inferred bandwidth effect for loadImages: {(900, 4)}",
         )
         result.assertOutputContains("ReqBW=3600 bytes/s")
+    }
+
+    @Test
+    fun `lowers forEach to the core repetition rule`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+
+            interface ImageLibrary {
+                @BandwidthEffect(
+                    downloads = [
+                        BandwidthDownload(
+                            rMaxBytesPerSecond = 400,
+                            nMax = 1,
+                            mayOutliveCall = true,
+                            selfBound = 2,
+                        ),
+                    ],
+                )
+                fun start(url: String)
+            }
+
+            fun loadImages(urls: List<String>, library: ImageLibrary) {
+                urls.forEach { url -> library.start(url) }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for loadImages: {(400, 2)}")
+        result.assertOutputContains("ReqBW=800 bytes/s")
+    }
+
+    @Test
+    fun `rejects unbounded escaping work in forEach`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+
+            interface ImageLibrary {
+                @BandwidthEffect(
+                    downloads = [
+                        BandwidthDownload(
+                            rMaxBytesPerSecond = 400,
+                            nMax = 1,
+                            mayOutliveCall = true,
+                        ),
+                    ],
+                )
+                fun start(url: String)
+            }
+
+            fun loadImages(urls: List<String>, library: ImageLibrary) {
+                urls.forEach { url -> library.start(url) }
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Escaping network work in repeated callback")
+        result.assertOutputContains(
+            "Use a self bound for every download",
+        )
     }
 
     @Test
@@ -686,9 +752,11 @@ class CompilerPluginIntegrationTest {
 
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "may have an unknown number of active item instances",
+            "Escaping network work in repeated callback",
         )
-        result.assertOutputContains("Use a bounded client for every download")
+        result.assertOutputContains(
+            "Use a self bound for every download",
+        )
     }
 
     @Test
@@ -771,8 +839,8 @@ class CompilerPluginIntegrationTest {
 
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires a " +
-                "bounded client for every download",
+            "Network work launched on an escaping coroutine scope requires a self bound " +
+                "for every download",
         )
     }
 
@@ -1506,7 +1574,7 @@ class CompilerPluginIntegrationTest {
         result.assertOutputContains(
             "Mapped async children may overlap across an unknown number of collection elements",
         )
-        result.assertOutputContains("Use a bounded client for every download")
+        result.assertOutputContains("Use a self bound for every download")
     }
 
     @Test
@@ -2188,7 +2256,9 @@ class CompilerPluginIntegrationTest {
             "Escaping network work in a general loop may overlap across an unknown " +
                 "number of iterations",
         )
-        result.assertOutputContains("Use a bounded client for every download")
+        result.assertOutputContains(
+            "Use a self bound for every download",
+        )
     }
 
     @Test

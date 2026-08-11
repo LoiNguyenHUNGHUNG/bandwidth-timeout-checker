@@ -17,9 +17,10 @@ public annotation class NetworkDownload(
  * One download entry in a [BandwidthEffect] contract.
  *
  * [mayOutliveCall] means work represented by this entry may remain active after
- * the annotated function or callback returns. [selfBound] is a trusted runtime
- * bound shared by repeated instances of this download kind; zero means that no
- * bound is declared.
+ * the annotated function or callback returns. [selfBound] declares a bound
+ * shared by repeated instances of this download kind; zero means that no bound
+ * is declared. A positive value is a trusted contract that runtime configuration
+ * enforces the declared limit.
  */
 @Retention(AnnotationRetention.BINARY)
 public annotation class BandwidthDownload(
@@ -72,8 +73,9 @@ public annotation class BoundedScope(
 
 /**
  * Declares the maximum number of network requests a client can execute at
- * once. The application must configure the underlying client to enforce this
- * bound (for example, with an OkHttp Dispatcher).
+ * once. This annotation is a trusted contract that runtime configuration
+ * establishes the same bound, for example through `OkHttpClient`'s
+ * `Dispatcher.maxRequests`.
  */
 @Target(
     AnnotationTarget.PROPERTY,

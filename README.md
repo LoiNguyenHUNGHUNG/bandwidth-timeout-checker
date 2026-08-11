@@ -87,17 +87,30 @@ fun startBackgroundSync()
 
 The checker preserves the individual rate, concurrency, self-bound, and
 lifetime fields instead of collapsing them to one pair. Set `selfBound` on an
-opaque download entry when a runtime client or scheduler enforces a shared
-limit across repeated invocations; zero leaves the bound unspecified.
+opaque download entry only when a runtime client or scheduler enforces a shared
+limit across repeated invocations; zero leaves the bound unspecified. A positive
+value is a trusted contract about that runtime limit.
 
 `@BoundedClient(k)` attaches a configured self bound to instances of one
 primitive download kind. A raw download carries
 `(r, n, selfBound=k, lifetime)`.
 Recognized concurrency constructs compute `n` with ordinary parallel algebra.
-Escaping coroutine work also uses self bounds. A `launch` or `async` through
-an explicit or otherwise unproven scope receiver may outlive its expression
-and function, so its body is summarized with unknown repetition and retained
-as long-lived work. Such a body requires a bounded client for every download.
+Every recognized repetition lowers to one core `repeat(effect)` rule. Downloads
+that complete within one invocation remain sequential. Downloads that escape
+an invocation may overlap later invocations, so each requires a self bound.
+Ordinary, non-repeated use does not require one. Runtime verification for a
+specific client may be added separately without changing this usage rule.
+
+The frontend recognizes `while`, `do-while`, `for`/`forEach`, repeated UI
+callbacks such as button presses, and lazy scrolling/item callbacks as
+repetitions. Supporting another repeated construct only adds a frontend model;
+the quantitative rule remains unchanged. Callback contents may differ between
+invocations because their download annotations already describe worst-case
+effects.
+
+A `launch` or `async` through an explicit or otherwise unproven scope receiver
+may outlive its expression and function, so the launched body is made escaping
+before applying the same repetition rule.
 An unqualified builder directly inside a recognized `coroutineScope` or
 `withContext` remains structured. The checker trusts the client configuration;
 for OkHttp, set the matching `Dispatcher.maxRequests` value.
@@ -107,11 +120,6 @@ an unknown number of concurrently active children. Every download in the async
 body therefore needs a self bound. A direct or stored collection `awaitAll()`
 ends that group's overlap with later statements; an untracked Deferred
 collection is rejected because its child effects are unknown.
-
-General `while` and `do-while` loops preserve the peak effect of network work
-that completes within each iteration. Work that may escape an iteration is
-instead treated as unknown repetition and requires a self bound for every
-download.
 
 For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 `try/catch` expression, but recovery paths are still joined conservatively.

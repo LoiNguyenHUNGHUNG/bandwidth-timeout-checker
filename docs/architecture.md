@@ -27,6 +27,7 @@ FIR quantitative-effect visitor: Gamma |- e : tau |> Phi
   - primitive download -> singleton effect
   - sequence / choice -> sequential join
   - structured concurrency -> parallel composition
+  - repeat -> completing work stays sequential; escaping work uses self bounds
   - escaping coroutine work -> download effects tagged `MAY_OUTLIVE_CALL`
   - opaque call -> declared latent effect
               |
@@ -79,13 +80,33 @@ Annotations are required only where inference cannot see enough:
 2. `@BandwidthEffect` download-effect lists on opaque functions, higher-order
    inputs, and opaque returned function types. Entries retain
    `(rMaxBytesPerSecond, nMax, selfBound, lifetime)`, where a zero `selfBound`
-   means unspecified. `(rMaxBytesPerSecond, nMax)` remains one-entry shorthand.
-3. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
+   means unspecified. A positive value is a trusted contract that runtime
+   configuration establishes that limit. `(rMaxBytesPerSecond, nMax)` remains
+   one-entry shorthand.
+3. `@BoundedClient(k)` on a client whose runtime configuration establishes the
+   same concurrency limit.
+4. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
    enforce the stated launch bound.
-4. `@BandwidthAlternative` on a whole `try/catch` expression when the
+5. `@BandwidthAlternative` on a whole `try/catch` expression when the
    programmer asserts that its network branches are comparable alternatives.
 
 The MVP has no priorities and no download identifiers.
+
+## Unknown repetition
+
+The core exposes one `repeat(Phi)` rule. It splits `Phi` into work that completes
+with one invocation and work that escapes it. Completing work keeps its local
+peak effect. Escaping work may overlap across an unknown number of later
+invocations, so every escaping download must carry a self bound before unknown
+replication is applied. Usage determines this obligation: ordinary work outside
+`repeat` does not require a self bound.
+
+The Kotlin frontend only identifies repetition boundaries and the repeated
+body. General loops, `forEach`, retained button callbacks, and lazy scrolling or
+item callbacks all lower through the same rule. Retained callbacks tag the
+result as potentially outliving the surrounding call after repetition is
+computed. Adding another framework construct therefore extends only frontend
+recognition, not the quantitative algebra.
 
 ## Bounded scopes
 
@@ -170,9 +191,8 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   mutable branch assignments, and higher-order function returns.
 - [x] Require and check latent contracts on opaque higher-order inputs and
   returned function types.
-- [x] Cache per-function summaries, reject unsupported recursion, and infer
-  general loops by keeping completing iterations sequential while applying
-  unknown repetition to bounded escaping work.
+- [x] Cache per-function summaries, reject unsupported recursion, and lower
+  general loops through the core repetition rule.
 - [x] Run annotation validation, effect inference, and diagnostics in the FIR
   frontend without an analysis-only IR pass.
 
@@ -188,8 +208,9 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 - [x] Model eager `map { async { ... } }` collections as unknown structured
   fan-out requiring self-bounded downloads. Track a local collection handle so
   direct or stored `awaitAll()` ends its overlap window.
-- [x] Model trusted `forEach` and AndroidX `traceAsync` callbacks as sequential
-  invocation; unknown higher-order library calls still require contracts.
+- [x] Lower `forEach` through the core repetition rule and model AndroidX
+  `traceAsync` as one callback invocation; unknown higher-order library calls
+  still require contracts.
 - Keep aliased, reassigned, stored, or escaped child handles live until scope
   completion unless ownership can be proved.
 - [x] Distinguish structured completion from escaped jobs. An unqualified
@@ -200,7 +221,7 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   values; unresolved callback effects are rejected. Lifetime-aware sequential
   composition keeps escaping work parallel with later work without
   rematerializing it at every call boundary. Escaping network work requires
-  bounded clients.
+  self bounds.
 - Compare inferred results against hand-written core fixtures.
 
 ### M4 - Enforced bounded network scopes
