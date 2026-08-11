@@ -38,6 +38,7 @@ private val R_MAX_BYTES_PER_SECOND: Name = Name.identifier("rMaxBytesPerSecond")
 private val N_MAX: Name = Name.identifier("nMax")
 private val DOWNLOADS: Name = Name.identifier("downloads")
 private val MAY_OUTLIVE_CALL: Name = Name.identifier("mayOutliveCall")
+private val SELF_BOUND: Name = Name.identifier("selfBound")
 private val K: Name = Name.identifier("k")
 
 internal data class DownloadContract(
@@ -54,6 +55,7 @@ private data class BandwidthDownloadContract(
     val rMaxBytesPerSecond: Long?,
     val nMax: Int?,
     val mayOutliveCall: Boolean,
+    val selfBound: Int?,
 )
 
 internal data class BoundedClientContract(
@@ -107,13 +109,15 @@ internal fun FirAnnotationContainer.effectContract(session: FirSession): EffectC
     annotation.downloadContracts(session).forEach { download ->
         val rate = download.rMaxBytesPerSecond ?: return null
         val concurrency = download.nMax ?: return null
-        if (rate < 0 || concurrency <= 0) return null
+        val selfBound = download.selfBound ?: return null
+        if (rate < 0 || concurrency <= 0 || selfBound < 0) return null
         val lifetime = if (download.mayOutliveCall) {
             DownloadLifetime.MAY_OUTLIVE_CALL
         } else {
             DownloadLifetime.COMPLETES_WITH_CALL
         }
-        effects += NetworkEffect.summary(rate, concurrency, lifetime)
+        val effect = NetworkEffect.summary(rate, concurrency, lifetime)
+        effects += if (selfBound == 0) effect else effect.withSelfBound(selfBound)
     }
     return EffectContract(
         effects.fold(NetworkEffect.EMPTY) { result, effect -> result.choice(effect) },
@@ -263,6 +267,15 @@ private fun MutableList<AnnotationProblem>.validateEffectAnnotation(
                 ),
             )
         }
+        val entrySelfBound = download.selfBound
+        if (entrySelfBound == null || entrySelfBound < 0) {
+            add(
+                AnnotationProblem(
+                    download.source ?: annotation.source,
+                    "BandwidthDownload selfBound must be a non-negative constant.",
+                ),
+            )
+        }
     }
 }
 
@@ -302,6 +315,7 @@ private fun FirExpression.downloadContracts(
                 rMaxBytesPerSecond = longArgument(R_MAX_BYTES_PER_SECOND, session),
                 nMax = intArgument(N_MAX, session),
                 mayOutliveCall = booleanArgument(MAY_OUTLIVE_CALL, session) == true,
+                selfBound = intArgument(SELF_BOUND, session) ?: 0,
             ),
         )
         is FirFunctionCall -> {
@@ -318,6 +332,11 @@ private fun FirExpression.downloadContracts(
                             ?.toInt(),
                         mayOutliveCall = argument(MAY_OUTLIVE_CALL)
                             ?.constantValue(session) as? Boolean ?: false,
+                        selfBound = argument(SELF_BOUND)
+                            ?.constantValue(session)
+                            .integralLongValue()
+                            ?.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }
+                            ?.toInt() ?: 0,
                     ),
                 )
             } else {

@@ -2102,6 +2102,78 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `preserves an opaque self bound across unknown repetition`() {
+        val result = compile(
+            """
+            package androidx.compose.material3
+
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+
+            fun Button(
+                onClick: () -> Unit,
+                content: () -> Unit,
+            ) = Unit
+
+            interface ImageLibrary {
+                @BandwidthEffect(
+                    downloads = [
+                        BandwidthDownload(
+                            rMaxBytesPerSecond = 500_000,
+                            nMax = 1,
+                            mayOutliveCall = true,
+                            selfBound = 4,
+                        ),
+                    ],
+                )
+                fun startImageDownload(url: String)
+            }
+
+            fun DownloadButton(library: ImageLibrary, url: String) {
+                Button(
+                    onClick = { library.startImageDownload(url) },
+                    content = {},
+                )
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for " +
+                "androidx.compose.material3.DownloadButton: {(500000, 4)}",
+        )
+        result.assertOutputContains("ReqBW=2000000 bytes/s")
+    }
+
+    @Test
+    fun `rejects a negative opaque self bound`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+
+            @BandwidthEffect(
+                downloads = [
+                    BandwidthDownload(
+                        rMaxBytesPerSecond = 500_000,
+                        nMax = 1,
+                        selfBound = -1,
+                    ),
+                ],
+            )
+            fun load() = Unit
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "BandwidthDownload selfBound must be a non-negative constant",
+        )
+    }
+
+    @Test
     fun `rejects a completing contract for visible escaping work`() {
         val result = compile(
             """
