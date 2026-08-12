@@ -121,6 +121,14 @@ body therefore needs a self bound. A direct or stored collection `awaitAll()`
 ends that group's overlap with later statements; an untracked Deferred
 collection is rejected because its child effects are unknown.
 
+As an alternative self-bound source, the frontend recognizes a shared immutable
+`val permits = Semaphore(k)` declared outside that repeated map when the mapped
+`async` body consists solely of `permits.withPermit { ... }`. It applies `k` to
+whole callback bodies, preserving internal parallelism: two parallel downloads
+under three permits have concurrency six. Mutable, per-element, aliased, or
+partially guarded semaphores are not trusted, and work escaping the permit is
+still rejected.
+
 Visible `flow { ... }`, collection `asFlow()`, and `flatMapMerge` pipelines keep
 their network effects latent until no-argument `collect()`. An explicit positive
 constant `flatMapMerge(concurrency = k)` bounds concurrently collected inner

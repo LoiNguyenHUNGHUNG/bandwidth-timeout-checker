@@ -467,8 +467,9 @@ internal class KotlinNetworkEffectVisitor(
      * concurrently active structured children.
      *
      * The collection source and non-callback arguments are evaluated once.
-     * Each mapped async body may overlap every other body, so all downloads in
-     * one iteration need trusted self bounds before replication is finite.
+     * Each mapped async body may overlap every other body. Replication is made
+     * finite by either trusted per-download self bounds or a shared Semaphore
+     * guarding the entire child body.
      */
     private fun inferRepeatedCoroutineChildren(
         children: RepeatedStructuredChildren,
@@ -497,6 +498,19 @@ internal class KotlinNetworkEffectVisitor(
                     "network work that may outlive that child. Keep nested work structured.",
             )
             return CoroutineBuilderEffect(inputs = inputs, body = perElement)
+        }
+        val semaphoreCapacity = if (child.inputs.network == NetworkEffect.EMPTY) {
+            children.builderCall.sharedSemaphoreCapacity(children.mapCall)
+        } else {
+            null
+        }
+        if (semaphoreCapacity != null) {
+            return CoroutineBuilderEffect(
+                inputs = inputs,
+                body = KotlinExpressionEffect(
+                    network = network.boundedReplication(semaphoreCapacity),
+                ),
+            )
         }
         val repeated = repeatNetworkEffect(
             effect = network.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
@@ -1044,6 +1058,14 @@ internal class KotlinNetworkEffectVisitor(
     private fun FirFunction.isAwaitAll(): Boolean =
         symbol.callableId.asSingleFqName().asString() == AWAIT_ALL_FQ_NAME
 
+    /** Returns whether this function constructs a coroutine Semaphore. */
+    private fun FirFunction.isSemaphoreFactory(): Boolean =
+        symbol.callableId.asSingleFqName().asString() == SEMAPHORE_FACTORY_FQ_NAME
+
+    /** Returns whether this function executes one callback under a Semaphore permit. */
+    private fun FirFunction.isSemaphoreWithPermit(): Boolean =
+        symbol.callableId.asSingleFqName().asString() == SEMAPHORE_WITH_PERMIT_FQ_NAME
+
     /** Returns whether this function is the lazy `flow { ... }` builder. */
     private fun FirFunction.isFlowBuilder(): Boolean =
         symbol.callableId.asSingleFqName().asString() == FLOW_BUILDER_FQ_NAME
@@ -1354,6 +1376,52 @@ internal class KotlinNetworkEffectVisitor(
         }?.key
     }
 
+    /**
+     * Resolves a shared immutable `Semaphore(k)` guarding this coroutine body's
+     * sole expression, or returns `null` when that bound cannot be trusted.
+     */
+    private fun FirFunctionCall.sharedSemaphoreCapacity(
+        repeatedCall: FirFunctionCall,
+    ): Int? {
+        val body = argumentForParameter("block")
+            ?.visibleLambda()
+            ?.anonymousFunction
+            ?.body
+            ?: return null
+        val permitCall = body.singleFunctionCall() ?: return null
+        if (permitCall.resolvedFunction()?.isSemaphoreWithPermit() != true) return null
+        val semaphore = permitCall.receiverExpressions()
+            .mapNotNull { it.resolvedSymbol()?.fir as? FirProperty }
+            .singleOrNull()
+            ?: return null
+        if (semaphore.isVar || semaphore.isDeclaredInside(repeatedCall)) return null
+        val factory = semaphore.initializer?.singleFunctionCall() ?: return null
+        if (factory.resolvedFunction()?.isSemaphoreFactory() != true) return null
+        return factory.argumentForParameter("permits")?.positiveConstantInt()
+    }
+
+    /** Returns whether this property is declared inside [element]'s source range. */
+    private fun FirProperty.isDeclaredInside(element: FirElement): Boolean {
+        val declarationSource = source ?: return true
+        val elementSource = element.source ?: return true
+        return declarationSource.startOffset >= elementSource.startOffset &&
+            declarationSource.endOffset <= elementSource.endOffset
+    }
+
+    /** Unwraps this element when it consists solely of one function call. */
+    private fun FirElement.singleFunctionCall(): FirFunctionCall? {
+        functionTypeConversionOperand()?.let { return it.singleFunctionCall() }
+        return when (this) {
+            is FirFunctionCall -> this
+            is FirBlock -> statements.singleOrNull()?.singleFunctionCall()
+            is FirReturnExpression -> result.singleFunctionCall()
+            is FirNamedArgumentExpression -> expression.singleFunctionCall()
+            is FirWrappedArgumentExpression -> expression.singleFunctionCall()
+            is FirWrappedExpression -> expression.singleFunctionCall()
+            else -> null
+        }
+    }
+
     /** Evaluates this expression as a positive compiler-known `Int`. */
     private fun FirExpression.positiveConstantInt(): Int? {
         functionTypeConversionOperand()?.let { return it.positiveConstantInt() }
@@ -1506,6 +1574,8 @@ internal class KotlinNetworkEffectVisitor(
             "kotlinx.coroutines.Dispatchers.Unconfined",
         )
         const val AWAIT_ALL_FQ_NAME: String = "kotlinx.coroutines.awaitAll"
+        const val SEMAPHORE_FACTORY_FQ_NAME: String = "kotlinx.coroutines.sync.Semaphore"
+        const val SEMAPHORE_WITH_PERMIT_FQ_NAME: String = "kotlinx.coroutines.sync.withPermit"
         const val FLOW_BUILDER_FQ_NAME: String = "kotlinx.coroutines.flow.flow"
         const val FLAT_MAP_MERGE_FQ_NAME: String = "kotlinx.coroutines.flow.flatMapMerge"
         val FLOW_SOURCE_BUILDER_FQ_NAMES: Set<String> = setOf(
@@ -1521,6 +1591,7 @@ internal class KotlinNetworkEffectVisitor(
         )
         val SINGLE_CALLBACK_FQ_NAMES: Set<String> = setOf(
             "androidx.tracing.traceAsync",
+            SEMAPHORE_WITH_PERMIT_FQ_NAME,
         )
         val IMMEDIATE_REPEATED_CALLBACK_FQ_NAMES: Set<String> = setOf(
             "kotlin.collections.forEach",

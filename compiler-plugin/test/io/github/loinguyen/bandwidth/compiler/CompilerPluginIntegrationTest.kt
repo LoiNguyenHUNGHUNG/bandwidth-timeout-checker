@@ -1599,6 +1599,181 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `uses a shared Semaphore bound for mapped async children`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun download(url: String) = Unit
+
+            suspend fun load(urls: List<String>) = coroutineScope {
+                val permits = Semaphore(3)
+                urls.map { url ->
+                    async {
+                        permits.withPermit { download(url) }
+                    }
+                }.awaitAll()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(900, 3)}")
+        result.assertOutputContains("ReqBW=2700 bytes/s")
+    }
+
+    @Test
+    fun `preserves parallel work inside each Semaphore permit`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun download(url: String) = Unit
+
+            suspend fun load(urls: List<String>) = coroutineScope {
+                val permits = Semaphore(3)
+                urls.map { url ->
+                    async {
+                        permits.withPermit {
+                            coroutineScope {
+                                launch { download(url) }
+                                launch { download(url) }
+                            }
+                        }
+                    }
+                }.awaitAll()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(500, 6)}")
+        result.assertOutputContains("ReqBW=3000 bytes/s")
+    }
+
+    @Test
+    fun `rejects a mutable Semaphore as a repetition bound`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun download(url: String) = Unit
+
+            suspend fun load(urls: List<String>) = coroutineScope {
+                var permits = Semaphore(3)
+                urls.map { url ->
+                    async {
+                        permits.withPermit { download(url) }
+                    }
+                }.awaitAll()
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Mapped async children may overlap across an unknown number of collection elements",
+        )
+        result.assertOutputContains("Use a self bound for every download")
+    }
+
+    @Test
+    fun `rejects a per-element Semaphore as a global repetition bound`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun download(url: String) = Unit
+
+            suspend fun load(urls: List<String>) = coroutineScope {
+                urls.map { url ->
+                    async {
+                        val permits = Semaphore(3)
+                        permits.withPermit { download(url) }
+                    }
+                }.awaitAll()
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Mapped async children may overlap across an unknown number of collection elements",
+        )
+        result.assertOutputContains("Use a self bound for every download")
+    }
+
+    @Test
+    fun `does not apply a Semaphore bound to work escaping the permit`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download(url: String) = Unit
+
+            suspend fun load(
+                urls: List<String>,
+                externalScope: CoroutineScope,
+                @BoundedClient(k = 4) client: NetworkClient,
+            ) = coroutineScope {
+                val permits = Semaphore(3)
+                urls.map { url ->
+                    async {
+                        permits.withPermit {
+                            externalScope.launch { client.download(url) }
+                        }
+                    }
+                }.awaitAll()
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Cannot infer map { async { ... } } when an async body starts network work " +
+                "that may outlive that child",
+        )
+    }
+
+    @Test
     fun `bounds flatMapMerge inner flows until collect`() {
         val result = compile(
             """
