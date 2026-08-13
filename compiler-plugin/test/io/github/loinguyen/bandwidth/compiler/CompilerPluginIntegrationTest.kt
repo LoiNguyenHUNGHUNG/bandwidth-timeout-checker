@@ -1743,6 +1743,170 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `keeps transformLatest lazy and bounds its active transform`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.ExperimentalCoroutinesApi
+            import kotlinx.coroutines.flow.asFlow
+            import kotlinx.coroutines.flow.collect
+            import kotlinx.coroutines.flow.transformLatest
+
+            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
+            suspend fun download(url: String) = Unit
+
+            @OptIn(ExperimentalCoroutinesApi::class)
+            suspend fun buildOnly(urls: List<String>) {
+                val downloads = urls.asFlow().transformLatest { url ->
+                    emit(download(url))
+                }
+            }
+
+            @OptIn(ExperimentalCoroutinesApi::class)
+            suspend fun load(urls: List<String>) {
+                urls.asFlow()
+                    .transformLatest { url -> emit(download(url)) }
+                    .collect()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        assertFalse(
+            result.output.contains("Inferred bandwidth effect for buildOnly:"),
+            result.output,
+        )
+        result.assertOutputContains("Inferred bandwidth effect for load: {(700, 1)}")
+    }
+
+    @Test
+    fun `preserves parallel work inside the latest transform`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.ExperimentalCoroutinesApi
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.flow.asFlow
+            import kotlinx.coroutines.flow.collect
+            import kotlinx.coroutines.flow.transformLatest
+            import kotlinx.coroutines.launch
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun download(url: String) = Unit
+
+            @OptIn(ExperimentalCoroutinesApi::class)
+            suspend fun load(urls: List<String>) {
+                urls.asFlow()
+                    .transformLatest { url ->
+                        coroutineScope {
+                            launch { download(url) }
+                            launch { download(url) }
+                        }
+                        emit(Unit)
+                    }
+                    .collect()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(500, 2)}")
+        result.assertOutputContains("ReqBW=1000 bytes/s")
+    }
+
+    @Test
+    fun `bounds collectLatest to one active action`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.flow.asFlow
+            import kotlinx.coroutines.flow.collectLatest
+
+            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
+            suspend fun download(url: String) = Unit
+
+            suspend fun load(urls: List<String>) {
+                urls.asFlow().collectLatest { url -> download(url) }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(600, 1)}")
+        result.assertOutputContains("ReqBW=600 bytes/s")
+    }
+
+    @Test
+    fun `launchIn materializes a tracked Flow as escaping work`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.ExperimentalCoroutinesApi
+            import kotlinx.coroutines.flow.asFlow
+            import kotlinx.coroutines.flow.launchIn
+            import kotlinx.coroutines.flow.transformLatest
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download(url: String) = Unit
+
+            @OptIn(ExperimentalCoroutinesApi::class)
+            fun observe(
+                urls: List<String>,
+                scope: CoroutineScope,
+                @BoundedClient(k = 3) client: NetworkClient,
+            ) {
+                urls.asFlow()
+                    .transformLatest { url ->
+                        client.download(url)
+                        emit(Unit)
+                    }
+                    .launchIn(scope)
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for observe: {(800, 3)}")
+        result.assertOutputContains("ReqBW=2400 bytes/s")
+    }
+
+    @Test
+    fun `requires self bounds for Flow work escaping through launchIn`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.flow.flow
+            import kotlinx.coroutines.flow.launchIn
+
+            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
+            suspend fun download() = Unit
+
+            fun observe(scope: CoroutineScope) {
+                flow {
+                    download()
+                    emit(Unit)
+                }.launchIn(scope)
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Network work collected by launchIn may outlive the current call and requires " +
+                "a self bound for every download",
+        )
+    }
+
+    @Test
     fun `uses an interface contract through an NIA style implementation`() {
         val result = compile(
             """

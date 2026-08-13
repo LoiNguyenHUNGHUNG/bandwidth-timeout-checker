@@ -323,6 +323,15 @@ internal class KotlinNetworkEffectVisitor(
         if (target.isFlatMapMerge()) {
             return inferFlatMapMerge(call, context)
         }
+        if (target.isTransformLatest()) {
+            return inferTransformLatest(call, context)
+        }
+        if (target.isCollectLatest()) {
+            return inferCollectLatest(call, context)
+        }
+        if (target.isLaunchIn()) {
+            return inferLaunchIn(call, context)
+        }
         if (target.isFlowCollect()) {
             return inferFlowCollect(call, context)
         }
@@ -663,6 +672,162 @@ internal class KotlinNetworkEffectVisitor(
         )
     }
 
+    /**
+     * Builds the lazy effect of `transformLatest`. The operator cancels and
+     * joins the preceding transform before starting the next one, so at most
+     * one completing callback body is active. Work escaping a callback can
+     * survive that cancellation boundary and still needs a self bound.
+     */
+    private fun inferTransformLatest(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val callbackArgument = call.argumentForParameter("transform")
+        val callback = callbackArgument?.visibleLambda()
+        val receiverEffects = call.receiverExpressions().map { infer(it, context) }
+        val nonCallbackArguments = call.argumentList.arguments
+            .filter { it !== callbackArgument }
+            .map { infer(it, context) }
+        val evaluatedInputs = sequence(receiverEffects + nonCallbackArguments)
+        val sourceFlow = receiverEffects.mapNotNull { it.latent }.singleOrNull()
+        if (sourceFlow == null) {
+            problem(
+                key = "transform-latest-source:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "Cannot infer the source Flow for transformLatest. Build it with " +
+                    "a visible flow { ... }, asFlow(), flatMapMerge, or transformLatest " +
+                    "expression in the same function.",
+            )
+        }
+
+        val transform = callback?.anonymousFunction?.let { function ->
+            inferFunction(function)
+        }
+        if (transform == null) {
+            problem(
+                key = "transform-latest-callback:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "Cannot infer transformLatest with a non-visible transform. " +
+                    "Keep the transform lambda visible.",
+            )
+        }
+        if (sourceFlow == null || transform == null) return evaluatedInputs
+
+        val repeatedTransform = boundedRepeatedNetworkEffect(
+            effect = transform.network,
+            maxConcurrentBodies = 1,
+            key = "transform-latest-repeat:${context.function.displayName()}:" +
+                call.source?.startOffset,
+            source = call.source ?: context.function.source,
+            missingBoundMessage = "Network work escaping a transformLatest callback may " +
+                "overlap across an unknown number of values. Use a self bound for every " +
+                "download.",
+        )
+        return evaluatedInputs.copy(
+            latent = LatentNetworkEffect(
+                network = sourceFlow.network.parallel(repeatedTransform),
+            ),
+        )
+    }
+
+    /**
+     * Materializes a tracked Flow with a latest-value collector. The previous
+     * action is cancelled and joined before the next action starts, bounding
+     * completing action bodies by one while preserving escaping work.
+     */
+    private fun inferCollectLatest(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val callbackArgument = call.argumentForParameter("action")
+        val callback = callbackArgument?.visibleLambda()
+        val receiverEffects = call.receiverExpressions().map { infer(it, context) }
+        val nonCallbackArguments = call.argumentList.arguments
+            .filter { it !== callbackArgument }
+            .map { infer(it, context) }
+        val evaluatedInputs = sequence(receiverEffects + nonCallbackArguments)
+        val sourceFlow = receiverEffects.mapNotNull { it.latent }.singleOrNull()
+        if (sourceFlow == null) {
+            problem(
+                key = "collect-latest-source:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "Cannot infer collectLatest on an untracked Flow. Build the Flow " +
+                    "with a visible flow { ... }, asFlow(), flatMapMerge, or " +
+                    "transformLatest expression in the same function.",
+            )
+        }
+
+        val action = callback?.anonymousFunction?.let { function ->
+            inferFunction(function)
+        }
+        if (action == null) {
+            problem(
+                key = "collect-latest-callback:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "Cannot infer collectLatest with a non-visible action. Keep the " +
+                    "collector lambda visible.",
+            )
+        }
+        if (sourceFlow == null || action == null) return evaluatedInputs
+
+        val repeatedAction = boundedRepeatedNetworkEffect(
+            effect = action.network,
+            maxConcurrentBodies = 1,
+            key = "collect-latest-repeat:${context.function.displayName()}:" +
+                call.source?.startOffset,
+            source = call.source ?: context.function.source,
+            missingBoundMessage = "Network work escaping a collectLatest action may overlap " +
+                "across an unknown number of values. Use a self bound for every download.",
+        )
+        return evaluatedInputs.then(
+            KotlinExpressionEffect(
+                network = sourceFlow.network.parallel(repeatedAction),
+            ),
+        )
+    }
+
+    /**
+     * Materializes a tracked Flow in the supplied CoroutineScope. `launchIn`
+     * is equivalent to `scope.launch { collect() }`, so its collection may
+     * outlive the current call and must satisfy the escaping repetition rule.
+     */
+    private fun inferLaunchIn(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val receiverEffects = call.receiverExpressions().map { infer(it, context) }
+        val argumentEffects = call.argumentList.arguments.map { infer(it, context) }
+        val evaluatedInputs = sequence(receiverEffects + argumentEffects)
+        val sourceFlow = receiverEffects.mapNotNull { it.latent }.singleOrNull()
+        if (sourceFlow == null) {
+            problem(
+                key = "launch-in-source:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "Cannot infer launchIn on an untracked Flow. Build the Flow with " +
+                    "a visible flow { ... }, asFlow(), flatMapMerge, or transformLatest " +
+                    "expression in the same function.",
+            )
+            return evaluatedInputs
+        }
+
+        val escapingCollection = repeatNetworkEffect(
+            effect = sourceFlow.network.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
+            key = "launch-in-self-bound:${context.function.displayName()}:" +
+                call.source?.startOffset,
+            source = call.source ?: context.function.source,
+            missingBoundMessage = "Network work collected by launchIn may outlive the " +
+                "current call and requires a self bound for every download.",
+        )
+        return evaluatedInputs.then(
+            KotlinExpressionEffect(network = escapingCollection),
+        )
+    }
+
     /** Materializes a tracked Flow at the no-argument `collect()` terminal. */
     private fun inferFlowCollect(
         call: FirFunctionCall,
@@ -678,8 +843,8 @@ internal class KotlinNetworkEffectVisitor(
                     call.source?.startOffset,
                 source = call.source ?: context.function.source,
                 message = "Cannot infer collect on an untracked Flow. Build the Flow with a " +
-                    "visible flow { ... }, asFlow(), or flatMapMerge expression in the same " +
-                    "function.",
+                    "visible flow { ... }, asFlow(), flatMapMerge, or transformLatest " +
+                    "expression in the same function.",
             )
         }
         if (call.argumentList.arguments.isNotEmpty()) {
@@ -1055,6 +1220,18 @@ internal class KotlinNetworkEffectVisitor(
     /** Returns whether this function merges inner flows with a fixed bound. */
     private fun FirFunction.isFlatMapMerge(): Boolean =
         symbol.callableId.asSingleFqName().asString() == FLAT_MAP_MERGE_FQ_NAME
+
+    /** Returns whether this function cancels the previous transform on a new value. */
+    private fun FirFunction.isTransformLatest(): Boolean =
+        symbol.callableId.asSingleFqName().asString() == TRANSFORM_LATEST_FQ_NAME
+
+    /** Returns whether this function terminally collects only the latest action. */
+    private fun FirFunction.isCollectLatest(): Boolean =
+        symbol.callableId.asSingleFqName().asString() == COLLECT_LATEST_FQ_NAME
+
+    /** Returns whether this function launches Flow collection in a supplied scope. */
+    private fun FirFunction.isLaunchIn(): Boolean =
+        symbol.callableId.asSingleFqName().asString() == LAUNCH_IN_FQ_NAME
 
     /** Returns whether this function terminally collects a Flow. */
     private fun FirFunction.isFlowCollect(): Boolean =
@@ -1508,6 +1685,9 @@ internal class KotlinNetworkEffectVisitor(
         const val AWAIT_ALL_FQ_NAME: String = "kotlinx.coroutines.awaitAll"
         const val FLOW_BUILDER_FQ_NAME: String = "kotlinx.coroutines.flow.flow"
         const val FLAT_MAP_MERGE_FQ_NAME: String = "kotlinx.coroutines.flow.flatMapMerge"
+        const val TRANSFORM_LATEST_FQ_NAME: String = "kotlinx.coroutines.flow.transformLatest"
+        const val COLLECT_LATEST_FQ_NAME: String = "kotlinx.coroutines.flow.collectLatest"
+        const val LAUNCH_IN_FQ_NAME: String = "kotlinx.coroutines.flow.launchIn"
         val FLOW_SOURCE_BUILDER_FQ_NAMES: Set<String> = setOf(
             "kotlinx.coroutines.flow.asFlow",
         )
