@@ -4,6 +4,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false -Dkotlin.incremental=false"
 
@@ -13,7 +17,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
