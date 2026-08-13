@@ -121,13 +121,15 @@ body therefore needs a self bound. A direct or stored collection `awaitAll()`
 ends that group's overlap with later statements; an untracked Deferred
 collection is rejected because its child effects are unknown.
 
-Visible `flow { ... }`, collection `asFlow()`, and `flatMapMerge` pipelines keep
-their network effects latent until no-argument `collect()`. An explicit positive
-constant `flatMapMerge(concurrency = k)` bounds concurrently collected inner
-flows by `k`; dynamic or default concurrency and untracked Flow values are rejected.
-Repeated transforms still use the same core repetition rule, so work escaping
-an invocation requires a self bound. Collector callbacks are rejected because
-supported Kotlin versions expose incompatible FIR shapes for them.
+Visible `flow { ... }`, collection `asFlow()`, `flatMapMerge`, and
+`transformLatest` pipelines keep their network effects latent until a modeled
+terminal operator. An explicit positive constant `flatMapMerge(concurrency = k)`
+bounds concurrently collected inner flows by `k`; `transformLatest` and
+`collectLatest` cancel and join the previous callback, so at most one completing
+callback body remains active while internal parallelism is preserved. `launchIn`
+materializes collection as work that may outlive its caller and therefore
+requires self bounds. Dynamic or default merge concurrency, untracked Flow
+values, and plain `collect` callbacks remain rejected.
 
 For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 `try/catch` expression, but recovery paths are still joined conservatively.
