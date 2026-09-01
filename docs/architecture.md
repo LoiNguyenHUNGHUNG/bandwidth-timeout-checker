@@ -47,16 +47,17 @@ us test the calculus independently and reuse it from other frontends later.
 Kotlin's FIR compiler-plugin API is experimental, so the checker treats the FIR
 surface as a versioned adapter. Shared inference code remains under
 `compiler-plugin/src`, while the small incompatible seams live under
-`src-kotlin-2.3` and `src-kotlin-2.4`. The selected adapter, Kotlin Gradle
-plugin, and `org.jetbrains.kotlin` compiler dependencies are aligned through:
+`src-kotlin-2.2`, `src-kotlin-2.3`, and `src-kotlin-2.4`. The selected adapter,
+Kotlin Gradle plugin, and `org.jetbrains.kotlin` compiler dependencies are
+aligned through:
 
 ```shell
-./gradlew build -PkotlinVersion=2.3.0
+./gradlew build -PkotlinVersion=2.2.20
 ```
 
 One build produces an artifact for one Kotlin compiler version. The eventual
 published Gradle plugin will select a version-aligned compiler artifact; it
-must not load a 2.4 FIR artifact into a 2.3 compiler process. CI builds and
+must not load an artifact built for one FIR line into another. CI builds and
 tests every supported compiler line so adapter drift fails before publication.
 
 Kotlin first resolves each expression's ordinary type and call target. The FIR
@@ -212,7 +213,7 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   latent until no-argument `collect()`. Require an explicit positive constant
   concurrency bound, apply it to completing inner-flow work, and route escaping
   transform and inner-flow work through the core repetition rule. Reject
-  collector callbacks until their incompatible Kotlin 2.3/2.4 FIR shapes are
+  collector callbacks until their incompatible version-specific FIR shapes are
   normalized.
 - [x] Lower `forEach` through the core repetition rule and model AndroidX
   `traceAsync` as one callback invocation; unknown higher-order library calls
@@ -245,7 +246,7 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 
 ### M6 - Android integration and evaluation
 
-- Build and test version-aligned FIR adapters for Kotlin 2.3 and 2.4 while
+- Build and test version-aligned FIR adapters for Kotlin 2.2, 2.3, and 2.4 while
   keeping the effect domain and annotation model shared.
 - Keep a compiler fixture matching Now in Android's
   `withContext`/`awaitAll`/`chunked().forEach` sync structure.
