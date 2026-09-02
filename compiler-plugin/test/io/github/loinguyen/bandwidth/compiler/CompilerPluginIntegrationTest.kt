@@ -12,6 +12,90 @@ import kotlin.test.assertNotEquals
 
 class CompilerPluginIntegrationTest {
     @Test
+    fun `infers a visible operator invoke as an ordinary call`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 3_000, completeTimeoutMillis = 1_000)
+            fun primitive() = Unit
+
+            class UseCase {
+                operator fun invoke() = primitive()
+            }
+
+            fun load(useCase: UseCase) {
+                useCase()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(3000, 1)}")
+    }
+
+    @Test
+    fun `infers a download in a when subject variable`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
+            fun primitive(): Int = 1
+
+            fun load() {
+                when (val response = primitive()) {
+                    1 -> println(response)
+                    else -> Unit
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(2000, 1)}")
+    }
+
+    @Test
+    fun `analyzes only configured entry points`() {
+        val result = compile(
+            """
+            package sample
+
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun primitive() = Unit
+
+            fun selected() {
+                primitive()
+            }
+
+            class Example {
+                fun alsoSelected() {
+                    primitive()
+                }
+            }
+
+            fun unrelated(callback: () -> Unit) {
+                callback()
+            }
+            """,
+            reportEffects = true,
+            entryPoints = listOf("sample.selected", "sample.Example.alsoSelected"),
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for sample.selected: {(1000, 1)}")
+        result.assertOutputContains(
+            "Inferred bandwidth effect for sample.Example.alsoSelected: {(1000, 1)}"
+        )
+        assertFalse(result.output.contains("Higher-order parameter 'callback'"))
+    }
+
+    @Test
     fun `keeps inferred structured concurrency with a bounded client`() {
         val result = compile(
             """
@@ -2672,6 +2756,7 @@ class CompilerPluginIntegrationTest {
     private fun compile(
         source: String,
         reportEffects: Boolean = false,
+        entryPoints: List<String> = emptyList(),
     ): CompilationResult {
         val directory: Path = Files.createTempDirectory("bandwidth-compiler-test")
         val sourceFile: Path = directory.resolve("Test.kt")
@@ -2707,6 +2792,12 @@ class CompilerPluginIntegrationTest {
             command += listOf(
                 "-P",
                 "plugin:io.github.loinguyen.bandwidth:reportEffects=true",
+            )
+        }
+        entryPoints.forEach { entryPoint ->
+            command += listOf(
+                "-P",
+                "plugin:io.github.loinguyen.bandwidth:entryPoint=$entryPoint",
             )
         }
         command += sourceFile.toString()

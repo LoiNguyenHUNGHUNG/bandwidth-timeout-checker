@@ -24,6 +24,7 @@ internal class KotlinNetworkEffectInference(
     private val session: FirSession,
     private val messages: MessageCollector,
     private val reportEffects: Boolean,
+    private val entryPoints: Set<String>,
 ) {
     private val inferredEffects:
         MutableMap<FirFunctionSymbol<*>, KotlinFunctionEffect> = mutableMapOf()
@@ -51,6 +52,7 @@ internal class KotlinNetworkEffectInference(
         context: CheckerContext,
         reporter: DiagnosticReporter,
     ) {
+        if (entryPoints.isNotEmpty() && function.displayName() !in entryPoints) return
         if (!analyzedFunctions.add(function.symbol)) return
         diagnosticContext = context
         diagnosticReporter = reporter
@@ -93,7 +95,7 @@ internal class KotlinNetworkEffectInference(
             }
             if (reportEffects && inferredEffect != NetworkEffect.EMPTY) {
                 messages.report(
-                    CompilerMessageSeverity.INFO,
+                    CompilerMessageSeverity.WARNING,
                     "Inferred bandwidth effect for ${function.displayName()}: " +
                         "${inferredEffect.render()}, " +
                         "ReqBW=${inferredEffect.requiredBandwidthBytesPerSecond()} bytes/s.",

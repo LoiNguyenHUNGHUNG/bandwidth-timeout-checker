@@ -57,10 +57,13 @@ class BandwidthCheckerGradlePlugin : KotlinCompilerPluginSupportPlugin {
         return project.provider {
             val extension: BandwidthCheckerGradleExtension =
                 project.extensions.getByType(BandwidthCheckerGradleExtension::class.java)
-            listOf(
-                SubpluginOption("enabled", extension.enabled.get().toString()),
-                SubpluginOption("reportEffects", extension.reportEffects.get().toString()),
-            )
+            buildList {
+                add(SubpluginOption("enabled", extension.enabled.get().toString()))
+                add(SubpluginOption("reportEffects", extension.reportEffects.get().toString()))
+                extension.entryPoints.get().forEach { entryPoint ->
+                    add(SubpluginOption("entryPoint", entryPoint))
+                }
+            }
         }
     }
 }

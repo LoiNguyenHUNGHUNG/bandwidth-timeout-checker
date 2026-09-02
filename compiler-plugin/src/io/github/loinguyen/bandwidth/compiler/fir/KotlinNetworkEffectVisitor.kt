@@ -228,13 +228,15 @@ internal class KotlinNetworkEffectVisitor(
     override fun visitWhenExpression(
         whenExpression: FirWhenExpression,
         data: KotlinEffectContext,
-    ): KotlinExpressionEffect = choice(
-        whenExpression.branches.map { branch ->
-            thenValue(
-                infer(branch.condition, data),
-                infer(branch.result, data),
-            )
-        },
+    ): KotlinExpressionEffect = infer(whenExpression.subjectVariable, data).then(
+        choice(
+            whenExpression.branches.map { branch ->
+                thenValue(
+                    infer(branch.condition, data),
+                    infer(branch.result, data),
+                )
+            },
+        ),
     )
 
     /**
@@ -356,7 +358,7 @@ internal class KotlinNetworkEffectVisitor(
         )
 
         val evaluatedInputs = receiverEffects.then(evaluatedArguments)
-        if (call is FirImplicitInvokeCall) {
+        if (call is FirImplicitInvokeCall && target.body == null) {
             val invokedValue = call.explicitReceiver ?: call.dispatchReceiver
             return inferFunctionInvocation(
                 call = call,

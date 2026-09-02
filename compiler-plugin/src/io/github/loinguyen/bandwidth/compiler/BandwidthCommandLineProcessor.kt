@@ -13,6 +13,7 @@ class BandwidthCommandLineProcessor : CommandLineProcessor {
     override val pluginOptions: Collection<CliOption> = listOf(
         ENABLED_OPTION,
         REPORT_EFFECTS_OPTION,
+        ENTRY_POINT_OPTION,
     )
 
     /**
@@ -35,6 +36,12 @@ class BandwidthCommandLineProcessor : CommandLineProcessor {
                 BandwidthConfiguration.REPORT_EFFECTS,
                 value.toBooleanStrict(),
             )
+            ENTRY_POINT_OPTION.optionName -> {
+                val entryPoint = value.trim()
+                require(entryPoint.isNotEmpty()) { "Entry point must not be blank" }
+                val configured = configuration.get(BandwidthConfiguration.ENTRY_POINTS, emptySet())
+                configuration.put(BandwidthConfiguration.ENTRY_POINTS, configured + entryPoint)
+            }
             else -> error("Unexpected config option: '${option.optionName}'")
         }
     }
@@ -53,6 +60,13 @@ class BandwidthCommandLineProcessor : CommandLineProcessor {
             description = "Report inferred effects and required bandwidth during compilation.",
             required = false,
             allowMultipleOccurrences = false,
+        )
+        val ENTRY_POINT_OPTION: CliOption = CliOption(
+            optionName = "entryPoint",
+            valueDescription = "<fully.qualified.name>",
+            description = "Add a function as a bandwidth-analysis entry point.",
+            required = false,
+            allowMultipleOccurrences = true,
         )
     }
 }
