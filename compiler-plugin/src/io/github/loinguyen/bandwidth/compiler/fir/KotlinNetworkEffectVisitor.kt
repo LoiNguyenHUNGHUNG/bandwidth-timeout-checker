@@ -816,7 +816,7 @@ internal class KotlinNetworkEffectVisitor(
         val evaluatedInputs = receiverEffects.then(evaluatedArguments)
 
         val callbackBody = argumentEffects
-            .filterKeys { it.returnTypeRef.coneType.isSomeFunctionType(session) }
+            .filter { (parameter, argument) -> parameter.isRepeatedCallback(argument) }
             .entries
             .fold(KotlinExpressionEffect()) { effect, (parameter, argument) ->
                 val latent = argument.latent
@@ -1067,6 +1067,28 @@ internal class KotlinNetworkEffectVisitor(
     /** Returns whether this function invokes its callback exactly once. */
     private fun FirFunction.isSingleCallbackFunction(): Boolean =
         symbol.callableId.asSingleFqName().asString() in SINGLE_CALLBACK_FQ_NAMES
+
+    /**
+     * Returns whether [argument] passed to this parameter is a callback that a
+     * recognized repetition may invoke many times.
+     *
+     * A Kotlin function type is a callback by declaration. Java listener
+     * interfaces are not: `View.OnClickListener`,
+     * `SwipeRefreshLayout.OnRefreshListener` and every other Android SAM
+     * boundary declare an interface parameter, so [isSomeFunctionType] is false
+     * for them and their bodies were previously dropped without a diagnostic.
+     * They are recognized here through the latent effect that SAM conversion of
+     * a visible lambda already produces, because
+     * [functionTypeConversionOperand] unwraps the conversion node.
+     *
+     * Accepting any latent-valued argument can only over-approximate: a passed
+     * function value that the API never invokes is charged as if it were
+     * invoked, which raises the inferred peak demand rather than lowering it.
+     */
+    private fun FirValueParameter.isRepeatedCallback(
+        argument: KotlinExpressionEffect,
+    ): Boolean =
+        returnTypeRef.coneType.isSomeFunctionType(session) || argument.latent != null
 
     /**
      * Returns whether this function repeatedly invokes callbacks that may
@@ -1528,6 +1550,24 @@ internal class KotlinNetworkEffectVisitor(
             "kotlin.sequences.forEach",
         )
         val RETAINED_REPEATED_CALLBACK_FQ_NAMES: Set<String> = setOf(
+            // Android View listeners. These are Java SAM boundaries, reached
+            // through KotlinExpressionEffect.latent rather than a Kotlin
+            // function type; see isRepeatedCallback.
+            "android.view.View.setOnClickListener",
+            "android.view.View.setOnLongClickListener",
+            "android.widget.AdapterView.setOnItemClickListener",
+            "androidx.swiperefreshlayout.widget.SwipeRefreshLayout.setOnRefreshListener",
+            // Compose click and paging surfaces. Modifier.clickable carries most
+            // Compose click handling; the pagers repeat their page content.
+            "androidx.compose.foundation.clickable",
+            "androidx.compose.foundation.combinedClickable",
+            "androidx.compose.foundation.pager.HorizontalPager",
+            "androidx.compose.foundation.pager.VerticalPager",
+            "androidx.compose.material3.FloatingActionButton",
+            "androidx.compose.material3.ExtendedFloatingActionButton",
+            "androidx.compose.material3.Card",
+            "androidx.compose.material3.NavigationBarItem",
+            "androidx.compose.material3.Tab",
             "androidx.compose.foundation.lazy.LazyColumn",
             "androidx.compose.foundation.lazy.LazyRow",
             "androidx.compose.foundation.lazy.grid.LazyHorizontalGrid",
