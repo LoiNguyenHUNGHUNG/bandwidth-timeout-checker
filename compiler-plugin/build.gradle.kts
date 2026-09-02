@@ -6,11 +6,12 @@ plugins {
 val kotlinCompilerVersion =
     providers.gradleProperty("kotlinVersion").orElse(libs.versions.kotlin)
 val kotlinAdapterDirectory = when {
+    kotlinCompilerVersion.get().startsWith("2.2.") -> "src-kotlin-2.2"
     kotlinCompilerVersion.get().startsWith("2.3.") -> "src-kotlin-2.3"
     kotlinCompilerVersion.get().startsWith("2.4.") -> "src-kotlin-2.4"
     else -> error(
         "Unsupported Kotlin compiler ${kotlinCompilerVersion.get()}. " +
-            "Supported lines: 2.3.x, 2.4.x.",
+            "Supported lines: 2.2.x, 2.3.x, 2.4.x.",
     )
 }
 
@@ -56,7 +57,10 @@ buildConfig {
 
 kotlin {
     compilerOptions {
-        if (kotlinCompilerVersion.get().startsWith("2.3.")) {
+        if (
+            kotlinCompilerVersion.get().startsWith("2.2.") ||
+            kotlinCompilerVersion.get().startsWith("2.3.")
+        ) {
             freeCompilerArgs.add("-Xcontext-parameters")
         }
         optIn.add("org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi")
