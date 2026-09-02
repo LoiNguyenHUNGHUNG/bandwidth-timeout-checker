@@ -805,6 +805,148 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `charges a SAM listener callback through the repetition rule`() {
+        val result = compile(
+            """
+            package android.view
+
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            fun interface OnClickListener {
+                fun onClick()
+            }
+
+            class View {
+                fun setOnClickListener(listener: OnClickListener) = Unit
+            }
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            fun download() = Unit
+
+            fun bind(view: View) {
+                view.setOnClickListener { download() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for android.view.bind: {(900, 1)}",
+        )
+    }
+
+    @Test
+    fun `keeps a bounded client bound for work escaping a SAM listener`() {
+        val result = compile(
+            """
+            package android.view
+
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            fun interface OnClickListener {
+                fun onClick()
+            }
+
+            class View {
+                fun setOnClickListener(listener: OnClickListener) = Unit
+            }
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            fun bind(
+                view: View,
+                scope: CoroutineScope,
+                @BoundedClient(k = 3) client: NetworkClient,
+            ) {
+                view.setOnClickListener {
+                    scope.launch { client.download() }
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for android.view.bind: {(900, 3)}",
+        )
+        result.assertOutputContains("ReqBW=2700 bytes/s")
+    }
+
+    @Test
+    fun `rejects unbounded escaping work in a SAM listener callback`() {
+        val result = compile(
+            """
+            package android.view
+
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            fun interface OnClickListener {
+                fun onClick()
+            }
+
+            class View {
+                fun setOnClickListener(listener: OnClickListener) = Unit
+            }
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.download() = Unit
+
+            fun bind(view: View, scope: CoroutineScope, client: NetworkClient) {
+                view.setOnClickListener {
+                    scope.launch { client.download() }
+                }
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Network work launched on an escaping coroutine scope requires a self bound " +
+                "for every download",
+        )
+    }
+
+    @Test
+    fun `charges a Compose clickable callback through the repetition rule`() {
+        val result = compile(
+            """
+            package androidx.compose.foundation
+
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            class Modifier
+
+            fun Modifier.clickable(onClick: () -> Unit): Modifier = this
+
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
+            fun download() = Unit
+
+            fun screen(modifier: Modifier) {
+                modifier.clickable { download() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for androidx.compose.foundation.screen: {(400, 1)}",
+        )
+    }
+
+    @Test
     fun `rejects repeated button network work without a bounded client`() {
         val result = compile(
             """
