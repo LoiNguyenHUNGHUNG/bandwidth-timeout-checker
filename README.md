@@ -19,9 +19,9 @@ ReqBW(Phi) = max {(r * n) | (r, n) in Phi}
 ```
 
 The current milestone builds the mathematical core, public annotations,
-sequential Kotlin effect inference, Gradle integration, and runtime support for
-a future bounded-scope rewrite. It does not yet infer structured coroutine
-parallelism or transform coroutine launches.
+Kotlin effect inference including structured and escaping coroutine work,
+Gradle integration, and runtime support for a future bounded-scope rewrite. It
+does not yet transform coroutine launches.
 
 ## Modules
 
@@ -110,10 +110,12 @@ effects.
 
 A `launch` or `async` through an explicit or otherwise unproven scope receiver
 may outlive its expression and function, so the launched body is made escaping
-before applying the same repetition rule.
-An unqualified builder directly inside a recognized `coroutineScope` or
-`withContext` remains structured. The checker trusts the client configuration;
-for OkHttp, set the matching `Dispatcher.maxRequests` value.
+without changing its multiplicity: one builder expression denotes one spawned
+child. Only an enclosing loop or repeated callback applies the repetition rule
+and therefore requires a self bound for escaping downloads. An unqualified
+builder directly inside a recognized `coroutineScope` or `withContext` remains
+structured. The checker trusts the client configuration; for OkHttp, set the
+matching `Dispatcher.maxRequests` value.
 
 An eager collection `map { async { ... } }` inside a structured scope creates
 an unknown number of concurrently active children. Every download in the async

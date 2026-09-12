@@ -227,8 +227,10 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   `MAY_OUTLIVE_CALL`. Builder blocks may be visible lambdas or latent callback
   values; unresolved callback effects are rejected. Lifetime-aware sequential
   composition keeps escaping work parallel with later work without
-  rematerializing it at every call boundary. Escaping network work requires
-  self bounds.
+  rematerializing it at every call boundary. One builder is one spawned child,
+  so lifetime promotion does not itself apply unknown repetition. Escaping
+  network work requires self bounds only when a loop, retained callback, or
+  another repetition boundary can create an unknown number of children.
 - Compare inferred results against hand-written core fixtures.
 
 ### M4 - Enforced bounded network scopes
