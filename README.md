@@ -154,8 +154,14 @@ To print inferred effects during a Gradle compilation:
 ```kotlin
 bandwidthChecker {
     reportEffects.set(true)
+    entryPoints.add("com.example.NetworkViewModel.refresh")
 }
 ```
+
+When `entryPoints` is non-empty, the checker analyzes only those functions and
+follows their visible callees transitively. This is useful for application case
+studies whose compilation also contains generated code and unrelated UI
+callbacks. An empty list preserves whole-compilation analysis.
 
 The recursion-free milestone rejects unannotated recursion, unbounded escaping
 work in general loops, and effectful callbacks passed to opaque higher-order

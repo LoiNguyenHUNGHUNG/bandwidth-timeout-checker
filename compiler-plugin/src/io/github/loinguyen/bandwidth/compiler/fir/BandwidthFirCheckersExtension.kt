@@ -15,11 +15,13 @@ internal class BandwidthFirCheckersExtension(
     session: FirSession,
     messages: MessageCollector,
     reportEffects: Boolean,
+    entryPoints: Set<String>,
 ) : FirAdditionalCheckersExtension(session) {
     private val inference = KotlinNetworkEffectInference(
         session = session,
         messages = messages,
         reportEffects = reportEffects,
+        entryPoints = entryPoints,
     )
 
     override val declarationCheckers: DeclarationCheckers =

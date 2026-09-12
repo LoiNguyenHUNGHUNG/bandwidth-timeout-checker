@@ -26,6 +26,7 @@ abstract class AbstractBandwidthCompilerPluginRegistrar : CompilerPluginRegistra
             BandwidthFirExtensionRegistrar(
                 messages = messages,
                 reportEffects = configuration.get(BandwidthConfiguration.REPORT_EFFECTS, false),
+                entryPoints = configuration.get(BandwidthConfiguration.ENTRY_POINTS, emptySet()),
             ),
         )
     }
