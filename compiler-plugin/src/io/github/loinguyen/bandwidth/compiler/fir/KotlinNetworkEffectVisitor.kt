@@ -323,6 +323,9 @@ internal class KotlinNetworkEffectVisitor(
         if (target.isFlatMapMerge()) {
             return inferFlatMapMerge(call, context)
         }
+        if (target.isSemaphoreWithPermit()) {
+            return inferSemaphoreWithPermit(call, context)
+        }
         if (target.isFlowCollect()) {
             return inferFlowCollect(call, context)
         }
@@ -659,6 +662,65 @@ internal class KotlinNetworkEffectVisitor(
                 network = sourceFlow.network
                     .parallel(repeatedTransform)
                     .parallel(repeatedInnerFlow),
+            ),
+        )
+    }
+
+    /**
+     * Preserves the effect of one `Semaphore.withPermit { ... }` invocation and
+     * records the shared capacity for a surrounding repetition boundary.
+     *
+     * Only an immutable top-level semaphore with a compiler-known positive
+     * capacity contributes a bound. Other semaphore forms remain transparent.
+     * Work that escapes the block is not protected after the permit is released,
+     * so it receives no bound from this construct. A surrounding repeated spawn
+     * therefore sees `k` for protected work and an unknown bound for escaped work.
+     */
+    private fun inferSemaphoreWithPermit(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val callback = call.visibleLambdaArgument()
+        val evaluatedInputs = sequence(
+            call.receiverExpressions().map { infer(it, context) } +
+                call.argumentList.arguments
+                    .filter { it.visibleLambda() !== callback }
+                    .map { infer(it, context) },
+        )
+        val body = callback?.anonymousFunction?.let { inferFunction(it) }
+        if (body == null) {
+            problem(
+                key = "semaphore-block:${context.function.displayName()}:" +
+                    call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = "Cannot infer Semaphore.withPermit with a non-visible block. " +
+                    "Keep the withPermit lambda visible.",
+            )
+            return evaluatedInputs
+        }
+
+        val bodyNetwork = body.network
+        if (bodyNetwork == NetworkEffect.EMPTY) {
+            return evaluatedInputs.copy(latent = body.returned)
+        }
+
+        val capacity = call.sharedTopLevelSemaphoreCapacity()
+        if (capacity == null) {
+            return evaluatedInputs.then(
+                KotlinExpressionEffect(
+                    network = bodyNetwork,
+                    latent = body.returned,
+                ),
+            )
+        }
+
+        val bounded = bodyNetwork.completingOnly()
+            .withConcurrentInvocationBound(capacity)
+            .then(bodyNetwork.escapingOnly())
+        return evaluatedInputs.then(
+            KotlinExpressionEffect(
+                network = bounded,
+                latent = body.returned,
             ),
         )
     }
@@ -1053,6 +1115,10 @@ internal class KotlinNetworkEffectVisitor(
     private fun FirFunction.isFlatMapMerge(): Boolean =
         symbol.callableId.asSingleFqName().asString() == FLAT_MAP_MERGE_FQ_NAME
 
+    /** Returns whether this is the structured kotlinx.coroutines semaphore helper. */
+    private fun FirFunction.isSemaphoreWithPermit(): Boolean =
+        symbol.callableId.asSingleFqName().asString() == SEMAPHORE_WITH_PERMIT_FQ_NAME
+
     /** Returns whether this function terminally collects a Flow. */
     private fun FirFunction.isFlowCollect(): Boolean =
         symbol.callableId.asSingleFqName().asString() in FLOW_COLLECT_FQ_NAMES
@@ -1398,6 +1464,56 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     /**
+     * Resolves the capacity of the unique semaphore receiver when it is a
+     * process-shared immutable top-level property.
+     */
+    private fun FirFunctionCall.sharedTopLevelSemaphoreCapacity(): Int? =
+        receiverExpressions()
+            .mapNotNull { it.sharedTopLevelSemaphoreCapacity() }
+            .distinct()
+            .singleOrNull()
+
+    /** Resolves this expression to a supported shared semaphore property. */
+    private fun FirExpression.sharedTopLevelSemaphoreCapacity(): Int? {
+        functionTypeConversionOperand()?.let {
+            return it.sharedTopLevelSemaphoreCapacity()
+        }
+        val expression = when (this) {
+            is FirNamedArgumentExpression -> expression
+            is FirWrappedArgumentExpression -> expression
+            is FirSpreadArgumentExpression -> expression
+            is FirWrappedExpression -> expression
+            else -> this
+        }
+        if (expression !== this) return expression.sharedTopLevelSemaphoreCapacity()
+
+        val property = expression.resolvedSymbol()?.fir as? FirProperty ?: return null
+        val callableId = property.symbol.callableId ?: return null
+        if (!property.isVal || property.symbol.isLocal || callableId.classId != null) return null
+        return property.initializer?.semaphoreInitializerCapacity()
+    }
+
+    /** Extracts the constant `permits` argument from `Semaphore(permits, ...)`. */
+    private fun FirExpression.semaphoreInitializerCapacity(): Int? {
+        functionTypeConversionOperand()?.let { return it.semaphoreInitializerCapacity() }
+        val expression = when (this) {
+            is FirNamedArgumentExpression -> expression
+            is FirWrappedArgumentExpression -> expression
+            is FirSpreadArgumentExpression -> expression
+            is FirWrappedExpression -> expression
+            else -> this
+        }
+        if (expression !== this) return expression.semaphoreInitializerCapacity()
+
+        val initializer = expression as? FirFunctionCall ?: return null
+        val target = initializer.resolvedFunction() ?: return null
+        if (target.symbol.callableId.asSingleFqName().asString() != SEMAPHORE_FACTORY_FQ_NAME) {
+            return null
+        }
+        return initializer.argumentForParameter("permits")?.positiveConstantInt()
+    }
+
+    /**
      * Returns whether this builder is an unqualified direct child whose context
      * cannot replace the structured parent job.
      */
@@ -1527,6 +1643,8 @@ internal class KotlinNetworkEffectVisitor(
         const val AWAIT_ALL_FQ_NAME: String = "kotlinx.coroutines.awaitAll"
         const val FLOW_BUILDER_FQ_NAME: String = "kotlinx.coroutines.flow.flow"
         const val FLAT_MAP_MERGE_FQ_NAME: String = "kotlinx.coroutines.flow.flatMapMerge"
+        const val SEMAPHORE_FACTORY_FQ_NAME: String = "kotlinx.coroutines.sync.Semaphore"
+        const val SEMAPHORE_WITH_PERMIT_FQ_NAME: String = "kotlinx.coroutines.sync.withPermit"
         val FLOW_SOURCE_BUILDER_FQ_NAMES: Set<String> = setOf(
             "kotlinx.coroutines.flow.asFlow",
         )

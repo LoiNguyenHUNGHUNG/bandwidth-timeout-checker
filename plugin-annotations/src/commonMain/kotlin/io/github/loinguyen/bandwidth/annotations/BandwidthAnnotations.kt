@@ -18,9 +18,9 @@ public annotation class NetworkDownload(
  *
  * [mayOutliveCall] means work represented by this entry may remain active after
  * the annotated function or callback returns. [selfBound] declares a bound
- * shared by repeated instances of this download kind; zero means that no bound
- * is declared. A positive value is a trusted contract that runtime configuration
- * enforces the declared limit.
+ * shared by repeated instances of this download kind; zero denotes the default
+ * bound infinity. A positive value is a trusted contract that runtime
+ * configuration enforces the declared finite limit.
  */
 @Retention(AnnotationRetention.BINARY)
 public annotation class BandwidthDownload(

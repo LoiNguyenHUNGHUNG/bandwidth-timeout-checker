@@ -11,9 +11,10 @@ public enum class DownloadLifetime {
 /**
  * One primitive download effect `(r, n, selfBound?, lifetime)`.
  *
- * [concurrency] is always established by the effect rules. [selfBound] is a
- * trusted bound for instances of this download kind. It is retained when an
- * enclosing unknown-repetition construct recalculates [concurrency]. [lifetime]
+ * [concurrency] is always established by the ordinary effect rules. [selfBound]
+ * is a trusted bound for instances of this download kind; `null` denotes the
+ * default bound infinity. At an unknown-repetition boundary, the effective
+ * multiplicity is the minimum of the ordinary result and this bound. [lifetime]
  * records whether the download can still be active after this expression returns.
  */
 public data class DownloadEffect(
@@ -53,7 +54,8 @@ public data class DownloadEffect(
     /**
      * Merges the trusted self bounds of equivalent or dominating entries.
      *
-     * A missing bound on either entry makes the merged bound unknown.
+     * A missing bound denotes infinity, so adding it to either entry makes the
+     * merged bound infinite as well.
      */
     internal fun mergeSelfBound(other: DownloadEffect): DownloadEffect =
         copy(
@@ -137,18 +139,52 @@ public class NetworkEffect private constructor(
         return result
     }
 
-    /** Attaches a trusted runtime bound to primitive requests in this effect. */
+    /**
+     * Replaces the default infinite self bound with a trusted finite runtime
+     * bound for primitive requests in this effect.
+     */
     public fun withSelfBound(selfBound: Int): NetworkEffect {
         require(selfBound > 0) { "selfBound must be positive" }
         return of(downloads.map { it.copy(selfBound = selfBound) })
     }
 
     /**
+     * Records that a shared gate admits at most [maxConcurrentInvocations]
+     * active invocations of this whole effect without changing the effect of
+     * one invocation. An entry exposing `n` downloads per invocation therefore
+     * carries a repetition bound of `maxConcurrentInvocations * n`.
+     *
+     * An existing tighter bound, such as a client-wide limit, is preserved by
+     * taking the minimum; a missing bound denotes infinity.
+     * The bound becomes active only if an enclosing construct applies unknown
+     * repetition. For an escaping repeated invocation, this realizes the peak
+     * summary `repeat(k) { spawn { effect } }` without changing a single call.
+     */
+    public fun withConcurrentInvocationBound(maxConcurrentInvocations: Int): NetworkEffect {
+        require(maxConcurrentInvocations > 0) {
+            "concurrent invocation bound must be positive"
+        }
+        return of(
+            downloads.map { download ->
+                val gateBound = Math.multiplyExact(
+                    maxConcurrentInvocations,
+                    download.concurrency,
+                )
+                download.copy(
+                    selfBound = download.selfBound?.coerceAtMost(gateBound) ?: gateBound,
+                )
+            },
+        )
+    }
+
+    /**
      * Models an unknown number of serial invocations of this effect.
      *
      * Downloads that complete with one invocation remain sequential across
-     * invocations. Downloads that escape may overlap with later invocations,
-     * so each must carry a trusted self bound.
+     * invocations. For escaping downloads, the ordinary repeated multiplicity
+     * is infinity. The effective multiplicity is `min(infinity, selfBound)`, so
+     * a finite self bound makes the result finite and a missing (infinite) bound
+     * is rejected. An empty effect remains valid.
      */
     public fun repeat(): NetworkEffect {
         require(canRepeat) {

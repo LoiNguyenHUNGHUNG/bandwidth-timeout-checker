@@ -81,9 +81,9 @@ Annotations are required only where inference cannot see enough:
 2. `@BandwidthEffect` download-effect lists on opaque functions, higher-order
    inputs, and opaque returned function types. Entries retain
    `(rMaxBytesPerSecond, nMax, selfBound, lifetime)`, where a zero `selfBound`
-   means unspecified. A positive value is a trusted contract that runtime
-   configuration establishes that limit. `(rMaxBytesPerSecond, nMax)` remains
-   one-entry shorthand.
+   denotes the default bound infinity. A positive value is a trusted contract
+   that runtime configuration establishes a finite limit.
+   `(rMaxBytesPerSecond, nMax)` remains one-entry shorthand.
 3. `@BoundedClient(k)` on a client whose runtime configuration establishes the
    same concurrency limit.
 4. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
@@ -142,6 +142,67 @@ expose eight downloads.
 Before enabling the rewrite, the Kotlin frontend must reject or conservatively
 handle scope aliases and escapes, reassignments, nested launches that can wait
 while holding a permit, and launches whose network work escapes the gated body.
+
+## Explicit semaphore gates
+
+The FIR frontend recognizes the structured
+`kotlinx.coroutines.sync.Semaphore.withPermit` form when its receiver is an
+immutable top-level property initialized with a compiler-known positive
+capacity:
+
+```kotlin
+private const val MAX_HANDLERS = 4
+private val handlerSlots = Semaphore(MAX_HANDLERS)
+
+suspend fun handler() = handlerSlots.withPermit {
+    download()
+}
+```
+
+For one call to `handler`, the effect remains one call to `download`; the
+semaphore does not manufacture concurrency. Instead, the frontend records that
+at most four invocations of the entire completing block may be active. When an
+enclosing entry point, loop, or callback creates repeated escaping invocations,
+the ordinary repetition rule consumes that bound. Internal fan-out is
+preserved: if one invocation starts two parallel downloads, four active permits
+may expose eight downloads.
+
+Operationally, a server continues accepting requests rather than stopping
+after four total invocations:
+
+```text
+repeat(infinity) {
+    spawn { acquire(handlerSlots); e; release(handlerSlots) }
+}
+```
+
+For peak network demand, waiting handlers have no network effect. If the permit
+is held until `e` completes, the protected projection is therefore:
+
+```text
+repeat(4) { spawn { e } }
+```
+
+More generally, `selfBound` defaults to infinity and the effective multiplicity
+is computed after the ordinary effect rules:
+
+```text
+n_effective = min(n_standard, selfBound)
+```
+
+At a repeated-handler boundary, `n_standard` is infinity. A recognized finite
+semaphore bound therefore makes the result finite; without one, the multiplier
+remains infinity. The finite checker reports an error only when a non-empty
+network effect has an infinite effective bandwidth requirement. An empty
+handler remains valid.
+
+A local semaphore is transparent because recreating it for each function
+invocation establishes no shared bound. Dynamic capacities and mutable or
+aliased semaphore properties are also transparent. Non-visible blocks and
+manual `acquire`/`release` pairs remain outside the supported fragment. Network
+work that escapes the block is no longer protected once `withPermit` releases
+the permit, so it receives no semaphore bound; a surrounding repetition will
+reject it unless another runtime mechanism supplies one.
 
 ## Recovery and branches
 
@@ -209,6 +270,10 @@ one syntactic branch globally "low bandwidth." Nested checks such as
 - [x] Model eager `map { async { ... } }` collections as unknown structured
   fan-out requiring self-bounded downloads. Track a local collection handle so
   direct or stored `awaitAll()` ends its overlap window.
+- [x] Recognize a visible `Semaphore.withPermit` block on an immutable shared
+  semaphore with constant capacity, preserving one invocation while carrying a
+  whole-block bound to enclosing repetition. Escaping work receives no gate
+  bound.
 - [x] Keep visible `flow`, collection `asFlow`, and `flatMapMerge` pipelines
   latent until no-argument `collect()`. Require an explicit positive constant
   concurrency bound, apply it to completing inner-flow work, and route escaping
