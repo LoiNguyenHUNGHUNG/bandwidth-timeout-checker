@@ -72,7 +72,7 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `models an external launch as long lived`() {
+    fun `does not replicate a single external launch to the client bound`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.BoundedClient
@@ -97,13 +97,13 @@ class CompilerPluginIntegrationTest {
 
         assertEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "Inferred bandwidth effect for onDownloadClicked: {(600, 3)}",
+            "Inferred bandwidth effect for onDownloadClicked: {(600, 1)}",
         )
-        result.assertOutputContains("ReqBW=1800 bytes/s")
+        result.assertOutputContains("ReqBW=600 bytes/s")
     }
 
     @Test
-    fun `rejects an escaping launch without a bounded client`() {
+    fun `allows a single escaping launch without a bounded client`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
@@ -119,12 +119,47 @@ class CompilerPluginIntegrationTest {
                 scope.launch { client.download() }
             }
             """,
+            reportEffects = true,
         )
 
-        assertNotEquals(0, result.exitCode, result.output)
+        assertEquals(0, result.exitCode, result.output)
         result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires a self bound",
+            "Inferred bandwidth effect for onDownloadClicked: {(600, 1)}",
         )
+        result.assertOutputContains("ReqBW=600 bytes/s")
+    }
+
+    @Test
+    fun `overlaps two sequential external launches`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            class NetworkClient
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.first() = Unit
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun NetworkClient.second() = Unit
+
+            fun load(
+                scope: CoroutineScope,
+                firstClient: NetworkClient,
+                secondClient: NetworkClient,
+            ) {
+                scope.launch { firstClient.first() }
+                scope.launch { secondClient.second() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
+        result.assertOutputContains("ReqBW=2000 bytes/s")
     }
 
     @Test
@@ -154,8 +189,8 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 3)}")
-        result.assertOutputContains("ReqBW=3000 bytes/s")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
+        result.assertOutputContains("ReqBW=2000 bytes/s")
     }
 
     @Test
@@ -191,8 +226,8 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(750, 5)}")
-        result.assertOutputContains("ReqBW=3750 bytes/s")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(750, 2)}")
+        result.assertOutputContains("ReqBW=1500 bytes/s")
     }
 
     @Test
@@ -253,7 +288,7 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `requires bounds for an indirect external launch block`() {
+    fun `allows an indirect external launch block without a self bound`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
@@ -270,16 +305,15 @@ class CompilerPluginIntegrationTest {
                 scope.launch(block = task)
             }
             """,
+            reportEffects = true,
         )
 
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires a self bound",
-        )
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(600, 1)}")
     }
 
     @Test
-    fun `bounds an indirect external launch block`() {
+    fun `does not replicate an indirect external launch to the client bound`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.BoundedClient
@@ -304,7 +338,7 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(600, 4)}")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(600, 1)}")
     }
 
     @Test
@@ -355,8 +389,8 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 5)}")
-        result.assertOutputContains("ReqBW=5000 bytes/s")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
+        result.assertOutputContains("ReqBW=2000 bytes/s")
     }
 
     @Test
@@ -397,7 +431,7 @@ class CompilerPluginIntegrationTest {
             )
 
             assertEquals(0, result.exitCode, "$coroutineContext\n${result.output}")
-            result.assertOutputContains("Inferred bandwidth effect for load: {(700, 4)}")
+            result.assertOutputContains("Inferred bandwidth effect for load: {(700, 1)}")
         }
     }
 
@@ -492,7 +526,7 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `requires a self bound for a Job replacing context`() {
+    fun `allows one Job replacing context without a self bound`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
@@ -509,12 +543,11 @@ class CompilerPluginIntegrationTest {
                 launch(Job()) { client.download() }
             }
             """,
+            reportEffects = true,
         )
 
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires a self bound",
-        )
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(700, 1)}")
     }
 
     @Test
@@ -552,7 +585,7 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 5)}")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
     }
 
     @Test
@@ -912,10 +945,8 @@ class CompilerPluginIntegrationTest {
         )
 
         assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires a self bound " +
-                "for every download",
-        )
+        result.assertOutputContains("Escaping network work in repeated callback")
+        result.assertOutputContains("Use a self bound for every download")
     }
 
     @Test
@@ -981,10 +1012,8 @@ class CompilerPluginIntegrationTest {
         )
 
         assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains(
-            "Network work launched on an escaping coroutine scope requires a self bound " +
-                "for every download",
-        )
+        result.assertOutputContains("Escaping network work in repeated callback")
+        result.assertOutputContains("Use a self bound for every download")
     }
 
     @Test
@@ -2549,7 +2578,7 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `adds equal self bounds because independent clients may share a rate`() {
+    fun `keeps sequential downloads inside one external launch sequential`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.BoundedClient
@@ -2577,8 +2606,8 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 4)}")
-        result.assertOutputContains("ReqBW=4000 bytes/s")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 1)}")
+        result.assertOutputContains("ReqBW=1000 bytes/s")
     }
 
     @Test
@@ -2807,8 +2836,8 @@ class CompilerPluginIntegrationTest {
         )
 
         assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 4)}")
-        result.assertOutputContains("ReqBW=4000 bytes/s")
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
+        result.assertOutputContains("ReqBW=2000 bytes/s")
     }
 
     private fun compile(

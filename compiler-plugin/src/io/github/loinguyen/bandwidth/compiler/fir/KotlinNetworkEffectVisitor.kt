@@ -699,24 +699,21 @@ internal class KotlinNetworkEffectVisitor(
         )
     }
 
-    /** A launch/async on an unproven receiver may outlive this expression. */
+    /**
+     * A launch/async on an unproven receiver is one spawned child that may
+     * outlive this expression. Enclosing loops and callbacks, rather than the
+     * builder itself, are responsible for applying repetition.
+     */
     private fun inferUnstructuredCoroutineBuilder(
         call: FirFunctionCall,
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
         val resolved = inferCoroutineBuilder(call, context)
         val child = resolved.body ?: return resolved.inputs
-        val inputs = resolved.inputs
-        val repeated = repeatNetworkEffect(
-            effect = child.network.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
-            key = "escaping-coroutine-self-bound:${context.function.displayName()}:" +
-                call.source?.startOffset,
-            source = call.source ?: context.function.source,
-            missingBoundMessage = "Network work launched on an escaping coroutine scope " +
-                "requires a self bound for every download.",
-        )
-        return inputs.then(
-            KotlinExpressionEffect(network = repeated),
+        return resolved.inputs.then(
+            KotlinExpressionEffect(
+                network = child.network.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
+            ),
         )
     }
 
