@@ -1914,6 +1914,249 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `keeps one shared Semaphore withPermit invocation local`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            private const val MAX_SCORE_HANDLERS = 4
+            private val scoreSlots = Semaphore(MAX_SCORE_HANDLERS)
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun downloadScores() = Unit
+
+            suspend fun scoresHandler() = scoreSlots.withPermit {
+                downloadScores()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for scoresHandler: {(1000, 1)}")
+        result.assertOutputContains("ReqBW=1000 bytes/s")
+    }
+
+    @Test
+    fun `uses a shared Semaphore bound across repeated launches`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            private const val MAX_SCORE_HANDLERS = 4
+            private val scoreSlots = Semaphore(MAX_SCORE_HANDLERS)
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun downloadScores() = Unit
+
+            fun registerScoresHandlers(
+                requests: List<Unit>,
+                requestScope: CoroutineScope,
+            ) {
+                requests.forEach {
+                    requestScope.launch {
+                        scoreSlots.withPermit { downloadScores() }
+                    }
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for registerScoresHandlers: {(1000, 4)}",
+        )
+        result.assertOutputContains("ReqBW=4000 bytes/s")
+    }
+
+    @Test
+    fun `scales a shared Semaphore bound by internal fanout`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            private val scoreSlots = Semaphore(4)
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun downloadScores() = Unit
+
+            fun registerScoresHandlers(
+                requests: List<Unit>,
+                requestScope: CoroutineScope,
+            ) {
+                requests.forEach {
+                    requestScope.launch {
+                        scoreSlots.withPermit {
+                            coroutineScope {
+                                launch { downloadScores() }
+                                launch { downloadScores() }
+                            }
+                        }
+                    }
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for registerScoresHandlers: {(1000, 8)}",
+        )
+        result.assertOutputContains("ReqBW=8000 bytes/s")
+    }
+
+    @Test
+    fun `keeps a local Semaphore transparent for one invocation`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun downloadScores() = Unit
+
+            suspend fun scoresHandler() {
+                val scoreSlots = Semaphore(4)
+                scoreSlots.withPermit { downloadScores() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for scoresHandler: {(1000, 1)}")
+    }
+
+    @Test
+    fun `treats repeated launches without a known Semaphore bound as unbounded`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            private val configuredLimit = System.getProperty("score.limit", "4").toInt()
+            private val scoreSlots = Semaphore(configuredLimit)
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun downloadScores() = Unit
+
+            fun registerScoresHandlers(
+                requests: List<Unit>,
+                requestScope: CoroutineScope,
+            ) {
+                requests.forEach {
+                    requestScope.launch {
+                        scoreSlots.withPermit { downloadScores() }
+                    }
+                }
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Escaping network work in repeated callback")
+        result.assertOutputContains("Use a self bound for every download")
+    }
+
+    @Test
+    fun `allows unbounded repeated launches when the body has no network effect`() {
+        val result = compile(
+            """
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+
+            fun registerHandlers(
+                requests: List<Unit>,
+                requestScope: CoroutineScope,
+            ) {
+                requests.forEach {
+                    requestScope.launch { println("handled") }
+                }
+            }
+            """,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+    }
+
+    @Test
+    fun `does not apply a Semaphore bound to one escaping launch`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            private val scoreSlots = Semaphore(4)
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun downloadScores() = Unit
+
+            suspend fun scoresHandler(requestScope: CoroutineScope) =
+                scoreSlots.withPermit {
+                    requestScope.launch { downloadScores() }
+                }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for scoresHandler: {(1000, 1)}")
+    }
+
+    @Test
+    fun `rejects repeated work escaping a Semaphore permit`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.CoroutineScope
+            import kotlinx.coroutines.launch
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            private val scoreSlots = Semaphore(4)
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun downloadScores() = Unit
+
+            suspend fun registerScoresHandlers(
+                requests: List<Unit>,
+                requestScope: CoroutineScope,
+            ) {
+                requests.forEach {
+                    scoreSlots.withPermit {
+                        requestScope.launch { downloadScores() }
+                    }
+                }
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Escaping network work in repeated callback")
+        result.assertOutputContains("Use a self bound for every download")
+    }
+
+    @Test
     fun `uses an interface contract through an NIA style implementation`() {
         val result = compile(
             """

@@ -20,6 +20,45 @@ class NetworkEffectTest {
     }
 
     @Test
+    fun `shared gate preserves one invocation and bounds later repetition`() {
+        val oneInvocation = NetworkEffect.download(1_000, 1_000)
+            .parallel(NetworkEffect.download(1_000, 1_000))
+            .withConcurrentInvocationBound(maxConcurrentInvocations = 4)
+
+        assertEquals(
+            listOf(DownloadEffect(Rational.of(1_000), 2, selfBound = 8)),
+            oneInvocation.obligations,
+        )
+
+        val repeated = oneInvocation
+            .withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+            .repeat()
+        assertEquals(
+            listOf(
+                DownloadEffect(
+                    Rational.of(1_000),
+                    8,
+                    selfBound = 8,
+                    lifetime = DownloadLifetime.MAY_OUTLIVE_CALL,
+                ),
+            ),
+            repeated.obligations,
+        )
+    }
+
+    @Test
+    fun `shared gate keeps a tighter existing download bound`() {
+        val result = NetworkEffect.download(1_000, 1_000)
+            .withSelfBound(2)
+            .withConcurrentInvocationBound(maxConcurrentInvocations = 4)
+
+        assertEquals(
+            listOf(DownloadEffect(Rational.of(1_000), 1, selfBound = 2)),
+            result.obligations,
+        )
+    }
+
+    @Test
     fun `uses summed self bounds for unknown repetition`() {
         val result = NetworkEffect.download(1_000, 1_000)
             .withSelfBound(3)

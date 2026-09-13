@@ -88,8 +88,8 @@ fun startBackgroundSync()
 The checker preserves the individual rate, concurrency, self-bound, and
 lifetime fields instead of collapsing them to one pair. Set `selfBound` on an
 opaque download entry only when a runtime client or scheduler enforces a shared
-limit across repeated invocations; zero leaves the bound unspecified. A positive
-value is a trusted contract about that runtime limit.
+limit across repeated invocations. Zero denotes the default bound infinity; a
+positive value is a trusted contract about a finite runtime limit.
 
 `@BoundedClient(k)` attaches a configured self bound to instances of one
 primitive download kind. A raw download carries
@@ -130,6 +130,45 @@ flows by `k`; dynamic or default concurrency and untracked Flow values are rejec
 Repeated transforms still use the same core repetition rule, so work escaping
 an invocation requires a self bound. Collector callbacks are rejected because
 supported Kotlin versions expose incompatible FIR shapes for them.
+
+A visible `kotlinx.coroutines.sync.Semaphore.withPermit` block on an immutable
+top-level semaphore carries its constant capacity to an enclosing repetition.
+One ordinary invocation retains its local effect; the semaphore does not create
+`k` copies by itself. If repeated spawns can overlap, the bound applies to the
+entire completing block, including internal coroutine fan-out. Local semaphores
+and dynamic capacities remain transparent because they establish no known
+shared bound. Work escaping the permit receives no semaphore bound and is
+rejected only if a surrounding repetition makes that bound necessary.
+
+For a repeatedly invoked server handler, the operational model accepts an
+unbounded stream of requests:
+
+```text
+repeat(infinity) { spawn { acquire; e; release } }
+```
+
+Projecting away waiting requests gives the peak-effect abstraction below when
+the permit is held until `e` completes:
+
+```text
+Semaphore(k): repeat(k) { spawn { e } }
+no known bound: repeat(infinity) { spawn { e } }
+```
+
+Equivalently, let `b = selfBound`, defaulting to infinity. The ordinary
+repeated-handler multiplicity is `n_standard = infinity`, and the effective
+multiplicity is:
+
+```text
+n_effective = min(n_standard, b)
+ReqBW_effective = r * n_effective
+                = min(r * n_standard, r * b)
+```
+
+Thus a finite semaphore-derived `b` makes the bandwidth requirement finite.
+The implementation uses a missing bound as its infinity sentinel and reports
+an error only when a non-empty network effect still has an infinite effective
+requirement. An effect-free handler remains valid.
 
 For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 `try/catch` expression, but recovery paths are still joined conservatively.
@@ -294,6 +333,7 @@ artifacts must not mix versions.
 - [x] Structured `coroutineScope`/`withContext` inference with sequential parent
   work, conservative `launch`/`async` overlap, inline `awaitAll`, and bounded
   `map { async { ... } }` collections synchronized by `awaitAll()`
+- [x] Shared constant-capacity `Semaphore.withPermit` inference
 - [x] Sequential `chunked(...).forEach` callback inference
 - [x] Version-selected FIR adapters and CI coverage for Kotlin 2.2, 2.3, and 2.4
 - [ ] Path-sensitive, rate-sensitive branch refinement
