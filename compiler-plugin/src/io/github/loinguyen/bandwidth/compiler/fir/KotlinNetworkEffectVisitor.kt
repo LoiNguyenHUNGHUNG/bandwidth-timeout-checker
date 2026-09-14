@@ -329,13 +329,13 @@ internal class KotlinNetworkEffectVisitor(
         if (target.isFlowCollect()) {
             return inferFlowCollect(call, context)
         }
-        val repeatedCallbackMayOutliveCall = target.repeatedCallbackMayOutliveCall()
-        if (repeatedCallbackMayOutliveCall != null) {
+        val repeatedCallbackPolicy = target.repeatedCallbackPolicy()
+        if (repeatedCallbackPolicy != null) {
             return inferRepeatedCallbackCall(
                 call = call,
                 target = target,
                 context = context,
-                mayOutliveCall = repeatedCallbackMayOutliveCall,
+                policy = repeatedCallbackPolicy,
             )
         }
         if (target.isSingleCallbackFunction()) {
@@ -862,7 +862,7 @@ internal class KotlinNetworkEffectVisitor(
         call: FirFunctionCall,
         target: FirFunction,
         context: KotlinEffectContext,
-        mayOutliveCall: Boolean,
+        policy: RepeatedCallbackPolicy,
     ): KotlinExpressionEffect {
         val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
         /** Infers [expression] at most once for this call site. */
@@ -901,16 +901,27 @@ internal class KotlinNetworkEffectVisitor(
         val bodyNetwork = callbackBody.network
         if (bodyNetwork == NetworkEffect.EMPTY) return evaluatedInputs
 
+        val repeatedBody = if (policy.invocationsMayOverlap) {
+            bodyNetwork.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+        } else {
+            bodyNetwork
+        }
         val repeated = repeatNetworkEffect(
-            effect = bodyNetwork,
+            effect = repeatedBody,
             key = "repeated-network:${context.function.displayName()}:" +
                 call.source?.startOffset,
             source = call.source ?: context.function.source,
-            missingBoundMessage = "Escaping network work in repeated callback " +
-                "${target.displayName()} may overlap across an unknown number of " +
-                "invocations. Use a self bound for every download.",
+            missingBoundMessage = if (policy.invocationsMayOverlap) {
+                "Network work in concurrent repeated callback ${target.displayName()} may " +
+                    "overlap across an unknown number of invocations. Use a self bound for " +
+                    "every download."
+            } else {
+                "Escaping network work in repeated callback ${target.displayName()} may " +
+                    "overlap across an unknown number of invocations. Use a self bound for " +
+                    "every download."
+            },
         )
-        val invocationEffect = if (mayOutliveCall) {
+        val invocationEffect = if (policy.mayOutliveCall) {
             repeated.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
         } else {
             repeated
@@ -1153,15 +1164,16 @@ internal class KotlinNetworkEffectVisitor(
     ): Boolean =
         returnTypeRef.coneType.isSomeFunctionType(session) || argument.latent != null
 
-    /**
-     * Returns whether this function repeatedly invokes callbacks that may
-     * outlive the call, or `null` when it is not a recognized repetition.
-     */
-    private fun FirFunction.repeatedCallbackMayOutliveCall(): Boolean? {
+    /** Returns the invocation policy of a recognized repeated callback API. */
+    private fun FirFunction.repeatedCallbackPolicy(): RepeatedCallbackPolicy? {
         val fqName = symbol.callableId.asSingleFqName().asString()
         return when (fqName) {
-            in IMMEDIATE_REPEATED_CALLBACK_FQ_NAMES -> false
-            in RETAINED_REPEATED_CALLBACK_FQ_NAMES -> true
+            in IMMEDIATE_REPEATED_CALLBACK_FQ_NAMES ->
+                RepeatedCallbackPolicy.IMMEDIATE_SERIAL
+            in RETAINED_REPEATED_CALLBACK_FQ_NAMES ->
+                RepeatedCallbackPolicy.RETAINED_SERIAL
+            in RETAINED_CONCURRENT_CALLBACK_FQ_NAMES ->
+                RepeatedCallbackPolicy.RETAINED_CONCURRENT
             else -> null
         }
     }
@@ -1658,6 +1670,7 @@ internal class KotlinNetworkEffectVisitor(
         )
         val SINGLE_CALLBACK_FQ_NAMES: Set<String> = setOf(
             "androidx.tracing.traceAsync",
+            "io.ktor.server.routing.routing",
         )
         val IMMEDIATE_REPEATED_CALLBACK_FQ_NAMES: Set<String> = setOf(
             "kotlin.collections.forEach",
@@ -1704,5 +1717,20 @@ internal class KotlinNetworkEffectVisitor(
             "androidx.compose.foundation.lazy.staggeredgrid.items",
             "androidx.compose.foundation.lazy.staggeredgrid.itemsIndexed",
         )
+        val RETAINED_CONCURRENT_CALLBACK_FQ_NAMES: Set<String> = setOf(
+            "de.nielsfalk.ktor.swagger.get",
+            "io.ktor.server.resources.get",
+            "io.ktor.server.routing.get",
+        )
     }
+}
+
+/** How a recognized higher-order API invokes and retains its callback. */
+private enum class RepeatedCallbackPolicy(
+    val mayOutliveCall: Boolean,
+    val invocationsMayOverlap: Boolean,
+) {
+    IMMEDIATE_SERIAL(mayOutliveCall = false, invocationsMayOverlap = false),
+    RETAINED_SERIAL(mayOutliveCall = true, invocationsMayOverlap = false),
+    RETAINED_CONCURRENT(mayOutliveCall = true, invocationsMayOverlap = true),
 }

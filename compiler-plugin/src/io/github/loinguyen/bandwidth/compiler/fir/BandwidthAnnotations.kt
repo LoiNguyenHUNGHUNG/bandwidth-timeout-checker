@@ -25,6 +25,8 @@ import org.jetbrains.kotlin.name.Name
 
 internal val NETWORK_DOWNLOAD_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.NetworkDownload"))
+internal val ENTRY_POINT_ANNOTATION: ClassId =
+    ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.EntryPoint"))
 internal val BANDWIDTH_EFFECT_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BandwidthEffect"))
 internal val BOUNDED_SCOPE_ANNOTATION: ClassId =
@@ -90,6 +92,10 @@ internal fun FirAnnotationContainer.downloadContract(session: FirSession): Downl
     if (maxBytes < 0 || timeoutMillis <= 0) return null
     return DownloadContract(maxBytes, timeoutMillis)
 }
+
+/** Returns whether this declaration is a framework-invoked request handler. */
+internal fun FirAnnotationContainer.isEntryPoint(session: FirSession): Boolean =
+    annotation(ENTRY_POINT_ANNOTATION, session) != null
 
 /**
  * Parses and combines the shorthand and list entries in a valid

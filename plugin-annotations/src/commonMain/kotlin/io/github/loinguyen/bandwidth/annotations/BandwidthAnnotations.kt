@@ -14,6 +14,18 @@ public annotation class NetworkDownload(
 )
 
 /**
+ * Marks a function as an application root invoked by a framework.
+ *
+ * The checker analyzes one invocation even when ordinary source code never
+ * calls the function. All marked roots are conservatively composed in
+ * parallel. Repeated framework callbacks registered by a root, such as Ktor
+ * request handlers, are modeled separately at their registration calls.
+ */
+@Target(AnnotationTarget.FUNCTION)
+@Retention(AnnotationRetention.BINARY)
+public annotation class EntryPoint
+
+/**
  * One download entry in a [BandwidthEffect] contract.
  *
  * [mayOutliveCall] means work represented by this entry may remain active after

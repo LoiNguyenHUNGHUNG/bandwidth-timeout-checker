@@ -44,6 +44,17 @@ does not yet transform coroutine launches.
 @NetworkDownload(maxBytes = 8_000_000, completeTimeoutMillis = 10_000)
 suspend fun downloadImage(url: String): ByteArray
 
+@EntryPoint
+fun Application.module() {
+    routing {
+        get("/picture") {
+            pictureSlots.withPermit {
+                downloadImage("https://images.example/picture")
+            }
+        }
+    }
+}
+
 fun applyNetworkCallback(
     @BandwidthEffect(rMaxBytesPerSecond = 800_000, nMax = 1)
     callback: suspend () -> Unit,
@@ -169,6 +180,18 @@ Thus a finite semaphore-derived `b` makes the bandwidth requirement finite.
 The implementation uses a missing bound as its infinity sentinel and reports
 an error only when a non-empty network effect still has an infinite effective
 requirement. An effect-free handler remains valid.
+
+`@EntryPoint` marks one framework-invoked application root even when ordinary
+source code never calls it. Each root is analyzed once, and the checker creates
+a virtual application root by composing all marked functions in parallel. No
+executable dummy `main` is generated. In Ktor, `routing { configuration }`
+invokes its configuration callback once, while `get { handler }` retains the
+handler and models it as `repeat(infinity) { spawn { handler } }`. A finite
+semaphore bound inside the handler replaces that infinity through the ordinary
+self-bound rule. For the initial experiment, every network handler uses its own
+persistent, statically visible semaphore, avoiding resource-identity analysis.
+Route-registration helpers such as `fun Route.alertsRoute()` are reached from
+the application root and do not need their own `@EntryPoint`.
 
 For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 `try/catch` expression, but recovery paths are still joined conservatively.
