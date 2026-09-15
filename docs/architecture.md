@@ -78,17 +78,20 @@ Annotations are required only where inference cannot see enough:
 
 1. `@NetworkDownload(maxBytes, completeTimeoutMillis)` on primitive network
    operations or library adapters.
-2. `@BandwidthEffect` download-effect lists on opaque functions, higher-order
+2. `@EntryPoint` on a framework-invoked application root that ordinary source
+   code may never call. Every marked root contributes one invocation to the
+   virtual application root.
+3. `@BandwidthEffect` download-effect lists on opaque functions, higher-order
    inputs, and opaque returned function types. Entries retain
    `(rMaxBytesPerSecond, nMax, selfBound, lifetime)`, where a zero `selfBound`
    denotes the default bound infinity. A positive value is a trusted contract
    that runtime configuration establishes a finite limit.
    `(rMaxBytesPerSecond, nMax)` remains one-entry shorthand.
-3. `@BoundedClient(k)` on a client whose runtime configuration establishes the
+4. `@BoundedClient(k)` on a client whose runtime configuration establishes the
    same concurrency limit.
-4. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
+5. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
    enforce the stated launch bound.
-5. `@BandwidthAlternative` on a whole `try/catch` expression when the
+6. `@BandwidthAlternative` on a whole `try/catch` expression when the
    programmer asserts that its network branches are comparable alternatives.
 
 The MVP has no priorities and no download identifiers.
@@ -195,6 +198,44 @@ semaphore bound therefore makes the result finite; without one, the multiplier
 remains infinity. The finite checker reports an error only when a non-empty
 network effect has an infinite effective bandwidth requirement. An empty
 handler remains valid.
+
+## Application entry points
+
+An `@EntryPoint` function denotes a framework-invoked application root `e`.
+The virtual main makes otherwise unreachable roots live concurrently:
+
+```text
+spawn { EntryPoint1() }
+spawn { EntryPoint2() }
+...
+```
+
+The FIR checker infers one invocation of each marked function. Once all source
+functions have been checked, a non-transforming IR hook builds the virtual
+application root:
+
+```text
+Application = EntryPoint1 || EntryPoint2 || ... || EntryPointN
+```
+
+This hook only reports the combined effect; it does not generate a Kotlin
+`main` or modify executable code.
+
+Ktor routing APIs provide a separate callback boundary. A `routing` call
+invokes its configuration lambda exactly once. A `get` call retains its handler
+and may run arbitrarily many handler invocations concurrently:
+
+```text
+routing { f } = f
+get { f } = repeat(infinity) { spawn { f } }
+```
+
+The callback rule first promotes the complete handler body to an escaping
+framework spawn and then applies unknown repetition. A finite self bound from a
+persistent semaphore inside `f` therefore replaces infinity through the core
+repetition rule. The first Ktor experiment requires a distinct statically
+visible semaphore for every network handler. Shared gate identity and aliasing
+remain outside this initial model.
 
 A local semaphore is transparent because recreating it for each function
 invocation establishes no shared bound. Dynamic capacities and mutable or

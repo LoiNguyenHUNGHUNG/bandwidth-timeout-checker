@@ -7,6 +7,7 @@ import org.jetbrains.kotlin.fir.extensions.FirExtensionRegistrar
 internal class BandwidthFirExtensionRegistrar(
     private val messages: MessageCollector,
     private val reportEffects: Boolean,
+    private val applicationEntryPoints: ApplicationEntryPointEffects,
 ) : FirExtensionRegistrar() {
     /** Registers the declaration checkers and their diagnostic definitions. */
     override fun ExtensionRegistrarContext.configurePlugin() {
@@ -15,6 +16,7 @@ internal class BandwidthFirExtensionRegistrar(
                 session = session,
                 messages = messages,
                 reportEffects = reportEffects,
+                applicationEntryPoints = applicationEntryPoints,
             )
         }
         registerDiagnosticContainers(BandwidthDiagnostics)
