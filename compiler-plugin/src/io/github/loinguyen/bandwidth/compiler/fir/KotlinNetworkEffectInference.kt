@@ -24,6 +24,7 @@ internal class KotlinNetworkEffectInference(
     private val session: FirSession,
     private val messages: MessageCollector,
     private val reportEffects: Boolean,
+    private val applicationEntryPoints: ApplicationEntryPointEffects,
 ) {
     private val inferredEffects:
         MutableMap<FirFunctionSymbol<*>, KotlinFunctionEffect> = mutableMapOf()
@@ -91,6 +92,7 @@ internal class KotlinNetworkEffectInference(
                     )
                 }
             }
+            if (function.isEntryPoint(session)) applicationEntryPoints.record(inferredEffect)
             if (reportEffects && inferredEffect != NetworkEffect.EMPTY) {
                 messages.report(
                     CompilerMessageSeverity.INFO,

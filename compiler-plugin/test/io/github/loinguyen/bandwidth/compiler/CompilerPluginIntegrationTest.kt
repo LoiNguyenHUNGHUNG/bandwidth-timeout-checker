@@ -2157,6 +2157,223 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `composes otherwise uncalled entry points once in parallel`() {
+        val result = compileSources(
+            sources = listOf(
+                """
+                import io.github.loinguyen.bandwidth.annotations.EntryPoint
+                import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+                suspend fun download() = Unit
+
+                @EntryPoint
+                suspend fun firstRoot() {
+                    download()
+                }
+                """,
+                """
+                import io.github.loinguyen.bandwidth.annotations.EntryPoint
+
+                @EntryPoint
+                suspend fun secondRoot() {
+                    download()
+                }
+                """,
+            ),
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred application entry-point effect from 2 entry point(s): {(1000, 2)}",
+        )
+        result.assertOutputContains("ReqBW=2000 bytes/s")
+    }
+
+    @Test
+    fun `composes independently bounded Ktor get handlers in parallel`() {
+        val result = compileSources(
+            sources = listOf(
+                ktorRoutingStub,
+                """
+                import io.github.loinguyen.bandwidth.annotations.EntryPoint
+                import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+                import io.ktor.server.routing.Application
+                import io.ktor.server.routing.get
+                import io.ktor.server.routing.routing
+                import kotlinx.coroutines.sync.Semaphore
+                import kotlinx.coroutines.sync.withPermit
+
+                private val pictureSlots = Semaphore(3)
+                private val searchSlots = Semaphore(5)
+
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+                suspend fun download() = Unit
+
+                @EntryPoint
+                fun Application.module() {
+                    routing {
+                        get("/picture") {
+                            pictureSlots.withPermit { download() }
+                        }
+                        get("/search") {
+                            searchSlots.withPermit { download() }
+                        }
+                    }
+                }
+                """,
+            ),
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred application entry-point effect from 1 entry point(s): {(1000, 8)}",
+        )
+        result.assertOutputContains("ReqBW=8000 bytes/s")
+    }
+
+    @Test
+    fun `models BeatSaver resource and Swagger get handlers`() {
+        val result = compileSources(
+            sources = listOf(
+                ktorRoutingStub,
+                ktorResourcesStub,
+                ktorSwaggerStub,
+                """
+                import de.nielsfalk.ktor.swagger.Metadata
+                import de.nielsfalk.ktor.swagger.get as swaggerGet
+                import io.github.loinguyen.bandwidth.annotations.EntryPoint
+                import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+                import io.ktor.server.resources.get as resourceGet
+                import io.ktor.server.routing.Application
+                import io.ktor.server.routing.routing
+                import kotlinx.coroutines.sync.Semaphore
+                import kotlinx.coroutines.sync.withPermit
+
+                class PictureResource
+                class SearchResource
+
+                private val pictureSlots = Semaphore(2)
+                private val searchSlots = Semaphore(3)
+
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+                suspend fun download() = Unit
+
+                @EntryPoint
+                fun Application.module() {
+                    routing {
+                        resourceGet<PictureResource> { _ ->
+                            pictureSlots.withPermit { download() }
+                        }
+                        swaggerGet<SearchResource>(Metadata()) { _ ->
+                            searchSlots.withPermit { download() }
+                        }
+                    }
+                }
+                """,
+            ),
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred application entry-point effect from 1 entry point(s): {(1000, 5)}",
+        )
+        result.assertOutputContains("ReqBW=5000 bytes/s")
+    }
+
+    @Test
+    fun `rejects a Ktor get handler without a finite bound`() {
+        val result = compileSources(
+            sources = listOf(
+                ktorRoutingStub,
+                """
+                import io.github.loinguyen.bandwidth.annotations.EntryPoint
+                import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+                import io.ktor.server.routing.Application
+                import io.ktor.server.routing.get
+                import io.ktor.server.routing.routing
+
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+                suspend fun download() = Unit
+
+                @EntryPoint
+                fun Application.module() {
+                    routing {
+                        get("/picture") { download() }
+                    }
+                }
+                """,
+            ),
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Network work in concurrent repeated callback")
+        result.assertOutputContains("io.ktor.server.routing.get")
+    }
+
+    @Test
+    fun `invokes a Ktor routing configuration only once`() {
+        val result = compileSources(
+            sources = listOf(
+                ktorRoutingStub,
+                """
+                import io.github.loinguyen.bandwidth.annotations.EntryPoint
+                import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+                import io.ktor.server.routing.Application
+                import io.ktor.server.routing.routing
+
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+                fun startupDownload() = Unit
+
+                @EntryPoint
+                fun Application.module() {
+                    routing { startupDownload() }
+                }
+                """,
+            ),
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred application entry-point effect from 1 entry point(s): {(1000, 1)}",
+        )
+        result.assertOutputContains("ReqBW=1000 bytes/s")
+    }
+
+    @Test
+    fun `allows an unbounded Ktor get handler with no network effect`() {
+        val result = compileSources(
+            sources = listOf(
+                ktorRoutingStub,
+                """
+                import io.github.loinguyen.bandwidth.annotations.EntryPoint
+                import io.ktor.server.routing.Application
+                import io.ktor.server.routing.get
+                import io.ktor.server.routing.routing
+
+                @EntryPoint
+                fun Application.module() {
+                    routing {
+                        get("/health") { println("healthy") }
+                    }
+                }
+                """,
+            ),
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred application entry-point effect from 1 entry point(s): {}",
+        )
+        result.assertOutputContains("ReqBW=0 bytes/s")
+    }
+
+    @Test
     fun `uses an interface contract through an NIA style implementation`() {
         val result = compile(
             """
@@ -3083,15 +3300,68 @@ class CompilerPluginIntegrationTest {
         result.assertOutputContains("ReqBW=2000 bytes/s")
     }
 
+    private val ktorRoutingStub = """
+        package io.ktor.server.routing
+
+        class Application
+        open class Route
+        class Routing : Route()
+        class RoutingContext
+
+        fun Application.routing(configuration: Routing.() -> Unit) = Unit
+
+        fun Route.get(
+            path: String,
+            body: suspend RoutingContext.() -> Unit,
+        ) = Unit
+    """
+
+    private val ktorResourcesStub = """
+        package io.ktor.server.resources
+
+        import io.ktor.server.routing.Route
+        import io.ktor.server.routing.RoutingContext
+
+        inline fun <reified T : Any> Route.get(
+            noinline body: suspend RoutingContext.(T) -> Unit,
+        ) = Unit
+    """
+
+    private val ktorSwaggerStub = """
+        package de.nielsfalk.ktor.swagger
+
+        import io.ktor.server.routing.Route
+        import io.ktor.server.routing.RoutingContext
+
+        class Metadata
+
+        inline fun <reified T : Any> Route.get(
+            metadata: Metadata,
+            noinline body: suspend RoutingContext.(T) -> Unit,
+        ) = Unit
+    """
+
     private fun compile(
         source: String,
         reportEffects: Boolean = false,
+    ): CompilationResult = compileSources(
+        sources = listOf(source),
+        reportEffects = reportEffects,
+    )
+
+    private fun compileSources(
+        sources: List<String>,
+        reportEffects: Boolean = false,
     ): CompilationResult {
         val directory: Path = Files.createTempDirectory("bandwidth-compiler-test")
-        val sourceFile: Path = directory.resolve("Test.kt")
+        val sourceFiles: List<Path> = sources.mapIndexed { index, source ->
+            val fileName = if (index == 0) "Test.kt" else "Test${index + 1}.kt"
+            directory.resolve(fileName).also {
+                it.writeText(source.trimIndent())
+            }
+        }
         val outputDirectory: Path = directory.resolve("classes")
         Files.createDirectories(outputDirectory)
-        sourceFile.writeText(source.trimIndent())
 
         val classpath: String = requiredProperty("bandwidth.compiler.test.classpath")
             .split(File.pathSeparator)
@@ -3123,7 +3393,7 @@ class CompilerPluginIntegrationTest {
                 "plugin:io.github.loinguyen.bandwidth:reportEffects=true",
             )
         }
-        command += sourceFile.toString()
+        command += sourceFiles.map(Path::toString)
 
         val process: Process = ProcessBuilder(command)
             .directory(directory.toFile())

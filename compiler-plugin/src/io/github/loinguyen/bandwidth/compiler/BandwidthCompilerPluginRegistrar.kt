@@ -1,6 +1,8 @@
 package io.github.loinguyen.bandwidth.compiler
 
+import io.github.loinguyen.bandwidth.compiler.fir.ApplicationEntryPointEffects
 import io.github.loinguyen.bandwidth.compiler.fir.BandwidthFirExtensionRegistrar
+import org.jetbrains.kotlin.backend.common.extensions.IrGenerationExtension
 import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.compiler.plugin.CompilerPluginRegistrar
 import org.jetbrains.kotlin.config.CommonConfigurationKeys
@@ -22,11 +24,17 @@ abstract class AbstractBandwidthCompilerPluginRegistrar : CompilerPluginRegistra
 
         val messages: MessageCollector =
             configuration.get(CommonConfigurationKeys.MESSAGE_COLLECTOR_KEY, MessageCollector.NONE)
+        val applicationEntryPoints = ApplicationEntryPointEffects(
+            messages = messages,
+            reportEffects = configuration.get(BandwidthConfiguration.REPORT_EFFECTS, false),
+        )
         FirExtensionRegistrarAdapter.registerExtension(
             BandwidthFirExtensionRegistrar(
                 messages = messages,
                 reportEffects = configuration.get(BandwidthConfiguration.REPORT_EFFECTS, false),
+                applicationEntryPoints = applicationEntryPoints,
             ),
         )
+        IrGenerationExtension.registerExtension(applicationEntryPoints)
     }
 }
