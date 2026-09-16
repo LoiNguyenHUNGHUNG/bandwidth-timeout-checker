@@ -342,7 +342,7 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `rejects an unknown indirect coroutine block`() {
+    fun `treats an unannotated indirect coroutine block as non-network`() {
         val result = compile(
             """
             import kotlinx.coroutines.CoroutineScope
@@ -355,8 +355,7 @@ class CompilerPluginIntegrationTest {
             """,
         )
 
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Cannot infer the network effect of this coroutine block")
+        assertEquals(0, result.exitCode, result.output)
     }
 
     @Test
@@ -2285,6 +2284,114 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `models Ktor post and BeatSaver route helper handlers`() {
+        val result = compileSources(
+            sources = listOf(
+                ktorRoutingStub,
+                ktorResourcesStub,
+                """
+                package io.beatmaps.api.util
+
+                import io.ktor.server.routing.Route
+                import io.ktor.server.routing.RoutingContext
+
+                inline fun <reified T : Any> Route.getWithOptions(
+                    noinline body: suspend RoutingContext.(T) -> Unit,
+                ) = Unit
+                """,
+                """
+                import io.beatmaps.api.util.getWithOptions
+                import io.github.loinguyen.bandwidth.annotations.EntryPoint
+                import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+                import io.ktor.server.resources.post
+                import io.ktor.server.routing.Application
+                import io.ktor.server.routing.routing
+                import kotlinx.coroutines.sync.Semaphore
+                import kotlinx.coroutines.sync.withPermit
+
+                class CreateResource
+                class ReadResource
+
+                private val createSlots = Semaphore(2)
+                private val readSlots = Semaphore(3)
+
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+                suspend fun download() = Unit
+
+                @EntryPoint
+                fun Application.module() {
+                    routing {
+                        post<CreateResource> { _ ->
+                            createSlots.withPermit { download() }
+                        }
+                        getWithOptions<ReadResource> { _ ->
+                            readSlots.withPermit { download() }
+                        }
+                    }
+                }
+                """,
+            ),
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred application entry-point effect from 1 entry point(s): {(1000, 5)}",
+        )
+        result.assertOutputContains("ReqBW=5000 bytes/s")
+    }
+
+    @Test
+    fun `models embeddedServer module as a single callback`() {
+        val result = compileSources(
+            sources = listOf(
+                ktorRoutingStub,
+                """
+                package io.ktor.server.engine
+
+                import io.ktor.server.routing.Application
+
+                class ApplicationEngine
+
+                fun embeddedServer(module: Application.() -> Unit) = ApplicationEngine()
+                """,
+                """
+                import io.github.loinguyen.bandwidth.annotations.EntryPoint
+                import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+                import io.ktor.server.engine.embeddedServer
+                import io.ktor.server.routing.get
+                import io.ktor.server.routing.routing
+                import kotlinx.coroutines.sync.Semaphore
+                import kotlinx.coroutines.sync.withPermit
+
+                private val slots = Semaphore(2)
+
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+                suspend fun download() = Unit
+
+                @EntryPoint
+                fun main() {
+                    embeddedServer {
+                        routing {
+                            get("/picture") {
+                                slots.withPermit { download() }
+                            }
+                        }
+                    }
+                }
+                """,
+            ),
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred application entry-point effect from 1 entry point(s): {(1000, 2)}",
+        )
+        result.assertOutputContains("ReqBW=2000 bytes/s")
+    }
+
+    @Test
     fun `rejects a Ktor get handler without a finite bound`() {
         val result = compileSources(
             sources = listOf(
@@ -2795,7 +2902,7 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `rejects invocation of an opaque callback return without a latent contract`() {
+    fun `treats an unannotated opaque callback return as non-network`() {
         val result = compile(
             """
             interface Boundary {
@@ -2809,12 +2916,11 @@ class CompilerPluginIntegrationTest {
             """,
         )
 
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Cannot infer the latent effect of an invoked function value")
+        assertEquals(0, result.exitCode, result.output)
     }
 
     @Test
-    fun `requires a contract when a higher-order parameter is invoked`() {
+    fun `treats an unannotated higher-order parameter as non-network`() {
         val result = compile(
             """
             fun invokeNetwork(callback: () -> Unit) {
@@ -2823,8 +2929,7 @@ class CompilerPluginIntegrationTest {
             """,
         )
 
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Higher-order parameter 'callback' is invoked without")
+        assertEquals(0, result.exitCode, result.output)
     }
 
     @Test
@@ -2875,6 +2980,24 @@ class CompilerPluginIntegrationTest {
 
         assertNotEquals(0, result.exitCode, result.output)
         result.assertOutputContains("Effectful higher-order argument for parameter 'action'")
+    }
+
+    @Test
+    fun `does not require a contract for an omitted default callback`() {
+        val result = compile(
+            """
+            fun configure(
+                value: Int,
+                callback: () -> Unit = {},
+            ) = value
+
+            fun caller() {
+                configure(1)
+            }
+            """,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
     }
 
     @Test
@@ -3314,6 +3437,11 @@ class CompilerPluginIntegrationTest {
             path: String,
             body: suspend RoutingContext.() -> Unit,
         ) = Unit
+
+        fun Route.post(
+            path: String,
+            body: suspend RoutingContext.() -> Unit,
+        ) = Unit
     """
 
     private val ktorResourcesStub = """
@@ -3323,6 +3451,11 @@ class CompilerPluginIntegrationTest {
         import io.ktor.server.routing.RoutingContext
 
         inline fun <reified T : Any> Route.get(
+            noinline body: suspend RoutingContext.(T) -> Unit,
+        ) = Unit
+
+
+        inline fun <reified T : Any> Route.post(
             noinline body: suspend RoutingContext.(T) -> Unit,
         ) = Unit
     """

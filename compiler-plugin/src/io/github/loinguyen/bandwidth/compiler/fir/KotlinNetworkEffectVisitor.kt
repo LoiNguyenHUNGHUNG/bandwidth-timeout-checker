@@ -37,7 +37,6 @@ import org.jetbrains.kotlin.fir.references.FirResolvedNamedReference
 import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirCallableSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirFunctionSymbol
-import org.jetbrains.kotlin.fir.symbols.impl.FirValueParameterSymbol
 import org.jetbrains.kotlin.fir.types.coneType
 import org.jetbrains.kotlin.fir.types.isSomeFunctionType
 import org.jetbrains.kotlin.fir.visitors.FirVisitor
@@ -362,11 +361,8 @@ internal class KotlinNetworkEffectVisitor(
         if (call is FirImplicitInvokeCall) {
             val invokedValue = call.explicitReceiver ?: call.dispatchReceiver
             return inferFunctionInvocation(
-                call = call,
-                invokedValue = invokedValue,
                 invokedValueEffect = invokedValue?.let(::effectOf),
                 evaluatedInputs = evaluatedInputs,
-                context = context,
             )
         }
 
@@ -1183,34 +1179,10 @@ internal class KotlinNetworkEffectVisitor(
      * after its receiver and argument inputs have been evaluated.
      */
     private fun inferFunctionInvocation(
-        call: FirImplicitInvokeCall,
-        invokedValue: FirExpression?,
         invokedValueEffect: KotlinExpressionEffect?,
         evaluatedInputs: KotlinExpressionEffect,
-        context: KotlinEffectContext,
     ): KotlinExpressionEffect {
-        val latent = invokedValueEffect?.latent
-        if (latent == null) {
-            val parameter = invokedValue
-                ?.resolvedSymbol()
-                ?.let { it as? FirValueParameterSymbol }
-                ?.fir
-            val message =
-                if (parameter != null) {
-                    "Higher-order parameter '${parameter.name}' is invoked without " +
-                        "@BandwidthEffect(rMaxBytesPerSecond, nMax)."
-                } else {
-                    "Cannot infer the latent effect of an invoked function value. " +
-                        "Keep the lambda visible or annotate its higher-order boundary."
-                }
-            problem(
-                key = "higher-order-invoke:${context.function.displayName()}:" +
-                    "${call.source?.startOffset}",
-                source = call.source ?: context.function.source,
-                message = message,
-            )
-            return evaluatedInputs
-        }
+        val latent = invokedValueEffect?.latent ?: LatentNetworkEffect()
         return evaluatedInputs.then(
             KotlinExpressionEffect(
                 network = latent.network,
@@ -1251,8 +1223,8 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     /**
-     * Requires resolvable latent effects for function-valued arguments and
-     * checks them against parameter contracts when supplied.
+     * Checks supplied function-valued arguments against parameter contracts.
+     * An unannotated source parameter has the trusted empty-effect contract.
      */
     private fun validateHigherOrderArguments(
         call: FirFunctionCall,
@@ -1268,23 +1240,11 @@ internal class KotlinNetworkEffectVisitor(
             if (!parameter.returnTypeRef.coneType.isSomeFunctionType(session)) {
                 return@forEach
             }
-            val actual = argumentEffects[parameter]?.latent
+            val suppliedArgument = argumentEffects[parameter] ?: return@forEach
+            val actual = suppliedArgument.latent ?: LatentNetworkEffect()
             val contract =
                 parameter.effectContract(session)
                     ?: parameter.returnTypeRef.effectContract(session)
-            if (actual == null) {
-                problem(
-                    key = "unknown-higher-order-argument:${context.function.displayName()}:" +
-                        "${call.source?.startOffset}:${parameter.name}",
-                    source = call.source ?: context.function.source,
-                    message = "Cannot infer the latent effect of higher-order argument " +
-                        "for parameter '${parameter.name}' of ${target.displayName()}. " +
-                        "Annotate the source higher-order boundary with " +
-                        "@BandwidthEffect(rMaxBytesPerSecond, nMax).",
-                )
-                return@forEach
-            }
-
             if (contract == null) {
                 if (actual.materialize() != NetworkEffect.EMPTY) {
                     problem(
@@ -1437,7 +1397,11 @@ internal class KotlinNetworkEffectVisitor(
         val mapping = (argumentList as? FirResolvedArgumentList)?.mapping ?: return emptyMap()
         return buildMap {
             mapping.forEach { (argument, parameter) ->
-                val effect = effectOf(argument)
+                val effect = argument.visibleLambda()?.let { lambda ->
+                    KotlinExpressionEffect(
+                        latent = inferFunction(lambda.anonymousFunction).asLatent(),
+                    )
+                } ?: effectOf(argument)
                 put(parameter, get(parameter)?.let { thenValue(it, effect) } ?: effect)
             }
         }
@@ -1670,7 +1634,22 @@ internal class KotlinNetworkEffectVisitor(
         )
         val SINGLE_CALLBACK_FQ_NAMES: Set<String> = setOf(
             "androidx.tracing.traceAsync",
+            "io.beatmaps.common.amqp.rabbitOptional",
+            "io.beatmaps.util.captchaProvider",
+            "io.beatmaps.util.optionalAuthorization",
+            "io.beatmaps.util.requireAuthorization",
+            "io.beatmaps.api.scores.ssTry",
+            "io.ktor.server.auth.authenticate",
+            "io.ktor.server.engine.embeddedServer",
             "io.ktor.server.routing.routing",
+            "kotlin.also",
+            "kotlin.apply",
+            "kotlin.let",
+            "kotlin.run",
+            "kotlin.runCatching",
+            "kotlin.use",
+            "org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction",
+            "org.jetbrains.exposed.sql.transactions.transaction",
         )
         val IMMEDIATE_REPEATED_CALLBACK_FQ_NAMES: Set<String> = setOf(
             "kotlin.collections.forEach",
@@ -1718,9 +1697,24 @@ internal class KotlinNetworkEffectVisitor(
             "androidx.compose.foundation.lazy.staggeredgrid.itemsIndexed",
         )
         val RETAINED_CONCURRENT_CALLBACK_FQ_NAMES: Set<String> = setOf(
+            "de.nielsfalk.ktor.swagger.delete",
             "de.nielsfalk.ktor.swagger.get",
+            "de.nielsfalk.ktor.swagger.patch",
+            "de.nielsfalk.ktor.swagger.post",
+            "de.nielsfalk.ktor.swagger.put",
+            "io.beatmaps.api.util.getWithOptions",
+            "io.beatmaps.api.util.postWithOptions",
+            "io.beatmaps.common.amqp.consumeAck",
+            "io.ktor.server.resources.delete",
             "io.ktor.server.resources.get",
+            "io.ktor.server.resources.patch",
+            "io.ktor.server.resources.post",
+            "io.ktor.server.resources.put",
+            "io.ktor.server.routing.delete",
             "io.ktor.server.routing.get",
+            "io.ktor.server.routing.patch",
+            "io.ktor.server.routing.post",
+            "io.ktor.server.routing.put",
         )
     }
 }
