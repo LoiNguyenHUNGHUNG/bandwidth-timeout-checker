@@ -5,7 +5,10 @@ import org.jetbrains.kotlin.fir.FirAnnotationContainer
 import org.jetbrains.kotlin.fir.FirSession
 import org.jetbrains.kotlin.fir.declarations.FirCallableDeclaration
 import org.jetbrains.kotlin.fir.declarations.FirFunction
+import org.jetbrains.kotlin.fir.declarations.FirValueParameter
 import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
+import org.jetbrains.kotlin.fir.types.coneType
+import org.jetbrains.kotlin.fir.types.isSomeFunctionType
 
 /** Effect suspended inside a value, such as a function or lazy Flow. */
 internal data class LatentNetworkEffect(
@@ -103,6 +106,12 @@ internal class KotlinEffectContext(
             ?.effectContract(session)
             ?.toLatentEffect()
         if (direct != null) return direct
+        if (
+            declaration is FirValueParameter &&
+            declaration.returnTypeRef.coneType.isSomeFunctionType(session)
+        ) {
+            return LatentNetworkEffect()
+        }
         return (declaration as? FirCallableDeclaration)
             ?.returnTypeRef
             ?.effectContract(session)

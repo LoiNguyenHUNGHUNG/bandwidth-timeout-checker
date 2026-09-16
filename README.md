@@ -200,9 +200,12 @@ before the alternative relation is formalized.
 
 Visible function bodies are inferred. A `@BandwidthEffect` on a visible function
 is checked as an interface contract, including lifetime, while calls across
-opaque boundaries use the declared effect list. Invoked higher-order parameters
-require their own `@BandwidthEffect`, and visible callback bodies are checked
-against that declaration.
+opaque boundaries use the declared effect list. An unannotated higher-order
+parameter is a trusted non-network contract. Annotate a parameter that may carry
+network work; visible callback bodies are checked against that declaration, and
+an effectful callback passed to an unannotated boundary is rejected. Function
+values whose bodies are not recoverable from FIR are likewise treated as
+trusted non-network values unless their declaration or type is annotated.
 
 Higher-order effects remain latent while lambdas and function references are
 stored, aliased, returned, or captured, and are charged only when the function

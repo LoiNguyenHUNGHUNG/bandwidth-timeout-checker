@@ -6,6 +6,7 @@ import org.gradle.api.Project
 import org.gradle.api.provider.Provider
 import org.jetbrains.kotlin.gradle.plugin.KotlinCompilation
 import org.jetbrains.kotlin.gradle.plugin.KotlinCompilerPluginSupportPlugin
+import org.jetbrains.kotlin.gradle.plugin.KotlinPlatformType
 import org.jetbrains.kotlin.gradle.plugin.SubpluginArtifact
 import org.jetbrains.kotlin.gradle.plugin.SubpluginOption
 
@@ -19,8 +20,10 @@ class BandwidthCheckerGradlePlugin : KotlinCompilerPluginSupportPlugin {
         )
     }
 
-    /** Returns `true` because the checker supports every Kotlin compilation. */
-    override fun isApplicable(kotlinCompilation: KotlinCompilation<*>): Boolean = true
+    /** Returns `true` for JVM compilations, the platform supported by the checker. */
+    override fun isApplicable(kotlinCompilation: KotlinCompilation<*>): Boolean =
+        kotlinCompilation.target.platformType == KotlinPlatformType.jvm ||
+            kotlinCompilation.target.platformType == KotlinPlatformType.androidJvm
 
     /** Returns the compiler plugin identifier passed to Kotlin Gradle tooling. */
     override fun getCompilerPluginId(): String = BuildConfig.KOTLIN_PLUGIN_ID
