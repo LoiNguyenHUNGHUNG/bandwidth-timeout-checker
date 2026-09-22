@@ -81,8 +81,9 @@ Annotations are required only where inference cannot see enough:
 2. `@EntryPoint` on a framework-invoked application root that ordinary source
    code may never call. Every marked root contributes one invocation to the
    virtual application root.
-3. `@BandwidthEffect` download-effect lists on opaque functions, higher-order
-   inputs, and opaque returned function types. Entries retain
+3. `@BandwidthEffect` download-effect lists and named effect variables on
+   opaque functions, higher-order inputs, and opaque returned function types.
+   Entries retain
    `(rMaxBytesPerSecond, nMax, selfBound, lifetime)`, where a zero `selfBound`
    denotes the default bound infinity. A positive value is a trusted contract
    that runtime configuration establishes a finite limit.
@@ -294,6 +295,8 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   mutable branch assignments, and higher-order function returns.
 - [x] Require and check latent contracts on opaque higher-order inputs and
   returned function types.
+- [x] Bind named callback effect variables and substitute them into
+  higher-order call summaries, including an optional escaping lifetime.
 - [x] Cache per-function summaries, reject unsupported recursion, and lower
   general loops through the core repetition rule.
 - [x] Run annotation validation, effect inference, and diagnostics in the FIR

@@ -60,6 +60,12 @@ fun applyNetworkCallback(
     callback: suspend () -> Unit,
 )
 
+@BandwidthEffect(variables = [BandwidthEffectVariable("E")])
+fun <T> invokeOnce(
+    @BandwidthEffect(variables = [BandwidthEffectVariable("E")])
+    callback: () -> T,
+): T = callback()
+
 @BoundedScope(k = 4)
 val downloadScope = viewModelScope
 
@@ -111,6 +117,16 @@ that complete within one invocation remain sequential. Downloads that escape
 an invocation may overlap later invocations, so each requires a self bound.
 Ordinary, non-repeated use does not require one. Runtime verification for a
 specific client may be added separately without changing this usage rule.
+
+`BandwidthEffectVariable("E")` gives higher-order boundaries a polymorphic
+effect contract. An occurrence on a function-valued parameter binds `E` to the
+effect of the supplied callback; an occurrence on the function substitutes the
+same effect into the call summary. Setting `mayOutliveCall = true` on the
+function occurrence changes only the substituted work's lifetime. Repetition
+and concurrency limits remain properties of the program construct or runtime
+gate rather than operations embedded in `@BandwidthEffect`. For a visible
+wrapper, the checker infers the wrapper's own concrete network work and adds the
+substituted variables. An opaque wrapper must declare that concrete work too.
 
 The frontend recognizes `while`, `do-while`, `for`/`forEach`, repeated UI
 callbacks such as button presses, and lazy scrolling/item callbacks as
@@ -226,7 +242,8 @@ The recursion-free milestone rejects unannotated recursion, unbounded escaping
 work in general loops, and effectful callbacks passed to opaque higher-order
 APIs without a parameter contract. Trusted library models cover sequential
 collection `map`/`forEach` callbacks, calls-in-place helpers such as `use`, and
-selected application wrappers. A sequential callback may run an unknown number
+framework callback registration. Application wrappers instead use polymorphic
+`@BandwidthEffect` contracts. A sequential callback may run an unknown number
 of times, but completing work from one invocation does not overlap the next;
 escaping work must still carry a self-bound.
 

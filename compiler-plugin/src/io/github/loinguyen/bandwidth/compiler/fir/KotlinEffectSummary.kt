@@ -104,6 +104,7 @@ internal class KotlinEffectContext(
         val declaration = symbol.fir
         val direct = (declaration as? FirAnnotationContainer)
             ?.effectContract(session)
+            ?.takeIf { it.variables.isEmpty() }
             ?.toLatentEffect()
         if (direct != null) return direct
         if (
@@ -115,6 +116,7 @@ internal class KotlinEffectContext(
         return (declaration as? FirCallableDeclaration)
             ?.returnTypeRef
             ?.effectContract(session)
+            ?.takeIf { it.variables.isEmpty() }
             ?.toLatentEffect()
     }
 

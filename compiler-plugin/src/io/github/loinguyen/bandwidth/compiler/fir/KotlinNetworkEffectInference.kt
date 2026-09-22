@@ -1,5 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
+import io.github.loinguyen.bandwidth.core.DownloadLifetime
 import io.github.loinguyen.bandwidth.core.NetworkEffect
 import org.jetbrains.kotlin.KtSourceElement
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageLocation
@@ -59,8 +60,11 @@ internal class KotlinNetworkEffectInference(
             val inferred: KotlinFunctionEffect = inferFunctionEffect(function)
             val inferredEffect: NetworkEffect = inferred.materialize()
             function.effectContract(session)?.let { contract ->
-                val declaredEffect: NetworkEffect = contract.toNetworkEffect()
-                if (!inferredEffect.isCoveredBy(declaredEffect)) {
+                val declaredEffect: NetworkEffect = contract.network
+                if (
+                    (contract.variables.isEmpty() || declaredEffect != NetworkEffect.EMPTY) &&
+                    !inferredEffect.isCoveredBy(declaredEffect)
+                ) {
                     error(
                         function.source,
                         "Inferred effect ${inferredEffect.render()} is not covered by " +
@@ -69,8 +73,11 @@ internal class KotlinNetworkEffectInference(
                 }
             }
             function.overriddenEffectContracts(session, context).forEach { contract ->
-                val declaredEffect: NetworkEffect = contract.toNetworkEffect()
-                if (!inferredEffect.isCoveredBy(declaredEffect)) {
+                val declaredEffect: NetworkEffect = contract.network
+                if (
+                    (contract.variables.isEmpty() || declaredEffect != NetworkEffect.EMPTY) &&
+                    !inferredEffect.isCoveredBy(declaredEffect)
+                ) {
                     error(
                         function.source,
                         "Inferred override effect ${inferredEffect.render()} is not covered by " +
@@ -82,8 +89,11 @@ internal class KotlinNetworkEffectInference(
             function.returnTypeRef.effectContract(session)?.let { contract ->
                 val inferredLatent: NetworkEffect =
                     inferred.returned?.materialize() ?: NetworkEffect.EMPTY
-                val declaredLatent: NetworkEffect = contract.toNetworkEffect()
-                if (!inferredLatent.isCoveredBy(declaredLatent)) {
+                val declaredLatent: NetworkEffect = contract.network
+                if (
+                    (contract.variables.isEmpty() || declaredLatent != NetworkEffect.EMPTY) &&
+                    !inferredLatent.isCoveredBy(declaredLatent)
+                ) {
                     error(
                         function.source,
                         "Inferred returned latent effect ${inferredLatent.render()} is not " +
@@ -168,6 +178,20 @@ internal class KotlinNetworkEffectInference(
 /** Returns the quantitative network effect represented by this contract. */
 internal fun EffectContract.toNetworkEffect(): NetworkEffect =
     network
+
+/** Substitutes named callback effects into this contract in declaration order. */
+internal fun EffectContract.instantiate(
+    bindings: Map<String, NetworkEffect>,
+    base: NetworkEffect = network,
+): NetworkEffect? = variables.fold(base) { result, variable ->
+    val bound = bindings[variable.name] ?: return null
+    val occurrence = if (variable.mayOutliveCall) {
+        bound.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+    } else {
+        bound
+    }
+    result.then(occurrence)
+}
 
 /** Returns this function's fully qualified callable name for diagnostics. */
 internal fun FirFunction.displayName(): String =

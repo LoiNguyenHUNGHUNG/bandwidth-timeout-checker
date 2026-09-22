@@ -39,6 +39,8 @@ private val COMPLETE_TIMEOUT_MILLIS: Name = Name.identifier("completeTimeoutMill
 private val R_MAX_BYTES_PER_SECOND: Name = Name.identifier("rMaxBytesPerSecond")
 private val N_MAX: Name = Name.identifier("nMax")
 private val DOWNLOADS: Name = Name.identifier("downloads")
+private val VARIABLES: Name = Name.identifier("variables")
+private val NAME: Name = Name.identifier("name")
 private val MAY_OUTLIVE_CALL: Name = Name.identifier("mayOutliveCall")
 private val SELF_BOUND: Name = Name.identifier("selfBound")
 private val K: Name = Name.identifier("k")
@@ -50,6 +52,12 @@ internal data class DownloadContract(
 
 internal data class EffectContract(
     val network: NetworkEffect,
+    val variables: List<EffectVariableContract>,
+)
+
+internal data class EffectVariableContract(
+    val name: String,
+    val mayOutliveCall: Boolean,
 )
 
 private data class BandwidthDownloadContract(
@@ -58,6 +66,12 @@ private data class BandwidthDownloadContract(
     val nMax: Int?,
     val mayOutliveCall: Boolean,
     val selfBound: Int?,
+)
+
+private data class ParsedEffectVariableContract(
+    val source: KtSourceElement?,
+    val name: String?,
+    val mayOutliveCall: Boolean,
 )
 
 internal data class BoundedClientContract(
@@ -131,6 +145,14 @@ internal fun FirAnnotationContainer.effectContract(session: FirSession): EffectC
     }
     return EffectContract(
         effects.fold(NetworkEffect.EMPTY) { result, effect -> result.choice(effect) },
+        annotation.effectVariableContracts(session).map { variable ->
+            EffectVariableContract(
+                name = variable.name ?: return null,
+                mayOutliveCall = variable.mayOutliveCall,
+            )
+        }.takeIf { variables ->
+            variables.all { it.name.isNotBlank() }
+        } ?: return null,
     )
 }
 
@@ -287,6 +309,17 @@ private fun MutableList<AnnotationProblem>.validateEffectAnnotation(
             )
         }
     }
+    val variables = annotation.effectVariableContracts(session)
+    variables.forEach { variable ->
+        if (variable.name.isNullOrBlank()) {
+            add(
+                AnnotationProblem(
+                    variable.source ?: annotation.source,
+                    "BandwidthEffectVariable name must be a non-blank constant string.",
+                ),
+            )
+        }
+    }
 }
 
 /** Returns the integral constant [name] as a [Long], or `null` if unavailable. */
@@ -306,6 +339,51 @@ private fun FirAnnotation.intArgument(name: Name, session: FirSession): Int? =
 /** Parses every `BandwidthDownload` entry in this annotation's `downloads` argument. */
 private fun FirAnnotation.downloadContracts(session: FirSession): List<BandwidthDownloadContract> {
     return argument(DOWNLOADS)?.downloadContracts(session).orEmpty()
+}
+
+/** Parses every symbolic effect occurrence in this annotation's `variables` argument. */
+private fun FirAnnotation.effectVariableContracts(
+    session: FirSession,
+): List<ParsedEffectVariableContract> =
+    argument(VARIABLES)?.effectVariableContracts(session).orEmpty()
+
+/** Recursively extracts `BandwidthEffectVariable` constructor arguments. */
+private fun FirExpression.effectVariableContracts(
+    session: FirSession,
+): List<ParsedEffectVariableContract> {
+    annotationArrayElements()?.let { elements ->
+        return elements.flatMap { it.effectVariableContracts(session) }
+    }
+    return when (this) {
+        is FirAnnotation -> listOf(
+            ParsedEffectVariableContract(
+                source = source,
+                name = stringArgument(NAME, session),
+                mayOutliveCall = booleanArgument(MAY_OUTLIVE_CALL, session) == true,
+            ),
+        )
+        is FirFunctionCall -> {
+            val variableName = argument(NAME)
+            if (variableName != null) {
+                listOf(
+                    ParsedEffectVariableContract(
+                        source = source,
+                        name = variableName.constantValue(session) as? String,
+                        mayOutliveCall = argument(MAY_OUTLIVE_CALL)
+                            ?.constantValue(session) as? Boolean ?: false,
+                    ),
+                )
+            } else {
+                argumentList.arguments.flatMap { it.effectVariableContracts(session) }
+            }
+        }
+        is FirVarargArgumentsExpression -> arguments.flatMap { it.effectVariableContracts(session) }
+        is FirNamedArgumentExpression -> expression.effectVariableContracts(session)
+        is FirSpreadArgumentExpression -> expression.effectVariableContracts(session)
+        is FirWrappedArgumentExpression -> expression.effectVariableContracts(session)
+        is FirWrappedExpression -> expression.effectVariableContracts(session)
+        else -> emptyList()
+    }
 }
 
 /**
@@ -371,6 +449,10 @@ private fun FirFunctionCall.argument(name: Name): FirExpression? {
 /** Returns the constant Boolean [name], or `null` when it cannot be evaluated. */
 private fun FirAnnotation.booleanArgument(name: Name, session: FirSession): Boolean? =
     argument(name)?.constantValue(session) as? Boolean
+
+/** Returns the constant String [name], or `null` when it cannot be evaluated. */
+private fun FirAnnotation.stringArgument(name: Name, session: FirSession): String? =
+    argument(name)?.constantValue(session) as? String
 
 /** Returns the raw annotation argument named [name], if present. */
 private fun FirAnnotation.argument(name: Name): FirExpression? =

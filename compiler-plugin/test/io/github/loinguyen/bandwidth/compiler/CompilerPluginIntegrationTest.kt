@@ -802,14 +802,21 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `keeps BeatSaver multipart callbacks sequential`() {
+    fun `substitutes a polymorphic callback effect`() {
         val result = compile(
             """
             package io.beatmaps.util
 
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffectVariable
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            fun <T, R> handleMultipart(parts: List<T>, cb: (T) -> R) = parts.map(cb)
+            @BandwidthEffect(variables = [BandwidthEffectVariable("E")])
+            fun <T, R> handleMultipart(
+                parts: List<T>,
+                @BandwidthEffect(variables = [BandwidthEffectVariable("E")])
+                cb: (T) -> R,
+            ) = parts.map(cb)
 
             @NetworkDownload(maxBytes = 450, completeTimeoutMillis = 1_000)
             fun download(part: String) = Unit
@@ -828,16 +835,26 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `invokes BeatSaver captcha callbacks once`() {
+    fun `forwards a polymorphic effect through nested wrappers`() {
         val result = compile(
             """
             package io.beatmaps.util
 
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffectVariable
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            fun <T> requireCaptcha(block: () -> T): T = block()
+            @BandwidthEffect(variables = [BandwidthEffectVariable("E")])
+            fun <T> requireCaptcha(
+                @BandwidthEffect(variables = [BandwidthEffectVariable("E")])
+                block: () -> T,
+            ): T = block()
 
-            fun <T> captchaIfPresent(block: () -> T): T = requireCaptcha(block)
+            @BandwidthEffect(variables = [BandwidthEffectVariable("E")])
+            fun <T> captchaIfPresent(
+                @BandwidthEffect(variables = [BandwidthEffectVariable("E")])
+                block: () -> T,
+            ): T = requireCaptcha(block)
 
             @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
             fun download() = Unit
@@ -856,14 +873,49 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `invokes BeatSaver generic page callbacks once`() {
+    fun `preserves inferred work inside a visible polymorphic wrapper`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffectVariable
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 425, completeTimeoutMillis = 1_000)
+            fun prepare() = Unit
+
+            @BandwidthEffect(variables = [BandwidthEffectVariable("Body")])
+            fun invokeAfterPreparing(
+                @BandwidthEffect(variables = [BandwidthEffectVariable("Body")])
+                body: () -> Unit,
+            ) {
+                prepare()
+                body()
+            }
+
+            fun load() = invokeAfterPreparing {}
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(425, 1)}")
+    }
+
+    @Test
+    fun `uses polymorphism instead of an application specific callback model`() {
         val result = compile(
             """
             package io.beatmaps
 
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffectVariable
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            fun genericPage(headerTemplate: () -> Unit) = headerTemplate()
+            @BandwidthEffect(variables = [BandwidthEffectVariable("PageEffect")])
+            fun genericPage(
+                @BandwidthEffect(variables = [BandwidthEffectVariable("PageEffect")])
+                headerTemplate: () -> Unit,
+            ) = headerTemplate()
 
             @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
             fun download() = Unit
@@ -877,6 +929,116 @@ class CompilerPluginIntegrationTest {
 
         assertEquals(0, result.exitCode, result.output)
         result.assertOutputContains("Inferred bandwidth effect for io.beatmaps.load: {(300, 1)}")
+    }
+
+    @Test
+    fun `can make a substituted callback effect outlive the call`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffectVariable
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @BandwidthEffect(
+                variables = [
+                    BandwidthEffectVariable("Task", mayOutliveCall = true),
+                ],
+            )
+            fun spawn(
+                @BandwidthEffect(variables = [BandwidthEffectVariable("Task")])
+                task: () -> Unit,
+            ) = Unit
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun fast() = Unit
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            fun slow() = Unit
+
+            fun load() {
+                spawn { fast() }
+                slow()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
+        result.assertOutputContains("ReqBW=2000 bytes/s")
+    }
+
+    @Test
+    fun `supports multiple occurrences of one effect variable`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffectVariable
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @BandwidthEffect(
+                variables = [
+                    BandwidthEffectVariable("Task", mayOutliveCall = true),
+                    BandwidthEffectVariable("Task", mayOutliveCall = true),
+                ],
+            )
+            fun spawnTwice(
+                @BandwidthEffect(variables = [BandwidthEffectVariable("Task")])
+                task: () -> Unit,
+            ) = Unit
+
+            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
+            fun download() = Unit
+
+            fun load() = spawnTwice { download() }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(700, 2)}")
+    }
+
+    @Test
+    fun `rejects an unbound polymorphic effect variable`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffectVariable
+
+            @BandwidthEffect(variables = [BandwidthEffectVariable("Missing")])
+            fun opaque() = Unit
+
+            fun load() = opaque()
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("no callback argument binds 'Missing'")
+    }
+
+    @Test
+    fun `binds an omitted optional callback to the empty effect`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffectVariable
+
+            @BandwidthEffect(variables = [BandwidthEffectVariable("Optional")])
+            fun invokeOptional(
+                @BandwidthEffect(variables = [BandwidthEffectVariable("Optional")])
+                callback: (() -> Unit)? = null,
+            ) {
+                callback?.invoke()
+            }
+
+            fun load() = invokeOptional()
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        assertFalse(result.output.contains("Cannot instantiate polymorphic effect"))
     }
 
     @Test
@@ -3051,6 +3213,38 @@ class CompilerPluginIntegrationTest {
 
         assertEquals(0, result.exitCode, result.output)
         result.assertOutputContains("Inferred bandwidth effect for caller: {(900, 1)}")
+    }
+
+    @Test
+    fun `substitutes a polymorphic latent return effect`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffectVariable
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            interface Boundary {
+                fun capture(
+                    @BandwidthEffect(variables = [BandwidthEffectVariable("Captured")])
+                    callback: () -> Unit,
+                ): @BandwidthEffect(
+                    variables = [BandwidthEffectVariable("Captured")],
+                ) (() -> Unit)
+            }
+
+            @NetworkDownload(maxBytes = 875, completeTimeoutMillis = 1_000)
+            fun download() = Unit
+
+            fun caller(boundary: Boundary) {
+                val operation = boundary.capture { download() }
+                operation()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for caller: {(875, 1)}")
     }
 
     @Test

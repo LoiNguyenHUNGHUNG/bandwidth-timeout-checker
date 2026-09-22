@@ -43,12 +43,30 @@ public annotation class BandwidthDownload(
 )
 
 /**
+ * One occurrence of a polymorphic effect in a [BandwidthEffect] contract.
+ *
+ * A named occurrence on a function-valued parameter binds the effect of the
+ * supplied callback. An occurrence with the same [name] on the enclosing
+ * function substitutes that callback effect into the function call's effect.
+ * [mayOutliveCall] conservatively changes the substituted effect's lifetime;
+ * it does not repeat the effect or impose a concurrency bound. Function-level
+ * occurrences are composed sequentially in declaration order, so a name may
+ * occur more than once when a callback is invoked more than once.
+ */
+@Retention(AnnotationRetention.BINARY)
+public annotation class BandwidthEffectVariable(
+    public val name: String,
+    public val mayOutliveCall: Boolean = false,
+)
+
+/**
  * Conservative list of download effects for an opaque function, higher-order
  * input, or returned function type whose body is unavailable to the checker.
  *
  * [rMaxBytesPerSecond] and [nMax] remain as source-compatible shorthand for one
  * completing entry. New contracts can retain rate/concurrency/lifetime
- * correlation in [downloads].
+ * correlation in [downloads]. [variables] makes a higher-order contract
+ * polymorphic in the effects of its function-valued inputs.
  */
 @Target(
     AnnotationTarget.FUNCTION,
@@ -60,6 +78,7 @@ public annotation class BandwidthEffect(
     public val rMaxBytesPerSecond: Long = 0,
     public val nMax: Int = 0,
     public val downloads: Array<BandwidthDownload> = [],
+    public val variables: Array<BandwidthEffectVariable> = [],
 )
 
 /**
