@@ -225,8 +225,10 @@ bandwidthChecker {
 The recursion-free milestone rejects unannotated recursion, unbounded escaping
 work in general loops, and effectful callbacks passed to opaque higher-order
 APIs without a parameter contract. Trusted library models cover sequential
-`forEach` callbacks and AndroidX `traceAsync`; these invoke a visible callback
-once for peak-bandwidth inference rather than treating it as concurrent work.
+collection `map`/`forEach` callbacks, calls-in-place helpers such as `use`, and
+selected application wrappers. A sequential callback may run an unknown number
+of times, but completing work from one invocation does not overlap the next;
+escaping work must still carry a self-bound.
 
 ## Candidate Android case studies
 

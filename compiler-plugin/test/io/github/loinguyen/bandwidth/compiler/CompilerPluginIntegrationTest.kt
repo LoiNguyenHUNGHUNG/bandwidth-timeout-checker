@@ -688,6 +688,198 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `keeps completing work in collection map sequential`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
+            fun download(id: String) = Unit
+
+            fun load(ids: List<String>) = ids.map { id ->
+                download(id)
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(700, 1)}")
+    }
+
+    @Test
+    fun `rejects unbounded escaping work in collection map`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+
+            interface ImageLibrary {
+                @BandwidthEffect(
+                    downloads = [
+                        BandwidthDownload(
+                            rMaxBytesPerSecond = 400,
+                            nMax = 1,
+                            mayOutliveCall = true,
+                        ),
+                    ],
+                )
+                fun start(id: String)
+            }
+
+            fun load(ids: List<String>, library: ImageLibrary) = ids.map { id ->
+                library.start(id)
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Escaping network work in repeated callback")
+        result.assertOutputContains("Use a self bound for every download")
+    }
+
+    @Test
+    fun `invokes kotlin io use callback once`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import java.io.ByteArrayInputStream
+
+            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
+            fun download() = Unit
+
+            fun load() = ByteArrayInputStream(byteArrayOf()).use {
+                download()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(600, 1)}")
+    }
+
+    @Test
+    fun `keeps completing work in mapNotNull sequential`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 650, completeTimeoutMillis = 1_000)
+            fun download(id: String) = Unit
+
+            fun load(ids: List<String>) = ids.mapNotNull { id ->
+                download(id)
+                id.takeIf { it.isNotEmpty() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(650, 1)}")
+    }
+
+    @Test
+    fun `invokes runBlocking body once`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.runBlocking
+
+            @NetworkDownload(maxBytes = 550, completeTimeoutMillis = 1_000)
+            suspend fun download() = Unit
+
+            fun load() = runBlocking {
+                download()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for load: {(550, 1)}")
+    }
+
+    @Test
+    fun `keeps BeatSaver multipart callbacks sequential`() {
+        val result = compile(
+            """
+            package io.beatmaps.util
+
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            fun <T, R> handleMultipart(parts: List<T>, cb: (T) -> R) = parts.map(cb)
+
+            @NetworkDownload(maxBytes = 450, completeTimeoutMillis = 1_000)
+            fun download(part: String) = Unit
+
+            fun load(parts: List<String>) = handleMultipart(parts) { part ->
+                download(part)
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for io.beatmaps.util.load: {(450, 1)}",
+        )
+    }
+
+    @Test
+    fun `invokes BeatSaver captcha callbacks once`() {
+        val result = compile(
+            """
+            package io.beatmaps.util
+
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            fun <T> requireCaptcha(block: () -> T): T = block()
+
+            fun <T> captchaIfPresent(block: () -> T): T = requireCaptcha(block)
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            fun download() = Unit
+
+            fun load() = captchaIfPresent {
+                download()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for io.beatmaps.util.load: {(500, 1)}",
+        )
+    }
+
+    @Test
+    fun `invokes BeatSaver generic page callbacks once`() {
+        val result = compile(
+            """
+            package io.beatmaps
+
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            fun genericPage(headerTemplate: () -> Unit) = headerTemplate()
+
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
+            fun download() = Unit
+
+            fun load() = genericPage {
+                download()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for io.beatmaps.load: {(300, 1)}")
+    }
+
+    @Test
     fun `uses an image loader bound for NIA style lazy feed items`() {
         val result = compile(
             """
