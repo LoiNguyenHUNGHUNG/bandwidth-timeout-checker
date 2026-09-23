@@ -1,6 +1,5 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
-import io.github.loinguyen.bandwidth.core.NetworkEffect
 import org.jetbrains.kotlin.fir.FirAnnotationContainer
 import org.jetbrains.kotlin.fir.FirSession
 import org.jetbrains.kotlin.fir.declarations.FirCallableDeclaration
@@ -12,7 +11,7 @@ import org.jetbrains.kotlin.fir.types.isSomeFunctionType
 
 /** Effect suspended inside a value, such as a function or lazy Flow. */
 internal data class LatentNetworkEffect(
-    val network: NetworkEffect = NetworkEffect.EMPTY,
+    val network: Effect = Effect.Empty,
     val returned: LatentNetworkEffect? = null,
 ) {
     /**
@@ -25,17 +24,25 @@ internal data class LatentNetworkEffect(
             returned = returned.join(other.returned),
         )
 
-    /** Returns the network work performed when this latent value is materialized. */
-    fun materialize(): NetworkEffect = network
+    /** Applies [substitution] recursively to this latent value. */
+    fun substitute(substitution: EffectSubstitution): LatentNetworkEffect =
+        LatentNetworkEffect(
+            network = network.substitute(substitution),
+            returned = returned?.substitute(substitution),
+        )
 }
 
 /** The effect component paired with Kotlin's already resolved type. */
 internal data class KotlinExpressionEffect(
-    val network: NetworkEffect = NetworkEffect.EMPTY,
+    val network: Effect = Effect.Empty,
     val latent: LatentNetworkEffect? = null,
 ) {
-    /** Returns the eager network effect of evaluating the expression. */
-    fun materialize(): NetworkEffect = network
+    /** Applies [substitution] to eager and latent effects. */
+    fun substitute(substitution: EffectSubstitution): KotlinExpressionEffect =
+        KotlinExpressionEffect(
+            network = network.substitute(substitution),
+            latent = latent?.substitute(substitution),
+        )
 }
 
 /**
@@ -61,7 +68,7 @@ internal fun KotlinExpressionEffect.parallel(other: KotlinExpressionEffect): Kot
 
 /** Interprocedural summary keyed by the FIR function symbol. */
 internal data class KotlinFunctionEffect(
-    val network: NetworkEffect = NetworkEffect.EMPTY,
+    val network: Effect = Effect.Empty,
     val returned: LatentNetworkEffect? = null,
 ) {
     /** Converts this interprocedural summary to a storable latent function effect. */
@@ -71,8 +78,12 @@ internal data class KotlinFunctionEffect(
             returned = returned,
         )
 
-    /** Returns the network work performed by invoking the summarized function. */
-    fun materialize(): NetworkEffect = network
+    /** Instantiates this function summary with [substitution]. */
+    fun substitute(substitution: EffectSubstitution): KotlinFunctionEffect =
+        KotlinFunctionEffect(
+            network = network.substitute(substitution),
+            returned = returned?.substitute(substitution),
+        )
 }
 
 /** Lexical environment for latent function and Flow values. */
@@ -104,7 +115,7 @@ internal class KotlinEffectContext(
         val declaration = symbol.fir
         val direct = (declaration as? FirAnnotationContainer)
             ?.effectContract(session)
-            ?.takeIf { it.variables.isEmpty() }
+            ?.takeIf { it.variable == null }
             ?.toLatentEffect()
         if (direct != null) return direct
         if (
@@ -116,7 +127,7 @@ internal class KotlinEffectContext(
         return (declaration as? FirCallableDeclaration)
             ?.returnTypeRef
             ?.effectContract(session)
-            ?.takeIf { it.variables.isEmpty() }
+            ?.takeIf { it.variable == null }
             ?.toLatentEffect()
     }
 
@@ -129,7 +140,7 @@ internal class KotlinEffectContext(
 
 /** Converts this annotation contract to a latent function-value effect. */
 internal fun EffectContract.toLatentEffect(): LatentNetworkEffect =
-    LatentNetworkEffect(network = toNetworkEffect())
+    LatentNetworkEffect(network = network.asEffect())
 
 /**
  * Null-aware conservative join for optional latent effects.

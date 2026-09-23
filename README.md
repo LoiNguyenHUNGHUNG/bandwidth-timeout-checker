@@ -60,10 +60,9 @@ fun applyNetworkCallback(
     callback: suspend () -> Unit,
 )
 
-@BandwidthEffect(variables = [BandwidthEffectVariable("E")])
+@BandwidthVariable("E")
 fun <T> invokeOnce(
-    @BandwidthEffect(variables = [BandwidthEffectVariable("E")])
-    callback: () -> T,
+    @BandwidthEffect("E") callback: () -> T,
 ): T = callback()
 
 @BoundedScope(k = 4)
@@ -118,15 +117,19 @@ an invocation may overlap later invocations, so each requires a self bound.
 Ordinary, non-repeated use does not require one. Runtime verification for a
 specific client may be added separately without changing this usage rule.
 
-`BandwidthEffectVariable("E")` gives higher-order boundaries a polymorphic
-effect contract. An occurrence on a function-valued parameter binds `E` to the
-effect of the supplied callback; an occurrence on the function substitutes the
-same effect into the call summary. Setting `mayOutliveCall = true` on the
-function occurrence changes only the substituted work's lifetime. Repetition
-and concurrency limits remain properties of the program construct or runtime
-gate rather than operations embedded in `@BandwidthEffect`. For a visible
-wrapper, the checker infers the wrapper's own concrete network work and adds the
-substituted variables. An opaque wrapper must declare that concrete work too.
+`@BandwidthVariable("E")` universally quantifies a function-scoped effect
+variable. `@BandwidthEffect("E")` assigns that latent effect to a higher-order
+input. The checker analyzes the body symbolically, infers summaries such as
+`seq(E, E)` or `par(E, F)`, and substitutes the supplied callbacks' effects at
+each call site. No symbolic annotation belongs on the whole function or result
+type: those effects are inferred from the body. Concrete `@BandwidthEffect`
+contracts remain available at opaque library boundaries.
+
+Internally, one `Effect` algebra represents both concrete pair sets and symbolic
+expressions. `seq`, `par`, and alternative choice immediately evaluate concrete
+operands and retain an expression only while variables remain. Variables denote
+whole effects, preserving the correlation between every `(rate, concurrency)`
+pair through nested generic wrappers.
 
 The frontend recognizes `while`, `do-while`, `for`/`forEach`, repeated UI
 callbacks such as button presses, and lazy scrolling/item callbacks as

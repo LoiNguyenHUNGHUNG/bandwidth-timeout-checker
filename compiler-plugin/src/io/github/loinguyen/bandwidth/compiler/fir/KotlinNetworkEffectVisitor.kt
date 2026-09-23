@@ -66,6 +66,18 @@ internal class KotlinNetworkEffectVisitor(
         latentValues: MutableMap<FirBasedSymbol<*>, LatentNetworkEffect>,
     ): KotlinFunctionEffect {
         val context = KotlinEffectContext(function, session, latentValues)
+        val variables = function.effectVariableIds(session).associateBy(EffectVariableId::name)
+        function.valueParameters.forEach { parameter ->
+            val variableName = parameter.effectContract(session)?.variable
+                ?: parameter.returnTypeRef.effectContract(session)?.variable
+                ?: return@forEach
+            variables[variableName]?.let { variable ->
+                context.bind(
+                    parameter.symbol,
+                    LatentNetworkEffect(network = Effect.Variable(variable)),
+                )
+            }
+        }
         val bodyEffect: KotlinExpressionEffect = infer(function.body, context)
         val expressionResult: LatentNetworkEffect? =
             if (function.returnTypeRef.coneType.isSomeFunctionType(session)) {
@@ -489,10 +501,10 @@ internal class KotlinNetworkEffectVisitor(
         val child = inferCoroutineBuilder(children.builderCall, context)
         val perElement = child.inputs.then(child.body ?: KotlinExpressionEffect())
         val network = perElement.network
-        if (network == NetworkEffect.EMPTY) {
+        if (network == Effect.Empty) {
             return CoroutineBuilderEffect(inputs = inputs, body = KotlinExpressionEffect())
         }
-        if (network.escapingOnly() != NetworkEffect.EMPTY) {
+        if (network.escapingOnly() != Effect.Empty) {
             problem(
                 key = "mapped-async-escaping:${context.function.displayName()}:" +
                     "${mapCall.source?.startOffset}",
@@ -573,7 +585,7 @@ internal class KotlinNetworkEffectVisitor(
                     "may overlap across an unknown number of values. Use a self bound for " +
                     "every download.",
             )
-        } ?: NetworkEffect.EMPTY
+        } ?: Effect.Empty
         return evaluatedInputs.copy(
             latent = LatentNetworkEffect(network = sourceNetwork),
         )
@@ -701,7 +713,7 @@ internal class KotlinNetworkEffectVisitor(
         }
 
         val bodyNetwork = body.network
-        if (bodyNetwork == NetworkEffect.EMPTY) {
+        if (bodyNetwork == Effect.Empty) {
             return evaluatedInputs.copy(latent = body.returned)
         }
 
@@ -757,7 +769,7 @@ internal class KotlinNetworkEffectVisitor(
         }
         return evaluatedInputs.then(
             KotlinExpressionEffect(
-                network = flow?.network ?: NetworkEffect.EMPTY,
+                network = flow?.network ?: Effect.Empty,
             ),
         )
     }
@@ -851,7 +863,7 @@ internal class KotlinNetworkEffectVisitor(
         val invokedCallbacks = argumentEffects.fold(KotlinExpressionEffect()) { effect, argument ->
             effect.then(
                 KotlinExpressionEffect(
-                    network = argument.latent?.network ?: NetworkEffect.EMPTY,
+                    network = argument.latent?.network ?: Effect.Empty,
                 ),
             )
         }
@@ -900,7 +912,7 @@ internal class KotlinNetworkEffectVisitor(
                 }
             }
         val bodyNetwork = callbackBody.network
-        if (bodyNetwork == NetworkEffect.EMPTY) return evaluatedInputs
+        if (bodyNetwork == Effect.Empty) return evaluatedInputs
 
         val repeatedBody = if (policy.invocationsMayOverlap) {
             bodyNetwork.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
@@ -1012,7 +1024,7 @@ internal class KotlinNetworkEffectVisitor(
         val body = lambda.anonymousFunction.body
         return body?.let { inferCoroutineStatements(it, context) }
             ?: KotlinExpressionEffect(
-                network = infer(lambda, context).latent?.network ?: NetworkEffect.EMPTY,
+                network = infer(lambda, context).latent?.network ?: Effect.Empty,
             )
     }
 
@@ -1202,7 +1214,7 @@ internal class KotlinNetworkEffectVisitor(
      */
     private fun functionSummary(
         target: FirFunction,
-        effectBindings: Map<String, NetworkEffect> = emptyMap(),
+        effectBindings: EffectSubstitution = EffectSubstitution.EMPTY,
         call: FirFunctionCall? = null,
         context: KotlinEffectContext? = null,
     ): KotlinFunctionEffect {
@@ -1211,80 +1223,61 @@ internal class KotlinNetworkEffectVisitor(
                 network = NetworkEffect.download(
                     maxBytes = contract.maxBytes,
                     completeTimeoutMillis = contract.completeTimeoutMillis,
-                ),
+                ).asEffect(),
             )
         }
 
         val invocationContract = target.effectContract(session)
         val returnedContract = target.returnTypeRef.effectContract(session)
+        val variables = target.effectVariableIds(session)
         val returnsFunction =
             target.returnTypeRef.coneType.isSomeFunctionType(session)
-        val needsPolymorphicBase =
-            invocationContract?.variables?.isNotEmpty() == true &&
-                invocationContract.network == NetworkEffect.EMPTY
         val needsVisibleBody =
             invocationContract == null ||
-                needsPolymorphicBase ||
+                variables.isNotEmpty() ||
                 (returnsFunction && returnedContract == null)
         val shouldInfer = target.body != null && needsVisibleBody
         val inferred = if (shouldInfer) inferFunction(target) else null
-        val invocationNetwork = invocationContract?.let { contract ->
-            val base = if (
-                contract.variables.isNotEmpty() &&
-                contract.network == NetworkEffect.EMPTY
-            ) {
-                inferred?.network ?: NetworkEffect.EMPTY
+        val symbolic = KotlinFunctionEffect(
+            network = if (variables.isNotEmpty()) {
+                inferred?.network ?: Effect.Empty
             } else {
-                contract.network
-            }
-            contract.instantiate(effectBindings, base) ?: run {
-                val unbound = contract.variables
-                    .map { it.name }
-                    .filterNot(effectBindings::containsKey)
-                    .distinct()
-                if (unbound.isNotEmpty() && call != null && context != null) {
-                    problem(
-                        key = "unbound-effect-variable:${context.function.displayName()}:" +
-                            "${call.source?.startOffset}:${unbound.joinToString()}",
-                        source = call.source ?: context.function.source,
-                        message = "Cannot instantiate polymorphic effect of " +
-                            "${target.displayName()}; no callback argument binds " +
-                            unbound.joinToString(prefix = "'", postfix = "'", separator = "', '"),
-                    )
-                }
-                contract.network
-            }
-        }
-        val returnedNetwork = returnedContract?.instantiate(effectBindings)
-        if (
-            returnedContract != null &&
-            returnedNetwork == null &&
-            call != null &&
-            context != null
-        ) {
-            val unbound = returnedContract.variables
-                .map { it.name }
-                .filterNot(effectBindings::containsKey)
-                .distinct()
+                invocationContract?.network?.asEffect()
+                    ?: inferred?.network
+                    ?: Effect.Empty
+            },
+            returned = returnedContract?.let {
+                LatentNetworkEffect(network = it.network.asEffect())
+            } ?: inferred?.returned,
+        )
+        val instantiated = symbolic.substitute(effectBindings)
+        if (call != null && context != null) {
+            val unbound = buildSet {
+                addAll(instantiated.network.freeVariables())
+                instantiated.returned?.network?.freeVariables()?.let(::addAll)
+            }.filter { it.owner == target.symbol }
             if (unbound.isNotEmpty()) {
                 problem(
-                    key = "unbound-returned-effect-variable:" +
-                        "${context.function.displayName()}:${call.source?.startOffset}:" +
-                        unbound.joinToString(),
+                    key = "unbound-effect-variable:${context.function.displayName()}:" +
+                        "${call.source?.startOffset}:${unbound.joinToString { it.name }}",
                     source = call.source ?: context.function.source,
-                    message = "Cannot instantiate polymorphic returned effect of " +
+                    message = "Cannot instantiate polymorphic effect of " +
                         "${target.displayName()}; no callback argument binds " +
-                        unbound.joinToString(prefix = "'", postfix = "'", separator = "', '"),
+                        unbound.joinToString(prefix = "'", postfix = "'", separator = "', '") {
+                            it.name
+                        },
+                )
+            }
+            instantiated.network.invalidMessage()?.let { message ->
+                problem(
+                    key = "invalid-instantiated-effect:${context.function.displayName()}:" +
+                        call.source?.startOffset,
+                    source = call.source ?: context.function.source,
+                    message = message,
                 )
             }
         }
-        return KotlinFunctionEffect(
-            network = invocationNetwork
-                ?: inferred?.network
-                ?: NetworkEffect.EMPTY,
-            returned = returnedNetwork?.let { LatentNetworkEffect(network = it) }
-                ?: inferred?.returned,
-        )
+        return instantiated
     }
 
     /**
@@ -1296,12 +1289,13 @@ internal class KotlinNetworkEffectVisitor(
         target: FirFunction,
         argumentEffects: Map<FirValueParameter, KotlinExpressionEffect>,
         context: KotlinEffectContext,
-    ): Map<String, NetworkEffect> {
+    ): EffectSubstitution {
         // launch/async are handled by structured coroutine rules, including
         // their visible lambda bodies. They are not ordinary library callback
         // contracts.
-        if (target.isCoroutineBuilder()) return emptyMap()
-        val bindings = mutableMapOf<String, NetworkEffect>()
+        if (target.isCoroutineBuilder()) return EffectSubstitution.EMPTY
+        val variables = target.effectVariableIds(session).associateBy(EffectVariableId::name)
+        val bindings = mutableMapOf<EffectVariableId, Effect>()
         target.valueParameters.forEach { parameter ->
             if (!parameter.returnTypeRef.coneType.isSomeFunctionType(session)) {
                 return@forEach
@@ -1311,14 +1305,16 @@ internal class KotlinNetworkEffectVisitor(
                     ?: parameter.returnTypeRef.effectContract(session)
             val suppliedArgument = argumentEffects[parameter]
             if (suppliedArgument == null) {
-                contract?.variables?.forEach { variable ->
-                    bindings[variable.name] = NetworkEffect.EMPTY
+                contract?.variable?.let { variableName ->
+                    variables[variableName]?.let { variable ->
+                        bindings[variable] = Effect.Empty
+                    }
                 }
                 return@forEach
             }
             val actual = suppliedArgument.latent ?: LatentNetworkEffect()
             if (contract == null) {
-                if (actual.materialize() != NetworkEffect.EMPTY) {
+                if (actual.network != Effect.Empty) {
                     problem(
                         key = "higher-order-argument:${context.function.displayName()}:" +
                             "${call.source?.startOffset}:${parameter.name}",
@@ -1331,9 +1327,10 @@ internal class KotlinNetworkEffectVisitor(
                 return@forEach
             }
 
-            val actualEffect = actual.materialize()
-            contract.variables.forEach { variable ->
-                val existing = bindings[variable.name]
+            val actualEffect = actual.network
+            contract.variable?.let { variableName ->
+                val variable = variables[variableName] ?: return@let
+                val existing = bindings[variable]
                 if (existing != null && existing != actualEffect) {
                     problem(
                         key = "effect-variable-conflict:${context.function.displayName()}:" +
@@ -1342,28 +1339,28 @@ internal class KotlinNetworkEffectVisitor(
                         message = "Effect variable '${variable.name}' is bound to different " +
                             "callback effects at the same call site.",
                     )
-                    bindings[variable.name] = existing.choice(actualEffect)
+                    bindings[variable] = existing.choice(actualEffect)
                 } else {
-                    bindings[variable.name] = actualEffect
+                    bindings[variable] = actualEffect
                 }
             }
 
             val declaredEffect = contract.network
             if (
                 declaredEffect != NetworkEffect.EMPTY &&
-                !actualEffect.isCoveredBy(declaredEffect)
+                actualEffect.concreteOrNull()?.isCoveredBy(declaredEffect) == false
             ) {
                 problem(
                     key = "higher-order-contract:${context.function.displayName()}:" +
                         "${call.source?.startOffset}:${parameter.name}",
                     source = call.source ?: context.function.source,
-                    message = "Higher-order argument effect ${actual.materialize().render()} is " +
+                    message = "Higher-order argument effect ${actualEffect.render()} is " +
                         "not covered by @BandwidthEffect contract " +
                         "${declaredEffect.render()} on parameter '${parameter.name}'.",
                 )
             }
         }
-        return bindings
+        return EffectSubstitution(bindings)
     }
 
     /**
@@ -1384,7 +1381,7 @@ internal class KotlinNetworkEffectVisitor(
         }
         val oneIteration = sequence(iterationExpressions.map { infer(it, context) })
         val iterationNetwork = oneIteration.network
-        if (iterationNetwork == NetworkEffect.EMPTY) return KotlinExpressionEffect()
+        if (iterationNetwork == Effect.Empty) return KotlinExpressionEffect()
 
         val repeated = repeatNetworkEffect(
             effect = iterationNetwork,
@@ -1399,12 +1396,13 @@ internal class KotlinNetworkEffectVisitor(
 
     /** Applies the core repetition rule and reports missing escaping bounds. */
     private fun repeatNetworkEffect(
-        effect: NetworkEffect,
+        effect: Effect,
         key: String,
         source: KtSourceElement?,
         missingBoundMessage: String,
-    ): NetworkEffect {
-        if (!effect.canRepeat) {
+    ): Effect {
+        val concrete = effect.concreteOrNull()
+        if (concrete != null && !concrete.canRepeat) {
             problem(
                 key = key,
                 source = source,
@@ -1412,7 +1410,7 @@ internal class KotlinNetworkEffectVisitor(
             )
             return effect
         }
-        return effect.repeat()
+        return effect.repeat(missingBoundMessage)
     }
 
     /**
@@ -1421,12 +1419,12 @@ internal class KotlinNetworkEffectVisitor(
      * of work that escapes a body.
      */
     private fun boundedRepeatedNetworkEffect(
-        effect: NetworkEffect,
+        effect: Effect,
         maxConcurrentBodies: Int,
         key: String,
         source: KtSourceElement?,
         missingBoundMessage: String,
-    ): NetworkEffect {
+    ): Effect {
         val repeated = repeatNetworkEffect(
             effect = effect,
             key = key,
