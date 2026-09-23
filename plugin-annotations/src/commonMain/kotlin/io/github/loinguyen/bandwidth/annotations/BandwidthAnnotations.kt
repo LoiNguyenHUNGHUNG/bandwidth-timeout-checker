@@ -46,9 +46,9 @@ public annotation class BandwidthDownload(
  * Universally quantifies the named bandwidth-effect variables of a function.
  *
  * Each name is scoped to the annotated function, just as a type parameter is
- * scoped to its declaration. A higher-order parameter refers to a quantified
- * variable with `@BandwidthEffect("E")`. The checker infers the function's
- * symbolic effect from its body and substitutes callback effects at call sites.
+ * scoped to its declaration. Higher-order parameters and opaque invocation
+ * contracts refer to quantified variables with `@BandwidthEffect("E")`. The
+ * checker substitutes callback effects for those variables at call sites.
  */
 @Target(AnnotationTarget.FUNCTION)
 @Retention(AnnotationRetention.BINARY)
@@ -60,10 +60,13 @@ public annotation class BandwidthVariable(
  * Conservative list of download effects for an opaque function, higher-order
  * input, or returned function type whose body is unavailable to the checker.
  *
- * A non-empty [variable] assigns a quantified latent effect to a higher-order
- * input. Concrete contracts use [rMaxBytesPerSecond], [nMax], or [downloads].
- * The checker infers effects for function bodies and returned function values;
- * effect variables therefore belong only on higher-order inputs.
+ * A non-empty [variable] assigns a quantified effect to a higher-order input or
+ * to the invocation of an opaque function. For example, placing
+ * `@BandwidthEffect("E")` on both an `install` function and its callback
+ * parameter gives it the type `(A -[E]-> B) -[E]-> Unit`. Declaration-level
+ * symbolic contracts are trusted library boundaries; ordinary visible
+ * polymorphic functions should omit them and let the checker infer their body.
+ * Concrete contracts use [rMaxBytesPerSecond], [nMax], or [downloads].
  */
 @Target(
     AnnotationTarget.FUNCTION,
@@ -77,6 +80,19 @@ public annotation class BandwidthEffect(
     public val nMax: Int = 0,
     public val downloads: Array<BandwidthDownload> = [],
 )
+
+/**
+ * Marks a callback expression that a framework retains and may invoke
+ * repeatedly and concurrently after the registration expression returns.
+ *
+ * The callback body is converted to long-lived work and passed through the
+ * checker's ordinary unknown-repetition rule. Consequently, every network
+ * operation in the callback must obtain a finite self bound from a visible
+ * semaphore, bounded client, or another trusted runtime limit.
+ */
+@Target(AnnotationTarget.EXPRESSION)
+@Retention(AnnotationRetention.SOURCE)
+public annotation class Handler
 
 /**
  * Programmer assertion that the annotated try/catch expression implements

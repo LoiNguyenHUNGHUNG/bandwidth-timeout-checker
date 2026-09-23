@@ -1077,22 +1077,168 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `rejects a symbolic annotation on the whole function`() {
+    fun `uses a symbolic invocation contract on an opaque higher-order function`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
             import io.github.loinguyen.bandwidth.annotations.BandwidthVariable
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @BandwidthVariable("E")
-            @BandwidthEffect("E")
-            fun invoke(@BandwidthEffect("E") callback: () -> Unit) = callback()
+            interface Installer {
+                @BandwidthVariable("E")
+                @BandwidthEffect("E")
+                fun install(@BandwidthEffect("E") configure: () -> Unit)
+            }
+
+            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
+            fun download() = Unit
+
+            fun configure(installer: Installer) {
+                installer.install { download() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred bandwidth effect for configure: {(800, 1)}",
+        )
+    }
+
+    @Test
+    fun `rejects an undeclared symbolic invocation effect`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+
+            @BandwidthEffect("Missing")
+            fun install(callback: () -> Unit) = Unit
             """,
         )
 
         assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains(
-            "Symbolic @BandwidthEffect variables belong only on higher-order inputs",
+        result.assertOutputContains("Effect variable 'Missing' is not declared")
+    }
+
+    @Test
+    fun `models an annotated retained handler through the repetition rule`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.Handler
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            class Client
+
+            fun register(callback: () -> Unit) = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            fun Client.download() = Unit
+
+            fun configure(@BoundedClient(k = 3) client: Client) {
+                register(@Handler { client.download() })
+            }
+            """,
+            reportEffects = true,
         )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for configure: {(900, 3)}")
+        result.assertOutputContains("ReqBW=2700 bytes/s")
+    }
+
+    @Test
+    fun `rejects an annotated retained handler without a runtime bound`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.Handler
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            fun register(callback: () -> Unit) = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            fun download() = Unit
+
+            fun configure() {
+                register(@Handler { download() })
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("concurrent repeated callback @Handler callback")
+        result.assertOutputContains("Use a self bound for every download")
+    }
+
+    @Test
+    fun `uses a handler semaphore as the repeated invocation bound`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.Handler
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            val handlerSlots = Semaphore(permits = 3)
+
+            fun register(callback: suspend () -> Unit) = Unit
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun download() = Unit
+
+            fun configure() {
+                register(@Handler {
+                    handlerSlots.withPermit { download() }
+                })
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for configure: {(900, 3)}")
+        result.assertOutputContains("ReqBW=2700 bytes/s")
+    }
+
+    @Test
+    fun `composes an invoke-once install contract with a nested retained handler`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthVariable
+            import io.github.loinguyen.bandwidth.annotations.BoundedClient
+            import io.github.loinguyen.bandwidth.annotations.Handler
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            interface Installer {
+                @BandwidthVariable("E")
+                @BandwidthEffect("E")
+                fun install(@BandwidthEffect("E") configure: () -> Unit)
+            }
+
+            class Client
+
+            fun retain(callback: () -> Unit) = Unit
+
+            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
+            fun Client.authenticate() = Unit
+
+            fun configure(
+                installer: Installer,
+                @BoundedClient(k = 3) client: Client,
+            ) {
+                installer.install {
+                    retain(@Handler { client.authenticate() })
+                }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for configure: {(600, 3)}")
+        result.assertOutputContains("ReqBW=1800 bytes/s")
     }
 
     @Test
