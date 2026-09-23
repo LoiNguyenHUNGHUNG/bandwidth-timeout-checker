@@ -120,14 +120,30 @@ internal class KotlinNetworkEffectVisitor(
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = KotlinExpressionEffect()
 
-    /** Wraps a visible anonymous function's summary as a latent value. */
+    /**
+     * Wraps an ordinary anonymous function as a latent value. A `@Handler`
+     * expression instead materializes a retained, concurrently repeated
+     * callback at the registration site.
+     */
     override fun visitAnonymousFunctionExpression(
         anonymousFunctionExpression: FirAnonymousFunctionExpression,
         data: KotlinEffectContext,
-    ): KotlinExpressionEffect =
-        KotlinExpressionEffect(
-            latent = inferFunction(anonymousFunctionExpression.anonymousFunction).asLatent(),
+    ): KotlinExpressionEffect {
+        val function = anonymousFunctionExpression.anonymousFunction
+        val summary = inferFunction(function)
+        if (!function.isHandler(session)) {
+            return KotlinExpressionEffect(latent = summary.asLatent())
+        }
+        val handlerEffect = repeatedCallbackNetwork(
+            bodyNetwork = summary.network,
+            callbackName = "@Handler callback",
+            key = "annotated-handler:${data.function.displayName()}:" +
+                anonymousFunctionExpression.source?.startOffset,
+            source = anonymousFunctionExpression.source ?: data.function.source,
+            policy = RepeatedCallbackPolicy.RETAINED_CONCURRENT,
         )
+        return KotlinExpressionEffect(network = handlerEffect)
+    }
 
     /**
      * Evaluates a callable reference's receivers and returns the target summary
@@ -913,7 +929,28 @@ internal class KotlinNetworkEffectVisitor(
             }
         val bodyNetwork = callbackBody.network
         if (bodyNetwork == Effect.Empty) return evaluatedInputs
+        val invocationEffect = repeatedCallbackNetwork(
+            bodyNetwork = bodyNetwork,
+            callbackName = target.displayName(),
+            key = "repeated-network:${context.function.displayName()}:" +
+                call.source?.startOffset,
+            source = call.source ?: context.function.source,
+            policy = policy,
+        )
+        return evaluatedInputs.then(
+            KotlinExpressionEffect(network = invocationEffect),
+        )
+    }
 
+    /** Applies one recognized callback invocation policy to its body effect. */
+    private fun repeatedCallbackNetwork(
+        bodyNetwork: Effect,
+        callbackName: String,
+        key: String,
+        source: KtSourceElement?,
+        policy: RepeatedCallbackPolicy,
+    ): Effect {
+        if (bodyNetwork == Effect.Empty) return Effect.Empty
         val repeatedBody = if (policy.invocationsMayOverlap) {
             bodyNetwork.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
         } else {
@@ -921,27 +958,23 @@ internal class KotlinNetworkEffectVisitor(
         }
         val repeated = repeatNetworkEffect(
             effect = repeatedBody,
-            key = "repeated-network:${context.function.displayName()}:" +
-                call.source?.startOffset,
-            source = call.source ?: context.function.source,
+            key = key,
+            source = source,
             missingBoundMessage = if (policy.invocationsMayOverlap) {
-                "Network work in concurrent repeated callback ${target.displayName()} may " +
-                    "overlap across an unknown number of invocations. Use a self bound for " +
-                    "every download."
+                "Network work in concurrent repeated callback $callbackName may overlap " +
+                    "across an unknown number of invocations. Use a self bound for every " +
+                    "download."
             } else {
-                "Escaping network work in repeated callback ${target.displayName()} may " +
-                    "overlap across an unknown number of invocations. Use a self bound for " +
-                    "every download."
+                "Escaping network work in repeated callback $callbackName may overlap " +
+                    "across an unknown number of invocations. Use a self bound for every " +
+                    "download."
             },
         )
-        val invocationEffect = if (policy.mayOutliveCall) {
+        return if (policy.mayOutliveCall) {
             repeated.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
         } else {
             repeated
         }
-        return evaluatedInputs.then(
-            KotlinExpressionEffect(network = invocationEffect),
-        )
     }
 
     /**
@@ -1228,24 +1261,21 @@ internal class KotlinNetworkEffectVisitor(
         }
 
         val invocationContract = target.effectContract(session)
+        val symbolicInvocation = target.symbolicInvocationEffect(session)
         val returnedContract = target.returnTypeRef.effectContract(session)
         val variables = target.effectVariableIds(session)
         val returnsFunction =
             target.returnTypeRef.coneType.isSomeFunctionType(session)
         val needsVisibleBody =
             invocationContract == null ||
-                variables.isNotEmpty() ||
                 (returnsFunction && returnedContract == null)
         val shouldInfer = target.body != null && needsVisibleBody
         val inferred = if (shouldInfer) inferFunction(target) else null
         val symbolic = KotlinFunctionEffect(
-            network = if (variables.isNotEmpty()) {
-                inferred?.network ?: Effect.Empty
-            } else {
-                invocationContract?.network?.asEffect()
-                    ?: inferred?.network
-                    ?: Effect.Empty
-            },
+            network = symbolicInvocation
+                ?: invocationContract?.network?.asEffect()
+                ?: inferred?.network
+                ?: Effect.Empty,
             returned = returnedContract?.let {
                 LatentNetworkEffect(network = it.network.asEffect())
             } ?: inferred?.returned,
@@ -1488,11 +1518,9 @@ internal class KotlinNetworkEffectVisitor(
         val mapping = (argumentList as? FirResolvedArgumentList)?.mapping ?: return emptyMap()
         return buildMap {
             mapping.forEach { (argument, parameter) ->
-                val effect = argument.visibleLambda()?.let { lambda ->
-                    KotlinExpressionEffect(
-                        latent = inferFunction(lambda.anonymousFunction).asLatent(),
-                    )
-                } ?: effectOf(argument)
+                // Route every argument through the ordinary visitor so
+                // expression-level policies such as @Handler are preserved.
+                val effect = effectOf(argument)
                 put(parameter, get(parameter)?.let { thenValue(it, effect) } ?: effect)
             }
         }

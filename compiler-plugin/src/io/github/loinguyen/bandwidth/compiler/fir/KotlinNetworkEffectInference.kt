@@ -150,6 +150,9 @@ internal class KotlinNetworkEffectInference(
                 ).asEffect(),
             )
         }
+        function.symbolicInvocationEffect(session)?.let { contract ->
+            return KotlinFunctionEffect(network = contract)
+        }
         inferredEffects[function.symbol]?.let { return it }
         if (!functionsBeingInferred.add(function.symbol)) {
             problem(

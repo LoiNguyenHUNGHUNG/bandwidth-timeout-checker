@@ -65,6 +65,16 @@ fun <T> invokeOnce(
     @BandwidthEffect("E") callback: () -> T,
 ): T = callback()
 
+interface Installer {
+    @BandwidthVariable("E")
+    @BandwidthEffect("E")
+    fun install(@BandwidthEffect("E") configure: () -> Unit)
+}
+
+fun registerAuthentication() {
+    retain(@Handler { boundedClient.authenticate() })
+}
+
 @BoundedScope(k = 4)
 val downloadScope = viewModelScope
 
@@ -119,11 +129,19 @@ specific client may be added separately without changing this usage rule.
 
 `@BandwidthVariable("E")` universally quantifies a function-scoped effect
 variable. `@BandwidthEffect("E")` assigns that latent effect to a higher-order
-input. The checker analyzes the body symbolically, infers summaries such as
-`seq(E, E)` or `par(E, F)`, and substitutes the supplied callbacks' effects at
-each call site. No symbolic annotation belongs on the whole function or result
-type: those effects are inferred from the body. Concrete `@BandwidthEffect`
-contracts remain available at opaque library boundaries.
+input. The checker analyzes visible bodies symbolically, infers summaries such
+as `seq(E, E)` or `par(E, F)`, and substitutes the supplied callbacks' effects
+at each call site. An opaque declaration can also carry
+`@BandwidthEffect("E")`, giving a contract such as
+`forall E. (A -[E]-> B) -[E]-> Unit`. This declaration-level contract is a
+trusted library boundary. Returned function effects remain inferred from
+visible bodies or use a concrete return-type contract.
+
+`@Handler` marks a callback expression retained by a framework and potentially
+invoked repeatedly and concurrently. Its body becomes long-lived and crosses
+the ordinary unknown-repetition rule. The annotation does not invent a
+capacity: every network operation in the callback still needs a visible
+semaphore, `@BoundedClient`, or another trusted runtime self bound.
 
 Internally, one `Effect` algebra represents both concrete pair sets and symbolic
 expressions. `seq`, `par`, and alternative choice immediately evaluate concrete
@@ -217,14 +235,16 @@ For now, `@BandwidthAlternative` is a trusted assertion attached to the whole
 This avoids assigning zero bandwidth to `try { download() } catch { showError() }`
 before the alternative relation is formalized.
 
-Visible function bodies are inferred. A `@BandwidthEffect` on a visible function
-is checked as an interface contract, including lifetime, while calls across
-opaque boundaries use the declared effect list. An unannotated higher-order
-parameter is a trusted non-network contract. Annotate a parameter that may carry
-network work; visible callback bodies are checked against that declaration, and
-an effectful callback passed to an unannotated boundary is rejected. Function
-values whose bodies are not recoverable from FIR are likewise treated as
-trusted non-network values unless their declaration or type is annotated.
+Visible function bodies are inferred. A concrete `@BandwidthEffect` on a
+visible function is checked as an interface contract, including lifetime,
+while calls across opaque boundaries use the declared effect list. A symbolic
+declaration-level contract is a trusted opaque adapter and replaces body
+inference for that declaration. An unannotated higher-order parameter is a
+trusted non-network contract. Annotate a parameter that may carry network work;
+visible callback bodies are checked against that declaration, and an effectful
+callback passed to an unannotated boundary is rejected. Function values whose
+bodies are not recoverable from FIR are likewise treated as trusted non-network
+values unless their declaration or type is annotated.
 
 Higher-order effects remain latent while lambdas and function references are
 stored, aliased, returned, or captured, and are charged only when the function

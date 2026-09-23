@@ -90,14 +90,17 @@ Annotations are required only where inference cannot see enough:
    that runtime configuration establishes a finite limit.
    `(rMaxBytesPerSecond, nMax)` remains one-entry shorthand.
 4. `@BandwidthVariable("E")` on a polymorphic higher-order function and
-   `@BandwidthEffect("E")` on each input that binds `E`. The body determines
-   the function and returned-value effects; substitutions are inferred at call
-   sites.
+   `@BandwidthEffect("E")` on each input that binds `E`. A visible body
+   determines its symbolic effect. An opaque declaration may additionally use
+   `@BandwidthEffect("E")` as a trusted invocation contract, for example
+   `forall E. (A -[E]-> B) -[E]-> Unit`.
 5. `@BoundedClient(k)` on a client whose runtime configuration establishes the
    same concurrency limit.
 6. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
    enforce the stated launch bound.
-7. `@BandwidthAlternative` on a whole `try/catch` expression when the
+7. `@Handler` on a retained callback expression. The body is modeled as
+   concurrent, repeated, long-lived work and must expose a finite self bound.
+8. `@BandwidthAlternative` on a whole `try/catch` expression when the
    programmer asserts that its network branches are comparable alternatives.
 
 The MVP has no priorities and no download identifiers.

@@ -35,6 +35,8 @@ internal val BANDWIDTH_EFFECT_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BandwidthEffect"))
 internal val BANDWIDTH_VARIABLE_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BandwidthVariable"))
+internal val HANDLER_ANNOTATION: ClassId =
+    ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.Handler"))
 internal val BOUNDED_SCOPE_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BoundedScope"))
 internal val BOUNDED_CLIENT_ANNOTATION: ClassId =
@@ -157,6 +159,20 @@ internal fun FirFunction.effectVariableIds(session: FirSession): List<EffectVari
             )
         }
 
+/** Resolves a declaration-level symbolic invocation contract in its binder scope. */
+internal fun FirFunction.symbolicInvocationEffect(session: FirSession): Effect? {
+    val variableName = effectContract(session)?.variable ?: return null
+    val variable = effectVariableIds(session).firstOrNull { it.name == variableName }
+        ?: return Effect.Invalid(
+            "Effect variable '$variableName' is not declared by @BandwidthVariable.",
+        )
+    return Effect.Variable(variable)
+}
+
+/** Returns whether this anonymous function is a retained, repeated handler. */
+internal fun FirFunction.isHandler(session: FirSession): Boolean =
+    annotation(HANDLER_ANNOTATION, session) != null
+
 /**
  * Parses a positive `@BoundedClient` declaration from this container.
  *
@@ -267,12 +283,12 @@ internal fun FirDeclaration.validateBandwidthAnnotations(
         val declared = effectVariableIds(session)
         val declaredByName = declared.associateBy(EffectVariableId::name)
         val functionVariable = effectContract(session)?.variable
-        if (functionVariable != null) {
+        if (functionVariable != null && functionVariable !in declaredByName) {
             add(
                 AnnotationProblem(
                     effect?.source ?: source,
-                    "Symbolic @BandwidthEffect variables belong only on higher-order inputs; " +
-                        "the checker infers the whole function effect.",
+                    "Effect variable '$functionVariable' is not declared by " +
+                        "@BandwidthVariable on ${symbol.callableId.callableName}.",
                 ),
             )
         }
