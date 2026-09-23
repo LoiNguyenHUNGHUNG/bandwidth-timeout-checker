@@ -1,11 +1,9 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
-import io.github.loinguyen.bandwidth.core.NetworkEffect
-
 /** Accumulates sequential phases inside one structured coroutine scope. */
 internal class CoroutinePhaseState<Handle : Any> {
     private var result: KotlinExpressionEffect = KotlinExpressionEffect()
-    private var escaping: NetworkEffect = NetworkEffect.EMPTY
+    private var escaping: Effect = Effect.Empty
     private var lastLatent: LatentNetworkEffect? = null
     private val activeChildren = linkedMapOf<Handle, KotlinExpressionEffect>()
     private val untrackedChildren = mutableListOf<KotlinExpressionEffect>()

@@ -43,12 +43,27 @@ public annotation class BandwidthDownload(
 )
 
 /**
+ * Universally quantifies the named bandwidth-effect variables of a function.
+ *
+ * Each name is scoped to the annotated function, just as a type parameter is
+ * scoped to its declaration. A higher-order parameter refers to a quantified
+ * variable with `@BandwidthEffect("E")`. The checker infers the function's
+ * symbolic effect from its body and substitutes callback effects at call sites.
+ */
+@Target(AnnotationTarget.FUNCTION)
+@Retention(AnnotationRetention.BINARY)
+public annotation class BandwidthVariable(
+    public vararg val names: String,
+)
+
+/**
  * Conservative list of download effects for an opaque function, higher-order
  * input, or returned function type whose body is unavailable to the checker.
  *
- * [rMaxBytesPerSecond] and [nMax] remain as source-compatible shorthand for one
- * completing entry. New contracts can retain rate/concurrency/lifetime
- * correlation in [downloads].
+ * A non-empty [variable] assigns a quantified latent effect to a higher-order
+ * input. Concrete contracts use [rMaxBytesPerSecond], [nMax], or [downloads].
+ * The checker infers effects for function bodies and returned function values;
+ * effect variables therefore belong only on higher-order inputs.
  */
 @Target(
     AnnotationTarget.FUNCTION,
@@ -57,6 +72,7 @@ public annotation class BandwidthDownload(
 )
 @Retention(AnnotationRetention.BINARY)
 public annotation class BandwidthEffect(
+    public val variable: String = "",
     public val rMaxBytesPerSecond: Long = 0,
     public val nMax: Int = 0,
     public val downloads: Array<BandwidthDownload> = [],

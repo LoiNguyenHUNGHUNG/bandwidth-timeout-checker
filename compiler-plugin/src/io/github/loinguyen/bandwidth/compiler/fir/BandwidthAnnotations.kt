@@ -7,6 +7,8 @@ import org.jetbrains.kotlin.fir.FirAnnotationContainer
 import org.jetbrains.kotlin.fir.FirSession
 import org.jetbrains.kotlin.fir.declarations.FirCallableDeclaration
 import org.jetbrains.kotlin.fir.declarations.FirDeclaration
+import org.jetbrains.kotlin.fir.declarations.FirFunction
+import org.jetbrains.kotlin.fir.declarations.FirValueParameter
 import org.jetbrains.kotlin.fir.declarations.getAnnotationByClassId
 import org.jetbrains.kotlin.fir.expressions.FirAnnotation
 import org.jetbrains.kotlin.fir.expressions.FirExpression
@@ -22,6 +24,8 @@ import org.jetbrains.kotlin.fir.declarations.evaluateAs
 import org.jetbrains.kotlin.name.ClassId
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.name.Name
+import org.jetbrains.kotlin.fir.types.coneType
+import org.jetbrains.kotlin.fir.types.isSomeFunctionType
 
 internal val NETWORK_DOWNLOAD_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.NetworkDownload"))
@@ -29,6 +33,8 @@ internal val ENTRY_POINT_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.EntryPoint"))
 internal val BANDWIDTH_EFFECT_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BandwidthEffect"))
+internal val BANDWIDTH_VARIABLE_ANNOTATION: ClassId =
+    ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BandwidthVariable"))
 internal val BOUNDED_SCOPE_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BoundedScope"))
 internal val BOUNDED_CLIENT_ANNOTATION: ClassId =
@@ -39,6 +45,8 @@ private val COMPLETE_TIMEOUT_MILLIS: Name = Name.identifier("completeTimeoutMill
 private val R_MAX_BYTES_PER_SECOND: Name = Name.identifier("rMaxBytesPerSecond")
 private val N_MAX: Name = Name.identifier("nMax")
 private val DOWNLOADS: Name = Name.identifier("downloads")
+private val VARIABLE: Name = Name.identifier("variable")
+private val NAMES: Name = Name.identifier("names")
 private val MAY_OUTLIVE_CALL: Name = Name.identifier("mayOutliveCall")
 private val SELF_BOUND: Name = Name.identifier("selfBound")
 private val K: Name = Name.identifier("k")
@@ -50,6 +58,7 @@ internal data class DownloadContract(
 
 internal data class EffectContract(
     val network: NetworkEffect,
+    val variable: String?,
 )
 
 private data class BandwidthDownloadContract(
@@ -131,8 +140,22 @@ internal fun FirAnnotationContainer.effectContract(session: FirSession): EffectC
     }
     return EffectContract(
         effects.fold(NetworkEffect.EMPTY) { result, effect -> result.choice(effect) },
+        annotation.stringArgument(VARIABLE, session)?.takeIf(String::isNotBlank),
     )
 }
+
+/** Returns the function-scoped variables introduced by `@BandwidthVariable`. */
+internal fun FirFunction.effectVariableIds(session: FirSession): List<EffectVariableId> =
+    annotation(BANDWIDTH_VARIABLE_ANNOTATION, session)
+        ?.stringArguments(NAMES, session)
+        .orEmpty()
+        .mapIndexed { index, name ->
+            EffectVariableId(
+                owner = symbol,
+                index = index,
+                name = name,
+            )
+        }
 
 /**
  * Parses a positive `@BoundedClient` declaration from this container.
@@ -160,6 +183,7 @@ internal fun FirDeclaration.validateBandwidthAnnotations(
     val container: FirAnnotationContainer = this@validateBandwidthAnnotations
     val download = container.annotation(NETWORK_DOWNLOAD_ANNOTATION, session)
     val effect = container.annotation(BANDWIDTH_EFFECT_ANNOTATION, session)
+    val variables = container.annotation(BANDWIDTH_VARIABLE_ANNOTATION, session)
     if (download != null && effect != null) {
         add(
             AnnotationProblem(
@@ -172,6 +196,30 @@ internal fun FirDeclaration.validateBandwidthAnnotations(
 
     download?.let { validateDownloadAnnotation(it, session) }
     effect?.let { validateEffectAnnotation(it, session) }
+    variables?.let { annotation ->
+        val names = annotation.stringArguments(NAMES, session)
+        if (names.isEmpty() || names.any(String::isBlank)) {
+            add(
+                AnnotationProblem(
+                    annotation.source ?: source,
+                    "@BandwidthVariable names must be non-blank constant strings.",
+                ),
+            )
+        }
+        val duplicates = names.groupingBy { it }
+            .eachCount()
+            .filterValues { it > 1 }
+            .keys
+        if (duplicates.isNotEmpty()) {
+            add(
+                AnnotationProblem(
+                    annotation.source ?: source,
+                    "@BandwidthVariable declares duplicate names: " +
+                        duplicates.sorted().joinToString(),
+                ),
+            )
+        }
+    }
     container.annotation(BOUNDED_SCOPE_ANNOTATION, session)?.let { annotation ->
         val bound: Int? = annotation.intArgument(K, session)
         if (bound == null || bound <= 0) {
@@ -198,6 +246,59 @@ internal fun FirDeclaration.validateBandwidthAnnotations(
     if (this@validateBandwidthAnnotations is FirCallableDeclaration) {
         returnTypeRef.annotation(BANDWIDTH_EFFECT_ANNOTATION, session)?.let { annotation ->
             validateEffectAnnotation(annotation, session)
+        }
+    }
+
+
+    if (this@validateBandwidthAnnotations is FirValueParameter) {
+        val variable = effectContract(session)?.variable
+        if (variable != null && !returnTypeRef.coneType.isSomeFunctionType(session)) {
+            add(
+                AnnotationProblem(
+                    effect?.source ?: source,
+                    "A symbolic @BandwidthEffect variable can annotate only a " +
+                        "function-valued parameter.",
+                ),
+            )
+        }
+    }
+
+    if (this@validateBandwidthAnnotations is FirFunction) {
+        val declared = effectVariableIds(session)
+        val declaredByName = declared.associateBy(EffectVariableId::name)
+        val functionVariable = effectContract(session)?.variable
+        if (functionVariable != null) {
+            add(
+                AnnotationProblem(
+                    effect?.source ?: source,
+                    "Symbolic @BandwidthEffect variables belong only on higher-order inputs; " +
+                        "the checker infers the whole function effect.",
+                ),
+            )
+        }
+        val returnedVariable = returnTypeRef.effectContract(session)?.variable
+        if (returnedVariable != null) {
+            add(
+                AnnotationProblem(
+                    returnTypeRef.source ?: source,
+                    "Symbolic @BandwidthEffect variables are inferred on returned values and " +
+                        "must not annotate the result type.",
+                ),
+            )
+        }
+        valueParameters.forEach { parameter ->
+            val parameterVariable = parameter.effectContract(session)?.variable
+                ?: parameter.returnTypeRef.effectContract(session)?.variable
+                ?: return@forEach
+            if (parameterVariable !in declaredByName) {
+                add(
+                    AnnotationProblem(
+                        parameter.source ?: source,
+                        "Effect variable '$parameterVariable' is not declared by " +
+                            "@BandwidthVariable on ${symbol.callableId.callableName}.",
+                    ),
+                )
+            }
         }
     }
 }
@@ -232,6 +333,7 @@ private fun MutableList<AnnotationProblem>.validateEffectAnnotation(
     annotation: FirAnnotation,
     session: FirSession,
 ) {
+    val variable = annotation.stringArgument(VARIABLE, session).orEmpty()
     val rMax: Long = annotation.longArgument(R_MAX_BYTES_PER_SECOND, session) ?: 0
     val nMax: Int = annotation.intArgument(N_MAX, session) ?: 0
     if (rMax < 0) {
@@ -255,6 +357,18 @@ private fun MutableList<AnnotationProblem>.validateEffectAnnotation(
             AnnotationProblem(
                 annotation.source,
                 "@BandwidthEffect with a positive rMax must have nMax greater than zero.",
+            ),
+        )
+    }
+    if (
+        variable.isNotEmpty() &&
+        (rMax != 0L || nMax != 0 || annotation.downloadContracts(session).isNotEmpty())
+    ) {
+        add(
+            AnnotationProblem(
+                annotation.source,
+                "A symbolic @BandwidthEffect variable cannot be combined with a concrete " +
+                    "effect contract.",
             ),
         )
     }
@@ -371,6 +485,29 @@ private fun FirFunctionCall.argument(name: Name): FirExpression? {
 /** Returns the constant Boolean [name], or `null` when it cannot be evaluated. */
 private fun FirAnnotation.booleanArgument(name: Name, session: FirSession): Boolean? =
     argument(name)?.constantValue(session) as? Boolean
+
+/** Returns the constant String [name], or `null` when it cannot be evaluated. */
+private fun FirAnnotation.stringArgument(name: Name, session: FirSession): String? =
+    argument(name)?.constantValue(session) as? String
+
+/** Returns every compiler-known string in a scalar or vararg annotation argument. */
+private fun FirAnnotation.stringArguments(name: Name, session: FirSession): List<String> =
+    argument(name)?.stringArguments(session).orEmpty()
+
+/** Recursively extracts string constants from FIR vararg and wrapper expressions. */
+private fun FirExpression.stringArguments(session: FirSession): List<String> {
+    annotationArrayElements()?.let { elements ->
+        return elements.flatMap { it.stringArguments(session) }
+    }
+    return when (this) {
+        is FirVarargArgumentsExpression -> arguments.flatMap { it.stringArguments(session) }
+        is FirNamedArgumentExpression -> expression.stringArguments(session)
+        is FirSpreadArgumentExpression -> expression.stringArguments(session)
+        is FirWrappedArgumentExpression -> expression.stringArguments(session)
+        is FirWrappedExpression -> expression.stringArguments(session)
+        else -> listOfNotNull(constantValue(session) as? String)
+    }
+}
 
 /** Returns the raw annotation argument named [name], if present. */
 private fun FirAnnotation.argument(name: Name): FirExpression? =

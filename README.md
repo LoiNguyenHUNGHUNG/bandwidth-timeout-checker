@@ -60,6 +60,11 @@ fun applyNetworkCallback(
     callback: suspend () -> Unit,
 )
 
+@BandwidthVariable("E")
+fun <T> invokeOnce(
+    @BandwidthEffect("E") callback: () -> T,
+): T = callback()
+
 @BoundedScope(k = 4)
 val downloadScope = viewModelScope
 
@@ -111,6 +116,20 @@ that complete within one invocation remain sequential. Downloads that escape
 an invocation may overlap later invocations, so each requires a self bound.
 Ordinary, non-repeated use does not require one. Runtime verification for a
 specific client may be added separately without changing this usage rule.
+
+`@BandwidthVariable("E")` universally quantifies a function-scoped effect
+variable. `@BandwidthEffect("E")` assigns that latent effect to a higher-order
+input. The checker analyzes the body symbolically, infers summaries such as
+`seq(E, E)` or `par(E, F)`, and substitutes the supplied callbacks' effects at
+each call site. No symbolic annotation belongs on the whole function or result
+type: those effects are inferred from the body. Concrete `@BandwidthEffect`
+contracts remain available at opaque library boundaries.
+
+Internally, one `Effect` algebra represents both concrete pair sets and symbolic
+expressions. `seq`, `par`, and alternative choice immediately evaluate concrete
+operands and retain an expression only while variables remain. Variables denote
+whole effects, preserving the correlation between every `(rate, concurrency)`
+pair through nested generic wrappers.
 
 The frontend recognizes `while`, `do-while`, `for`/`forEach`, repeated UI
 callbacks such as button presses, and lazy scrolling/item callbacks as
@@ -225,8 +244,11 @@ bandwidthChecker {
 The recursion-free milestone rejects unannotated recursion, unbounded escaping
 work in general loops, and effectful callbacks passed to opaque higher-order
 APIs without a parameter contract. Trusted library models cover sequential
-`forEach` callbacks and AndroidX `traceAsync`; these invoke a visible callback
-once for peak-bandwidth inference rather than treating it as concurrent work.
+collection `map`/`forEach` callbacks, calls-in-place helpers such as `use`, and
+framework callback registration. Application wrappers instead use polymorphic
+`@BandwidthEffect` contracts. A sequential callback may run an unknown number
+of times, but completing work from one invocation does not overlap the next;
+escaping work must still carry a self-bound.
 
 ## Candidate Android case studies
 

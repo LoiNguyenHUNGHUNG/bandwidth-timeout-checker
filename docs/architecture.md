@@ -68,9 +68,11 @@ summaries are cached by resolved FIR symbol.
 
 Kotlin syntax-to-effect rules live in `KotlinNetworkEffectVisitor.kt`. The
 surrounding inference pass is responsible only for interprocedural caching,
-recursion boundaries, contracts, and diagnostics. The frontend computes effects
-directly; it does not build an intermediate network-program tree. IR is reserved
-for transformations such as the future bounded-scope semaphore rewrite.
+recursion boundaries, contracts, and diagnostics. The frontend builds one
+unified `Effect` value. Fully concrete operations normalize immediately;
+operations containing quantified variables remain symbolic until call-site
+substitution. IR is reserved for transformations such as the future
+bounded-scope semaphore rewrite.
 
 ## Annotation discipline
 
@@ -81,17 +83,21 @@ Annotations are required only where inference cannot see enough:
 2. `@EntryPoint` on a framework-invoked application root that ordinary source
    code may never call. Every marked root contributes one invocation to the
    virtual application root.
-3. `@BandwidthEffect` download-effect lists on opaque functions, higher-order
+3. Concrete `@BandwidthEffect` contracts on opaque functions, higher-order
    inputs, and opaque returned function types. Entries retain
    `(rMaxBytesPerSecond, nMax, selfBound, lifetime)`, where a zero `selfBound`
    denotes the default bound infinity. A positive value is a trusted contract
    that runtime configuration establishes a finite limit.
    `(rMaxBytesPerSecond, nMax)` remains one-entry shorthand.
-4. `@BoundedClient(k)` on a client whose runtime configuration establishes the
+4. `@BandwidthVariable("E")` on a polymorphic higher-order function and
+   `@BandwidthEffect("E")` on each input that binds `E`. The body determines
+   the function and returned-value effects; substitutions are inferred at call
+   sites.
+5. `@BoundedClient(k)` on a client whose runtime configuration establishes the
    same concurrency limit.
-5. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
+6. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
    enforce the stated launch bound.
-6. `@BandwidthAlternative` on a whole `try/catch` expression when the
+7. `@BandwidthAlternative` on a whole `try/catch` expression when the
    programmer asserts that its network branches are comparable alternatives.
 
 The MVP has no priorities and no download identifiers.
@@ -294,6 +300,8 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   mutable branch assignments, and higher-order function returns.
 - [x] Require and check latent contracts on opaque higher-order inputs and
   returned function types.
+- [x] Quantify function-scoped callback effect variables, infer symbolic
+  `seq`/`par`/choice summaries, and explicitly substitute them at call sites.
 - [x] Cache per-function summaries, reject unsupported recursion, and lower
   general loops through the core repetition rule.
 - [x] Run annotation validation, effect inference, and diagnostics in the FIR
