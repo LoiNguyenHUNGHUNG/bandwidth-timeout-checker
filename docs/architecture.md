@@ -98,8 +98,10 @@ Annotations are required only where inference cannot see enough:
    same concurrency limit.
 6. `@BoundedScope(k)` on a `CoroutineScope` property when the compiler will
    enforce the stated launch bound.
-7. `@Handler` on a retained callback expression. The body is modeled as
-   concurrent, repeated, long-lived work and must expose a finite self bound.
+7. `@Handler` on a retained callback expression or function declaration. A
+   declaration becomes a virtual application root for callbacks invoked inside
+   opaque library code. The body is modeled as concurrent, repeated, long-lived
+   work and must expose a finite self bound.
 8. `@BandwidthAlternative` on a whole `try/catch` expression when the
    programmer asserts that its network branches are comparable alternatives.
 

@@ -82,15 +82,18 @@ public annotation class BandwidthEffect(
 )
 
 /**
- * Marks a callback expression that a framework retains and may invoke
- * repeatedly and concurrently after the registration expression returns.
+ * Marks a callback expression or function declaration that a framework may
+ * invoke repeatedly and concurrently.
  *
- * The callback body is converted to long-lived work and passed through the
- * checker's ordinary unknown-repetition rule. Consequently, every network
- * operation in the callback must obtain a finite self bound from a visible
- * semaphore, bounded client, or another trusted runtime limit.
+ * An annotated expression is materialized at its registration site. An
+ * annotated declaration is added directly to the virtual application root,
+ * which models callbacks invoked from opaque library code. In either form, the
+ * body becomes long-lived work and passes through the checker's ordinary
+ * unknown-repetition rule. Consequently, every network operation must obtain a
+ * finite self bound from a visible semaphore, bounded client, or another
+ * trusted runtime limit.
  */
-@Target(AnnotationTarget.EXPRESSION)
+@Target(AnnotationTarget.EXPRESSION, AnnotationTarget.FUNCTION)
 @Retention(AnnotationRetention.SOURCE)
 public annotation class Handler
 
