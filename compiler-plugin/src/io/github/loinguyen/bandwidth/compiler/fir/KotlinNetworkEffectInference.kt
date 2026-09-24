@@ -1,5 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
+import io.github.loinguyen.bandwidth.core.DownloadLifetime
 import io.github.loinguyen.bandwidth.core.NetworkEffect
 import org.jetbrains.kotlin.KtSourceElement
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageLocation
@@ -9,6 +10,7 @@ import org.jetbrains.kotlin.diagnostics.DiagnosticReporter
 import org.jetbrains.kotlin.diagnostics.reportOn
 import org.jetbrains.kotlin.fir.FirSession
 import org.jetbrains.kotlin.fir.analysis.checkers.context.CheckerContext
+import org.jetbrains.kotlin.fir.declarations.FirAnonymousFunction
 import org.jetbrains.kotlin.fir.declarations.FirFunction
 import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirFunctionSymbol
@@ -57,6 +59,8 @@ internal class KotlinNetworkEffectInference(
         diagnosticReporter = reporter
         try {
             val inferred: KotlinFunctionEffect = inferFunctionEffect(function)
+            val isDeclarationHandler =
+                function !is FirAnonymousFunction && function.isHandler(session)
             val quantified = function.effectVariableIds(session).toSet()
             val free = buildSet {
                 addAll(inferred.network.freeVariables())
@@ -116,9 +120,34 @@ internal class KotlinNetworkEffectInference(
                         )
                     }
                 }
-                if (function.isEntryPoint(session)) applicationEntryPoints.record(inferredEffect)
-            } else if (function.isEntryPoint(session)) {
-                error(function.source, "An @EntryPoint cannot have polymorphic bandwidth effects.")
+                when {
+                    isDeclarationHandler -> {
+                        val handlerBody = function.effectContract(session)
+                            ?.takeIf { it.variable == null }
+                            ?.network
+                            ?: inferredEffect
+                        val repeatedBody = handlerBody.withLifetime(
+                            DownloadLifetime.MAY_OUTLIVE_CALL,
+                        )
+                        if (repeatedBody.canRepeat) {
+                            applicationEntryPoints.record(repeatedBody.repeat())
+                        } else {
+                            error(
+                                function.source,
+                                "Network work in concurrent repeated @Handler function " +
+                                    "${function.displayName()} may overlap across an unknown " +
+                                    "number of invocations. Use a self bound for every download.",
+                            )
+                        }
+                    }
+                    function.isEntryPoint(session) -> applicationEntryPoints.record(inferredEffect)
+                }
+            } else if (function.isEntryPoint(session) || isDeclarationHandler) {
+                val annotationName = if (isDeclarationHandler) "@Handler" else "@EntryPoint"
+                error(
+                    function.source,
+                    "An $annotationName function cannot have polymorphic bandwidth effects.",
+                )
             }
             if (reportEffects && inferredEffect != null && inferredEffect != NetworkEffect.EMPTY) {
                 messages.report(

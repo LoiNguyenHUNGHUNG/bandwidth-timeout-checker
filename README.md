@@ -137,11 +137,13 @@ at each call site. An opaque declaration can also carry
 trusted library boundary. Returned function effects remain inferred from
 visible bodies or use a concrete return-type contract.
 
-`@Handler` marks a callback expression retained by a framework and potentially
-invoked repeatedly and concurrently. Its body becomes long-lived and crosses
-the ordinary unknown-repetition rule. The annotation does not invent a
-capacity: every network operation in the callback still needs a visible
-semaphore, `@BoundedClient`, or another trusted runtime self bound.
+`@Handler` marks a callback expression or function declaration retained by a
+framework and potentially invoked repeatedly and concurrently. An annotated
+declaration becomes a virtual application root, covering calls made inside
+opaque library code. Its body becomes long-lived and crosses the ordinary
+unknown-repetition rule. The annotation does not invent a capacity: every
+network operation in the callback still needs a visible semaphore,
+`@BoundedClient`, or another trusted runtime self bound.
 
 Internally, one `Effect` algebra represents both concrete pair sets and symbolic
 expressions. `seq`, `par`, and alternative choice immediately evaluate concrete

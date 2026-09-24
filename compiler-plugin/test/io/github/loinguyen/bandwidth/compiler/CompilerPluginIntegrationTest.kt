@@ -1202,6 +1202,89 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `models a declaration handler as a repeated application root`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.Handler
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            val handlerSlots = Semaphore(permits = 3)
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun download() = Unit
+
+            @Handler
+            suspend fun frameworkCallback() {
+                handlerSlots.withPermit { download() }
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred application entry-point effect from 1 entry point(s): {(900, 3)}",
+        )
+        result.assertOutputContains("ReqBW=2700 bytes/s")
+    }
+
+    @Test
+    fun `models an opaque annotated handler method`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.Handler
+
+            interface FrameworkCallbacks {
+                @Handler
+                @BandwidthEffect(
+                    downloads = [
+                        BandwidthDownload(
+                            rMaxBytesPerSecond = 700,
+                            nMax = 1,
+                            selfBound = 2,
+                        ),
+                    ],
+                )
+                suspend fun onRequest()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred application entry-point effect from 1 entry point(s): {(700, 2)}",
+        )
+        result.assertOutputContains("ReqBW=1400 bytes/s")
+    }
+
+    @Test
+    fun `rejects a declaration handler without a runtime bound`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.Handler
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
+            suspend fun download() = Unit
+
+            @Handler
+            suspend fun frameworkCallback() {
+                download()
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("concurrent repeated @Handler function frameworkCallback")
+        result.assertOutputContains("Use a self bound for every download")
+    }
+
+    @Test
     fun `composes an invoke-once install contract with a nested retained handler`() {
         val result = compile(
             """
