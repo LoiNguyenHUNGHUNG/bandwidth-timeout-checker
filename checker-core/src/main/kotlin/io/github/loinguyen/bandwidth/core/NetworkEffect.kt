@@ -84,6 +84,8 @@ public data class DownloadEffect(
  */
 public class NetworkEffect private constructor(
     private val downloads: List<DownloadEffect>,
+    /** All work in this effect belongs to one shared, bounded invocation region. */
+    private val concurrentInvocationBound: Int? = null,
 ) {
     /** Final bandwidth obligations after lifetime overlap is materialized. */
     public val obligations: List<DownloadEffect>
@@ -107,14 +109,19 @@ public class NetworkEffect private constructor(
      * Sequential composition. Completing work sequences normally, while work
      * that may outlive either operand remains mutually parallel.
      */
-    public fun then(other: NetworkEffect): NetworkEffect =
-        fromComponents(
+    public fun then(other: NetworkEffect): NetworkEffect {
+        if (downloads.isEmpty()) return other
+        if (other.downloads.isEmpty()) return this
+        return fromComponents(
             completing = normalize(completingDownloads() + other.completingDownloads()),
             escaping = parallelDownloads(escapingDownloads(), other.escapingDownloads()),
         )
+    }
 
     /** Parallel composition from Table 2, applied within each lifetime component. */
     public fun parallel(other: NetworkEffect): NetworkEffect {
+        if (downloads.isEmpty()) return other
+        if (other.downloads.isEmpty()) return this
         return fromComponents(
             completing = parallelDownloads(
                 completingDownloads(),
@@ -128,8 +135,11 @@ public class NetworkEffect private constructor(
     }
 
     /** Alternative-path join: only one operand executes. */
-    public fun choice(other: NetworkEffect): NetworkEffect =
-        of(downloads + other.downloads)
+    public fun choice(other: NetworkEffect): NetworkEffect {
+        if (downloads.isEmpty()) return other
+        if (other.downloads.isEmpty()) return this
+        return of(downloads + other.downloads)
+    }
 
     /** Models at most [maxConcurrentBodies] overlapping copies of one body. */
     public fun boundedReplication(maxConcurrentBodies: Int): NetworkEffect {
@@ -146,6 +156,7 @@ public class NetworkEffect private constructor(
     public fun withSelfBound(selfBound: Int): NetworkEffect {
         require(selfBound > 0) { "selfBound must be positive" }
         return of(downloads.map { it.copy(selfBound = selfBound) })
+            .withInvocationBound(concurrentInvocationBound)
     }
 
     /**
@@ -156,9 +167,14 @@ public class NetworkEffect private constructor(
      *
      * An existing tighter bound, such as a client-wide limit, is preserved by
      * taking the minimum; a missing bound denotes infinity.
-     * The bound becomes active only if an enclosing construct applies unknown
-     * repetition. For an escaping repeated invocation, this realizes the peak
-     * summary `repeat(k) { spawn { effect } }` without changing a single call.
+     * The whole-region bound becomes active only if an enclosing construct
+     * applies unknown overlapping repetition. It then realizes finite parallel
+     * composition of [maxConcurrentInvocations] copies, preserving the body's
+     * rate/concurrency correlations without changing a single call.
+     *
+     * Composing two nonempty effects drops this whole-region information: the
+     * effects may use independent gates. Their per-download bounds remain as a
+     * conservative fallback for later repetition.
      */
     public fun withConcurrentInvocationBound(maxConcurrentInvocations: Int): NetworkEffect {
         require(maxConcurrentInvocations > 0) {
@@ -174,6 +190,9 @@ public class NetworkEffect private constructor(
                     selfBound = download.selfBound?.coerceAtMost(gateBound) ?: gateBound,
                 )
             },
+        ).withInvocationBound(
+            concurrentInvocationBound?.coerceAtMost(maxConcurrentInvocations)
+                ?: maxConcurrentInvocations,
         )
     }
 
@@ -203,9 +222,15 @@ public class NetworkEffect private constructor(
     /**
      * Summarizes an unknown number of overlapping copies of this body.
      *
-     * Every retained download may reach its own [DownloadEffect.selfBound], so
-     * each resulting global concurrency is their sum. Self bounds stay on the
-     * returned downloads for an enclosing repetition boundary.
+     * A shared whole-invocation bound uses finite parallel composition: an
+     * obligation `(r, n)` becomes `(r, n + (k - 1) * K)`, where `K` is the body's
+     * maximum concurrency and `k` bounds overlapping invocations. Independent
+     * per-download self bounds additionally cap the total concurrency.
+     *
+     * Without a whole-invocation bound, each retained download may reach its
+     * own [DownloadEffect.selfBound], so their bounds are summed. Self bounds
+     * stay on the returned downloads for an enclosing repetition boundary;
+     * the whole-invocation bound is consumed by this repetition.
      */
     public fun withUnknownRepetition(
         lifetime: DownloadLifetime = DownloadLifetime.COMPLETES_WITH_CALL,
@@ -214,10 +239,16 @@ public class NetworkEffect private constructor(
             "unknown repetition requires a self bound for every download"
         }
         val materialized = obligations
-        val concurrency = materialized.sumOf { requireNotNull(it.selfBound) }
+        val selfBoundTotal = materialized.sumOf { requireNotNull(it.selfBound).toLong() }
+        val parallelShift = concurrentInvocationBound?.let { bound ->
+            (bound - 1).toLong() * (materialized.maxOfOrNull { it.concurrency } ?: 0)
+        }
         return of(
             materialized.map {
-                it.copy(concurrency = concurrency, lifetime = lifetime)
+                val concurrency = parallelShift?.let { shift ->
+                    minOf(it.concurrency.toLong() + shift, selfBoundTotal)
+                } ?: selfBoundTotal
+                it.copy(concurrency = Math.toIntExact(concurrency), lifetime = lifetime)
             },
         )
     }
@@ -225,12 +256,19 @@ public class NetworkEffect private constructor(
     /** Materializes this whole effect at a new enclosing lifetime boundary. */
     public fun withLifetime(lifetime: DownloadLifetime): NetworkEffect =
         of(obligations.map { it.copy(lifetime = lifetime) })
+            .withInvocationBound(concurrentInvocationBound)
 
     /** Projection used by structured-coroutine phase tracking. */
     public fun completingOnly(): NetworkEffect = of(completingDownloads())
+        .withInvocationBound(concurrentInvocationBound)
 
     /** Projection used by structured-coroutine phase tracking. */
     public fun escapingOnly(): NetworkEffect = of(escapingDownloads())
+        .withInvocationBound(concurrentInvocationBound)
+
+    /** Attaches a bound only while it still covers every download in the effect. */
+    private fun withInvocationBound(bound: Int?): NetworkEffect =
+        if (downloads.isEmpty() || bound == null) this else NetworkEffect(downloads, bound)
 
     /** `ReqBW(Phi) = max { r * n | (r, n) in Phi }`. */
     public fun requiredBandwidthBytesPerSecond(): Rational {
@@ -250,12 +288,14 @@ public class NetworkEffect private constructor(
             }
         }
 
-    /** Returns whether [other] contains the same normalized component entries. */
+    /** Returns whether [other] has the same component entries and invocation bound. */
     public override fun equals(other: Any?): Boolean =
-        other is NetworkEffect && downloads == other.downloads
+        other is NetworkEffect && downloads == other.downloads &&
+            concurrentInvocationBound == other.concurrentInvocationBound
 
     /** Returns a hash code consistent with [equals]. */
-    public override fun hashCode(): Int = downloads.hashCode()
+    public override fun hashCode(): Int = 31 * downloads.hashCode() +
+        (concurrentInvocationBound?.hashCode() ?: 0)
 
     /** Returns the materialized obligations in set notation. */
     public override fun toString(): String = obligations.joinToString(prefix = "{", postfix = "}")

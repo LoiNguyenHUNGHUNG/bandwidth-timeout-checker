@@ -1231,6 +1231,210 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `preserves phases when repeating a handler through a semaphore gated helper`() {
+        val result = compileSources(
+            sources = listOf(
+                phasedHandlerFixture(),
+                """
+                import io.github.loinguyen.bandwidth.annotations.Handler
+
+                fun register(callback: suspend () -> Unit) = Unit
+
+                fun configure() {
+                    register(@Handler { gatedRequest() })
+                }
+                """,
+            ),
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for gatedRequest: {(100, 1), (1, 10)}")
+        result.assertOutputContains("Inferred bandwidth effect for configure: {(100, 21), (1, 30)}")
+        result.assertOutputContains("ReqBW=2100 bytes/s")
+    }
+
+    @Test
+    fun `preserves phases in a semaphore bounded declaration handler`() {
+        val result = compileSources(
+            sources = listOf(
+                phasedHandlerFixture(),
+                """
+                import io.github.loinguyen.bandwidth.annotations.Handler
+
+                @Handler
+                suspend fun frameworkCallback() {
+                    gatedRequest()
+                }
+                """,
+            ),
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred application entry-point effect from 1 entry point(s): {(100, 21), (1, 30)}",
+        )
+        result.assertOutputContains("ReqBW=2100 bytes/s")
+    }
+
+    @Test
+    fun `preserves phases in a semaphore bounded Ktor handler`() {
+        val result = compileSources(
+            sources = listOf(
+                ktorRoutingStub,
+                phasedHandlerFixture(),
+                """
+                import io.github.loinguyen.bandwidth.annotations.EntryPoint
+                import io.ktor.server.routing.Application
+                import io.ktor.server.routing.get
+                import io.ktor.server.routing.routing
+
+                @EntryPoint
+                fun Application.module() {
+                    routing {
+                        get("/phased") { gatedRequest() }
+                    }
+                }
+                """,
+            ),
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains(
+            "Inferred application entry-point effect from 1 entry point(s): {(100, 21), (1, 30)}",
+        )
+        result.assertOutputContains("ReqBW=2100 bytes/s")
+    }
+
+    @Test
+    fun `a single handler permit preserves the effect of one invocation`() {
+        val result = compileSources(
+            sources = listOf(
+                phasedHandlerFixture(permits = 1),
+                """
+                import io.github.loinguyen.bandwidth.annotations.Handler
+
+                fun register(callback: suspend () -> Unit) = Unit
+
+                fun configure() {
+                    register(@Handler { gatedRequest() })
+                }
+                """,
+            ),
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for configure: {(100, 1), (1, 10)}")
+        result.assertOutputContains("ReqBW=100 bytes/s")
+    }
+
+    @Test
+    fun `does not extend a helper semaphore bound to unguarded handler work`() {
+        val result = compileSources(
+            sources = listOf(
+                phasedHandlerFixture(),
+                """
+                import io.github.loinguyen.bandwidth.annotations.Handler
+
+                fun register(callback: suspend () -> Unit) = Unit
+
+                fun configure() {
+                    register(@Handler {
+                        gatedRequest()
+                        low()
+                    })
+                }
+                """,
+            ),
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("concurrent repeated callback @Handler callback")
+        result.assertOutputContains("Use a self bound for every download")
+    }
+
+    @Test
+    fun `keeps equal effects under independent handler gates distinct across branches`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.Handler
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            private val firstSlots = Semaphore(3)
+            private val secondSlots = Semaphore(3)
+
+            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
+            suspend fun high() = Unit
+
+            fun register(callback: suspend (Boolean) -> Unit) = Unit
+
+            fun configure() {
+                register(@Handler { first ->
+                    if (first) {
+                        firstSlots.withPermit { high() }
+                    } else {
+                        secondSlots.withPermit { high() }
+                    }
+                })
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for configure: {(100, 6)}")
+        result.assertOutputContains("ReqBW=600 bytes/s")
+    }
+
+    @Test
+    fun `keeps independent gate alternatives distinct before effect substitution`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthVariable
+            import io.github.loinguyen.bandwidth.annotations.Handler
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            private val firstSlots = Semaphore(3)
+            private val secondSlots = Semaphore(3)
+
+            @BandwidthVariable("Body")
+            suspend fun chooseGate(
+                first: Boolean,
+                @BandwidthEffect("Body") task: suspend () -> Unit,
+            ) {
+                if (first) {
+                    firstSlots.withPermit { task() }
+                } else {
+                    secondSlots.withPermit { task() }
+                }
+            }
+
+            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
+            suspend fun high() = Unit
+
+            fun register(callback: suspend () -> Unit) = Unit
+
+            fun configure(first: Boolean) {
+                register(@Handler { chooseGate(first) { high() } })
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for configure: {(100, 6)}")
+        result.assertOutputContains("ReqBW=600 bytes/s")
+    }
+
+    @Test
     fun `models an opaque annotated handler method`() {
         val result = compile(
             """
@@ -4079,6 +4283,29 @@ class CompilerPluginIntegrationTest {
         result.assertOutputContains("Inferred bandwidth effect for load: {(1000, 2)}")
         result.assertOutputContains("ReqBW=2000 bytes/s")
     }
+
+    private fun phasedHandlerFixture(permits: Int = 3): String = """
+        import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+        import kotlinx.coroutines.coroutineScope
+        import kotlinx.coroutines.launch
+        import kotlinx.coroutines.sync.Semaphore
+        import kotlinx.coroutines.sync.withPermit
+
+        private val handlerSlots = Semaphore($permits)
+
+        @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
+        suspend fun high() = Unit
+
+        @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000)
+        suspend fun low() = Unit
+
+        suspend fun gatedRequest() = handlerSlots.withPermit {
+            high()
+            coroutineScope {
+                ${List(10) { "launch { low() }" }.joinToString("\n")}
+            }
+        }
+    """
 
     private val ktorRoutingStub = """
         package io.ktor.server.routing

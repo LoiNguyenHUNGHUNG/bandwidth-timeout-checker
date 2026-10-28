@@ -118,7 +118,8 @@ internal fun Effect.parallel(other: Effect): Effect {
 internal fun Effect.choice(other: Effect): Effect {
     if (this == Effect.Empty) return other
     if (other == Effect.Empty) return this
-    if (this == other) return this
+    // Equal-looking effects can come from independent semaphore regions.
+    // Preserve both operands until substitution can apply the core choice rule.
     val leftConcrete = concreteOrNull()
     val rightConcrete = other.concreteOrNull()
     if (leftConcrete != null && rightConcrete != null) {
@@ -127,7 +128,7 @@ internal fun Effect.choice(other: Effect): Effect {
     val parts = buildList {
         if (this@choice is Effect.Choice) addAll(this@choice.parts) else add(this@choice)
         if (other is Effect.Choice) addAll(other.parts) else add(other)
-    }.distinct()
+    }
     return Effect.Choice(parts)
 }
 
