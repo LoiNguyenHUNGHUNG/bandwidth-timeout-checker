@@ -197,8 +197,23 @@ is held until `e` completes, the protected projection is therefore:
 repeat(4) { spawn { e } }
 ```
 
-More generally, `selfBound` defaults to infinity and the effective multiplicity
-is computed after the ordinary effect rules:
+The core retains this whole-invocation bound separately from each download's
+`selfBound`. At overlapping repetition, it applies the paper's finite parallel
+rule: for `K = max { n | (r, n) in Phi }`, `k` copies shift each pair to
+`(r, n + (k - 1) * K)`. Trusted per-download bounds may further cap the total
+concurrency. This preserves sequential rate/concurrency distinctions: a
+three-slot handler with body `{(100, 1), (1, 10)}` yields
+`{(100, 21), (1, 30)}` instead of summing the phase-specific caps to 33.
+
+Empty composition, helper summaries, and lifetime projections preserve the
+whole-invocation bound. Composition of two nonempty effects drops it because
+the effects may use independent gates; the existing per-download fallback
+remains sound. Repetition consumes the grouping, so another enclosing unknown
+repetition can conservatively flatten the correlations again. Ordinary
+sequential repetition of completing work does not activate the bound.
+
+Without whole-invocation information, `selfBound` defaults to infinity and the
+effective multiplicity is computed after the ordinary effect rules:
 
 ```text
 n_effective = min(n_standard, selfBound)
