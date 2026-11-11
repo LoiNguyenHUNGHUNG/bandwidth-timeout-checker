@@ -9,7 +9,6 @@ import org.jetbrains.kotlin.fir.originalForSubstitutionOverride
 import org.jetbrains.kotlin.fir.unwrapFakeOverrides
 import org.jetbrains.kotlin.KtSourceElement
 import org.jetbrains.kotlin.fir.declarations.FirFunction
-import org.jetbrains.kotlin.fir.declarations.FirNamedFunction
 import org.jetbrains.kotlin.fir.declarations.FirConstructor
 import org.jetbrains.kotlin.fir.declarations.FirCallableDeclaration
 import org.jetbrains.kotlin.fir.declarations.FirProperty
@@ -200,9 +199,15 @@ internal class KotlinNetworkEffectVisitor(
     override fun visitElement(
         element: FirElement,
         data: KotlinEffectContext,
-    ): KotlinExpressionEffect =
-        element.functionTypeConversionOperand()?.let { infer(it, data) }
+    ): KotlinExpressionEffect {
+        // FIR versions disagree on whether named declarations dispatch through
+        // visitFunction or directly here. Use the common base type so both
+        // routes keep declarations latent; declaration checkers still validate
+        // every body and contract independently.
+        if (element is FirFunction) return KotlinExpressionEffect()
+        return element.functionTypeConversionOperand()?.let { infer(it, data) }
             ?: inferChildren(element, data)
+    }
 
     /**
      * Leaves a nested function declaration latent; its body is charged only on
@@ -210,14 +215,6 @@ internal class KotlinNetworkEffectVisitor(
      */
     override fun visitFunction(
         function: FirFunction,
-        data: KotlinEffectContext,
-    ): KotlinExpressionEffect = KotlinExpressionEffect()
-
-    // Some FIR adapters dispatch named declarations to visitElement,
-    // not visitFunction. Its declaration still stays latent; the declaration
-    // checker separately validates the body and any declared contract.
-    override fun visitNamedFunction(
-        namedFunction: FirNamedFunction,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = KotlinExpressionEffect()
 
