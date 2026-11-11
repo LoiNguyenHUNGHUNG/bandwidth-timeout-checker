@@ -400,7 +400,16 @@ internal class KotlinNetworkEffectInference(
                             DownloadLifetime.MAY_OUTLIVE_CALL,
                         )
                         if (repeatedBody.canRepeat) {
-                            applicationEntryPoints.record(repeatedBody.repeat())
+                            val repeated = repeatedBody.repeat()
+                            applicationEntryPoints.record(repeated)
+                            if (reportEffects) {
+                                messages.report(
+                                    CompilerMessageSeverity.INFO,
+                                    "NAMED_HANDLER_EFFECT function=${function.displayName()} " +
+                                        "body=${handlerBody.render()} repeated=${repeated.render()}",
+                                    CompilerMessageLocation.create(context.bandwidthSourcePath()),
+                                )
+                            }
                         } else {
                             error(
                                 function.source,

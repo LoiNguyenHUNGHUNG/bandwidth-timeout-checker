@@ -239,6 +239,10 @@ class CompilerPluginIntegrationTest {
         result.assertOutputContains(
             "Inferred application entry-point effect from 1 entry point(s): {(100, 21), (1, 30)}",
         )
+        result.assertOutputContains(
+            "NAMED_HANDLER_EFFECT function=frameworkCallback " +
+                "body={(100, 1), (1, 10)} repeated={(100, 21), (1, 30)}",
+        )
         result.assertOutputContains("ReqBW=2100 bytes/s")
     }
 
