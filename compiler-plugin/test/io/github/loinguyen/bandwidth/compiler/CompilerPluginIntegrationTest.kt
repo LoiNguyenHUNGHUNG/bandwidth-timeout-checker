@@ -5134,6 +5134,175 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `constructor inference sequences fields and init blocks once after super`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.*
+            @BandwidthEffect(downloads = [BandwidthDownload(
+                rMaxBytesPerSecond = 100, nMax = 1, mayOutliveCall = true, selfBound = 10,
+            )])
+            fun background() = Unit
+            @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1000)
+            fun middle() = Unit
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000)
+            fun last() = Unit
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000)
+            fun after() = Unit
+            class Source {
+                val first = background()
+                init { middle() }
+                val final = last()
+            }
+            fun create() { Source(); after() }
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("create", 800)
+    }
+
+    @Test
+    fun `constructor inference does not repeat initializers through this delegation`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.*
+            @BandwidthEffect(downloads = [BandwidthDownload(
+                rMaxBytesPerSecond = 100, nMax = 1, mayOutliveCall = true, selfBound = 10,
+            )])
+            fun background() = Unit
+            @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1000)
+            fun middle() = Unit
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000)
+            fun after() = Unit
+            class Source(val label: String) {
+                val first = background()
+                constructor() : this("default") { middle() }
+            }
+            fun create() { Source(); after() }
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("create", 800)
+    }
+
+    @Test
+    fun `constructor inference includes superclass and direct secondary initialization`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.*
+            @BandwidthEffect(downloads = [BandwidthDownload(
+                rMaxBytesPerSecond = 100, nMax = 1, mayOutliveCall = true, selfBound = 10,
+            )])
+            fun background() = Unit
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000)
+            fun after() = Unit
+            open class Base { val base = background() }
+            class Source : Base {
+                val own = background()
+                constructor() : super()
+            }
+            fun create() { Source(); after() }
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("create", 1200)
+    }
+
+    @Test
+    fun `constructor inference resolves inner and local classes to their own initializers`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.*
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000)
+            fun first() = Unit
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000)
+            fun second() = Unit
+            class Outer {
+                inner class Inner { init { first() } }
+                fun create() = Inner()
+            }
+            fun local() {
+                class Local { val value = second() }
+                Local()
+            }
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("Outer.create", 300)
+        result.assertFunctionBandwidth("local", 400)
+    }
+
+    @Test
+    fun `constructor inference charges local class instances rather than declarations`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.*
+            @BandwidthEffect(downloads = [BandwidthDownload(
+                rMaxBytesPerSecond = 100, nMax = 1, mayOutliveCall = true, selfBound = 10,
+            )])
+            fun background() = Unit
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000)
+            fun after() = Unit
+            fun load() {
+                class Local { val value = background() }
+                Local()
+                after()
+            }
+            fun unused() {
+                class Local { val value = background() }
+                after()
+            }
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("load", 800)
+        result.assertFunctionBandwidth("unused", 400)
+    }
+
+    @Test
+    fun `constructor inference retains the Flow storage invariant in init blocks`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.*
+            import kotlinx.coroutines.flow.*
+            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1000)
+            suspend fun download() = Unit
+            class Source {
+                var stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit> = emptyFlow()
+                init { stream = flow { emit(download()) } }
+            }
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("not covered")
+    }
+
+    @Test
+    fun `constructor inference retains strict object initialization boundaries`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.*
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000)
+            fun download() = Unit
+            object Source { val value = download() }
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("not modeled at constructor boundaries")
+    }
+
+    @Test
+    fun `constructor inference rejects unmodeled eager default arguments`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.*
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000)
+            fun download() = Unit
+            class Source(val value: Unit = download())
+            fun create() = Source()
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Eager network work in a constructor default argument")
+    }
+
+    @Test
+    fun `standard zip transform contributes repeated callback network effects`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.*
+            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000)
+            fun download(id: Int) = id
+            fun load(ids: List<Int>, labels: List<String>) =
+                ids.zip(labels) { id, label -> download(id) to label }
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("load", 300)
+    }
+
+    @Test
     fun `latent Flow discipline preserves a concrete val constructor property contract`() {
         val result = compile(
             """
@@ -5725,7 +5894,7 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `latent Flow discipline rejects unsupported eager network work in a field initializer`() {
+    fun `constructor inference charges eager Flow field initialization at its caller`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
@@ -5734,16 +5903,21 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flow
 
             @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            fun prepare(): Flow<Unit> = flow { emit(Unit) }
+            fun downloadMetadata() = Unit
+            fun prepare(): Flow<Unit> {
+                downloadMetadata()
+                return flow { emit(Unit) }
+            }
 
             class Source {
                 val stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit> = prepare()
             }
-            """,
+            fun create() = Source()
+            """, reportEffects = true,
         )
 
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Eager network work during Flow property initialization")
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("create", 300)
     }
 
     @Test
@@ -7088,12 +7262,13 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `latent Flow discipline rejects eager network work in another Flow wrapper initializer`() {
+    fun `constructor inference charges another Flow wrapper field at its caller`() {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
             import kotlinx.coroutines.flow.Flow
+            import kotlinx.coroutines.flow.emptyFlow
 
             @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
             fun downloadMetadata(): String = "metadata"
@@ -7101,11 +7276,12 @@ class CompilerPluginIntegrationTest {
             class Wrapper(val source: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>) {
                 val metadata: String = downloadMetadata()
             }
-            """,
+            fun create() = Wrapper(emptyFlow())
+            """, reportEffects = true,
         )
 
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Flow wrapper initializer")
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("create", 300)
     }
 
     @Test

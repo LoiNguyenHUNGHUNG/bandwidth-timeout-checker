@@ -177,6 +177,14 @@ self bounds. `awaitAll()` is recognized in statements, initializers, returns,
 and chained expressions, and ends only the joined children's overlap. Work
 that escapes a child keeps its own lifetime and requires an independent bound.
 
+Source-class constructor summaries include superclass construction followed by
+property initializers and `init` blocks in source order. A secondary constructor
+that delegates with `this(...)` reuses that initialization rather than charging
+it again. Calls to constructors include this work, including any bounded
+background jobs it starts. Flow storage contracts remain checked independently.
+Eager network work in object/companion or top-level initialization, and in
+constructor default arguments, requires an explicit initialization boundary.
+
 Cold `Flow` producers carry latent effects until collection. This information
 propagates through parameters, returns, aliases, and explicitly contracted
 properties, including `StateFlow` and `SharedFlow` subtypes. Opaque producers
