@@ -5290,6 +5290,40 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
+    fun `observable delegate retains a bounded network callback after construction`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.*
+            import kotlin.properties.Delegates
+            @BandwidthEffect(downloads = [BandwidthDownload(100, 1, selfBound = 2)])
+            fun notifyRemote() = Unit
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000)
+            fun foreground() = Unit
+            class Source {
+                var value: Int by Delegates.observable(0) { _, _, _ -> notifyRemote() }
+            }
+            fun load() { Source(); foreground() }
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("load", 1200)
+    }
+
+    @Test
+    fun `observable delegate rejects a network callback without an independent bound`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.*
+            import kotlin.properties.Delegates
+            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1000)
+            fun notifyRemote() = Unit
+            class Source {
+                var value: Int by Delegates.observable(0) { _, _, _ -> notifyRemote() }
+            }
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("concurrent repeated callback kotlin.properties.Delegates.observable")
+        result.assertOutputContains("Use a self bound for every download")
+    }
+
+    @Test
     fun `standard zip transform contributes repeated callback network effects`() {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.*
