@@ -205,8 +205,21 @@ Semaphore(k): repeat(k) { spawn { e } }
 no known bound: repeat(infinity) { spawn { e } }
 ```
 
-Equivalently, let `b = selfBound`, defaulting to infinity. The ordinary
-repeated-handler multiplicity is `n_standard = infinity`, and the effective
+The finite case composes `k` copies of the entire protected effect in parallel.
+For a body effect `Phi` with maximum concurrency `K`, each pair `(r, n)` becomes
+`(r, n + (k - 1) * K)`. For example, one rate-100 download followed by ten
+parallel rate-1 downloads has effect `{(100, 1), (1, 10)}`. Three handler permits
+give `{(100, 21), (1, 30)}`, requiring bandwidth 2100 rather than 3300 bytes/s.
+The requests may occupy different phases, but they share the same three slots.
+
+The whole-invocation bound survives helper calls and lifetime projections.
+Combining two nonempty effects conservatively discards that grouping because
+their gates may be independent; per-download bounds remain available. Once
+consumed by repetition, the grouping is also discarded, so a further enclosing
+repetition may use the less precise per-download bounds.
+
+Without whole-invocation information, let `b = selfBound`, defaulting to
+infinity. The ordinary repeated-handler multiplicity is `n_standard = infinity`, and the effective
 multiplicity is:
 
 ```text
@@ -226,8 +239,8 @@ a virtual application root by composing all marked functions in parallel. No
 executable dummy `main` is generated. In Ktor, `routing { configuration }`
 invokes its configuration callback once, while `get { handler }` retains the
 handler and models it as `repeat(infinity) { spawn { handler } }`. A finite
-semaphore bound inside the handler replaces that infinity through the ordinary
-self-bound rule. For the initial experiment, every network handler uses its own
+semaphore bound covering the handler uses the finite parallel projection above.
+For the initial experiment, every network handler uses its own
 persistent, statically visible semaphore, avoiding resource-identity analysis.
 Route-registration helpers such as `fun Route.alertsRoute()` are reached from
 the application root and do not need their own `@EntryPoint`.

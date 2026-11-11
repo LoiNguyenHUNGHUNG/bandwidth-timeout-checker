@@ -3,6 +3,7 @@ package io.github.loinguyen.bandwidth.core
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class NetworkEffectTest {
@@ -56,6 +57,129 @@ class NetworkEffectTest {
             listOf(DownloadEffect(Rational.of(1_000), 1, selfBound = 2)),
             result.obligations,
         )
+    }
+
+    @Test
+    fun `shared gate repeats mixed phases as finite parallel copies`() {
+        val body = NetworkEffect.summary(100, 1).then(NetworkEffect.summary(1, 10))
+
+        for (bound in listOf(1, 2, 3, 10)) {
+            val repeated = body.withConcurrentInvocationBound(bound)
+                .withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+                .repeat()
+            val finiteParallel = body.boundedReplication(bound)
+            assertEquals(
+                finiteParallel.obligations.map { it.requiredRateBytesPerSecond to it.concurrency },
+                repeated.obligations.map { it.requiredRateBytesPerSecond to it.concurrency },
+                "handler bound $bound",
+            )
+        }
+
+        val repeated = body.withConcurrentInvocationBound(3)
+            .withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+            .repeat()
+        assertEquals(
+            listOf(
+                DownloadEffect(Rational.of(100), 21, 3, DownloadLifetime.MAY_OUTLIVE_CALL),
+                DownloadEffect(Rational.of(1), 30, 30, DownloadLifetime.MAY_OUTLIVE_CALL),
+            ),
+            repeated.obligations,
+        )
+        assertEquals(Rational.of(2_100), repeated.requiredBandwidthBytesPerSecond())
+    }
+
+    @Test
+    fun `whole gate survives empty composition and lifetime projections`() {
+        val gated = NetworkEffect.summary(100, 1).then(NetworkEffect.summary(1, 10))
+            .withConcurrentInvocationBound(3)
+        val transformed = NetworkEffect.EMPTY.then(gated)
+            .then(NetworkEffect.EMPTY)
+            .parallel(NetworkEffect.EMPTY)
+            .choice(NetworkEffect.EMPTY)
+            .withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+            .escapingOnly()
+            .withLifetime(DownloadLifetime.COMPLETES_WITH_CALL)
+            .completingOnly()
+
+        assertEquals(gated, transformed)
+        assertEquals(
+            Rational.of(2_100),
+            transformed.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+                .repeat().requiredBandwidthBytesPerSecond(),
+        )
+    }
+
+    @Test
+    fun `independent gates do not become a shared invocation bound`() {
+        val high = NetworkEffect.summary(100, 1).withConcurrentInvocationBound(3)
+        val low = NetworkEffect.summary(1, 10).withConcurrentInvocationBound(3)
+
+        for (combined in listOf(high.then(low), high.parallel(low), high.choice(low))) {
+            val repeated = combined.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL).repeat()
+            assertEquals(33, repeated.maxConcurrency)
+            assertEquals(Rational.of(3_300), repeated.requiredBandwidthBytesPerSecond())
+        }
+    }
+
+    @Test
+    fun `equal branch effects can belong to independent gates`() {
+        val first = NetworkEffect.summary(100, 1).withConcurrentInvocationBound(3)
+        val second = NetworkEffect.summary(100, 1).withConcurrentInvocationBound(3)
+        val repeated = first.choice(second)
+            .withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+            .repeat()
+
+        assertEquals(6, repeated.maxConcurrency)
+    }
+
+    @Test
+    fun `equal branch effects can carry independent primitive caps`() {
+        val first = NetworkEffect.summary(100, 1).withSelfBound(3)
+        val second = NetworkEffect.summary(100, 1).withSelfBound(3)
+
+        assertEquals(6, first.choice(second).withUnknownRepetition().maxConcurrency)
+    }
+
+    @Test
+    fun `shared gate does not bound work outside its region`() {
+        val gated = NetworkEffect.summary(100, 1).withConcurrentInvocationBound(3)
+        val withUnguardedWork = gated.then(NetworkEffect.summary(1, 1))
+            .withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+
+        assertFailsWith<IllegalArgumentException> { withUnguardedWork.repeat() }
+    }
+
+    @Test
+    fun `shared gate respects a tighter primitive cap during repetition`() {
+        val repeated = NetworkEffect.download(1_000, 1_000)
+            .withSelfBound(2)
+            .withConcurrentInvocationBound(4)
+            .withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+            .repeat()
+
+        assertEquals(2, repeated.maxConcurrency)
+    }
+
+    @Test
+    fun `ordinary sequential repetition does not activate a shared gate`() {
+        val body = NetworkEffect.summary(100, 1).then(NetworkEffect.summary(1, 10))
+        val gated = body.withConcurrentInvocationBound(3)
+
+        assertEquals(gated, gated.repeat())
+        assertEquals(
+            body.obligations.map { it.requiredRateBytesPerSecond to it.concurrency },
+            gated.repeat().obligations.map { it.requiredRateBytesPerSecond to it.concurrency },
+        )
+    }
+
+    @Test
+    fun `whole gate information participates in effect equality`() {
+        val body = NetworkEffect.summary(100, 1).then(NetworkEffect.summary(1, 10))
+        val gated = body.withConcurrentInvocationBound(3)
+        val independent = NetworkEffect.of(gated.obligations)
+
+        assertNotEquals(gated, independent)
+        assertEquals(gated, body.withConcurrentInvocationBound(3))
     }
 
     @Test
