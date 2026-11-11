@@ -3229,6 +3229,10 @@ internal class KotlinNetworkEffectVisitor(
             "androidx.compose.foundation.lazy.staggeredgrid.itemsIndexed",
         )
         val RETAINED_CONCURRENT_CALLBACK_FQ_NAMES: Set<String> = setOf(
+            // Observable delegates retain the callback and run it on assignments.
+            // Different threads can assign concurrently; each network operation
+            // therefore needs its own shared self bound.
+            "kotlin.properties.Delegates.observable",
             "de.nielsfalk.ktor.swagger.delete",
             "de.nielsfalk.ktor.swagger.get",
             "de.nielsfalk.ktor.swagger.patch",
