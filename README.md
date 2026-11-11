@@ -453,6 +453,8 @@ version without changing source:
 ./gradlew clean build -PkotlinVersion=2.3.20
 ./gradlew clean build -PkotlinVersion=2.3.21
 ./gradlew clean build -PkotlinVersion=2.4.10
+./gradlew clean build -PkotlinVersion=2.4.20
+./gradlew clean build -PkotlinVersion=2.4.21
 ```
 
 The default remains the version in `gradle/libs.versions.toml`. CI verifies all

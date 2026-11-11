@@ -31,11 +31,9 @@ internal class BandwidthFirCheckersExtension(
     )
 
     override val declarationCheckers: DeclarationCheckers =
-        object : DeclarationCheckers() {
+        object : BandwidthFunctionDeclarationCheckers(inference) {
             override val basicDeclarationCheckers =
                 setOf(BandwidthAnnotationChecker)
-            override val simpleFunctionCheckers =
-                bandwidthFunctionEffectCheckers(inference)
             override val propertyCheckers = setOf(BandwidthPropertyEffectChecker(inference))
             override val constructorCheckers = setOf(BandwidthConstructorEffectChecker(inference))
             override val anonymousInitializerCheckers =

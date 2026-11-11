@@ -47,7 +47,7 @@ us test the calculus independently and reuse it from other frontends later.
 Kotlin's FIR compiler-plugin API is experimental, so the checker treats the FIR
 surface as a versioned adapter. Shared inference code remains under
 `compiler-plugin/src`, while the small incompatible seams live under
-`src-kotlin-2.2`, `src-kotlin-2.3`, `src-kotlin-2.3.20`, and `src-kotlin-2.4`. Kotlin 2.3.20 and later 2.3 patch releases, including 2.3.21, use `src-kotlin-2.3.20`; earlier 2.3 releases use `src-kotlin-2.3`. The selected adapter,
+`src-kotlin-2.2`, `src-kotlin-2.3`, `src-kotlin-2.3.20`, `src-kotlin-2.4`, and `src-kotlin-2.4.20`. Kotlin 2.3.20 and later 2.3 patch releases, including 2.3.21, use `src-kotlin-2.3.20`; earlier 2.3 releases use `src-kotlin-2.3`. Kotlin 2.4.20 and later 2.4 patch releases use `src-kotlin-2.4.20` for renamed checker registration and explicit message-collector access. The selected adapter,
 Kotlin Gradle plugin, and `org.jetbrains.kotlin` compiler dependencies are
 aligned through:
 
