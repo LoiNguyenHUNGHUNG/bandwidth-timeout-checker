@@ -5,17 +5,27 @@ import io.github.loinguyen.bandwidth.core.DownloadLifetime
 import java.util.IdentityHashMap
 import org.jetbrains.kotlin.fir.FirElement
 import org.jetbrains.kotlin.fir.FirSession
+import org.jetbrains.kotlin.fir.originalForSubstitutionOverride
+import org.jetbrains.kotlin.fir.unwrapFakeOverrides
 import org.jetbrains.kotlin.KtSourceElement
 import org.jetbrains.kotlin.fir.declarations.FirFunction
+import org.jetbrains.kotlin.fir.declarations.FirNamedFunction
+import org.jetbrains.kotlin.fir.declarations.FirConstructor
+import org.jetbrains.kotlin.fir.declarations.FirCallableDeclaration
 import org.jetbrains.kotlin.fir.declarations.FirProperty
+import org.jetbrains.kotlin.fir.declarations.FirPropertyAccessor
 import org.jetbrains.kotlin.fir.declarations.FirValueParameter
 import org.jetbrains.kotlin.fir.declarations.evaluateAs
 import org.jetbrains.kotlin.fir.expressions.FirAnonymousFunctionExpression
 import org.jetbrains.kotlin.fir.expressions.FirBlock
 import org.jetbrains.kotlin.fir.expressions.FirCallableReferenceAccess
+import org.jetbrains.kotlin.fir.expressions.FirCheckedSafeCallSubject
 import org.jetbrains.kotlin.fir.expressions.FirDoWhileLoop
+import org.jetbrains.kotlin.fir.expressions.FirElvisExpression
 import org.jetbrains.kotlin.fir.expressions.FirExpression
 import org.jetbrains.kotlin.fir.expressions.FirFunctionCall
+import org.jetbrains.kotlin.fir.expressions.FirCall
+import org.jetbrains.kotlin.fir.expressions.FirDelegatedConstructorCall
 import org.jetbrains.kotlin.fir.expressions.FirImplicitInvokeCall
 import org.jetbrains.kotlin.fir.expressions.FirLiteralExpression
 import org.jetbrains.kotlin.fir.expressions.FirLoop
@@ -23,8 +33,10 @@ import org.jetbrains.kotlin.fir.expressions.FirNamedArgumentExpression
 import org.jetbrains.kotlin.fir.expressions.FirPropertyAccessExpression
 import org.jetbrains.kotlin.fir.expressions.FirQualifiedAccessExpression
 import org.jetbrains.kotlin.fir.expressions.FirReturnExpression
+import org.jetbrains.kotlin.fir.expressions.FirSafeCallExpression
 import org.jetbrains.kotlin.fir.expressions.FirSpreadArgumentExpression
 import org.jetbrains.kotlin.fir.expressions.FirTryExpression
+import org.jetbrains.kotlin.fir.expressions.FirThisReceiverExpression
 import org.jetbrains.kotlin.fir.expressions.FirTypeOperatorCall
 import org.jetbrains.kotlin.fir.expressions.FirVariableAssignment
 import org.jetbrains.kotlin.fir.expressions.FirVarargArgumentsExpression
@@ -38,9 +50,12 @@ import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirCallableSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirFunctionSymbol
 import org.jetbrains.kotlin.fir.types.coneType
+import org.jetbrains.kotlin.fir.types.ConeKotlinTypeProjection
 import org.jetbrains.kotlin.fir.types.isSomeFunctionType
+import org.jetbrains.kotlin.fir.types.resolvedType
 import org.jetbrains.kotlin.fir.visitors.FirVisitor
 import org.jetbrains.kotlin.fir.visitors.FirVisitorVoid
+import org.jetbrains.kotlin.descriptors.Modality
 
 /**
  * Infers the effect component of Kotlin's resolved FIR type-and-effect
@@ -49,12 +64,17 @@ import org.jetbrains.kotlin.fir.visitors.FirVisitorVoid
 internal class KotlinNetworkEffectVisitor(
     private val session: FirSession,
     private val inferFunction: (FirFunction) -> KotlinFunctionEffect,
+    private val reportInfo: (String) -> Unit,
     private val reportProblem: (
         key: String,
         source: KtSourceElement?,
         message: String,
     ) -> Unit,
 ) : FirVisitor<KotlinExpressionEffect, KotlinEffectContext>() {
+    /** Scope ownership may justify a guarded wait without ending its overlap phase. */
+    private val structuredPhases =
+        IdentityHashMap<KotlinEffectContext, CoroutinePhaseState<FirBasedSymbol<*>>>()
+
     /**
      * Infers the eager effect and callback-valued return of [function].
      *
@@ -65,8 +85,42 @@ internal class KotlinNetworkEffectVisitor(
         function: FirFunction,
         latentValues: MutableMap<FirBasedSymbol<*>, LatentNetworkEffect>,
     ): KotlinFunctionEffect {
+        if (function is FirPropertyAccessor && function.isGetter) {
+            val property = function.propertySymbol.fir
+            property.bandwidthPureLazyFlowInitializer(session)?.let { initializer ->
+                val summary = inferFunction(initializer.anonymousFunction)
+                val invalid = when {
+                    summary.network.concreteOrNull() != NetworkEffect.EMPTY ->
+                        "Eager network work in a delegated lazy Flow initializer is unsupported. " +
+                            "Use an explicit initialization function instead."
+                    summary.returned?.network?.concreteOrNull() == null ->
+                        "Cannot infer the stored Flow effect of a delegated lazy Flow initializer."
+                    else -> null
+                }
+                if (invalid != null) {
+                    problem("lazy-flow-getter:" + property.symbol.callableId,
+                        initializer.source ?: property.source, invalid)
+                    return KotlinFunctionEffect(
+                        network = Effect.Invalid(invalid),
+                        returned = LatentNetworkEffect(network = Effect.Invalid(invalid)),
+                    )
+                }
+                // A pure, visible initializer may run on the first read, but
+                // it adds no eager network work. Its known Flow effect still
+                // has to satisfy the ordinary property's checked invariant.
+                return KotlinFunctionEffect(returned = summary.returned)
+            }
+        }
         val context = KotlinEffectContext(function, session, latentValues)
         val variables = function.effectVariableIds(session).associateBy(EffectVariableId::name)
+        function.receiverParameter?.let { receiver ->
+            val contract = receiver.effectContract(session) ?: receiver.typeRef.effectContract(session)
+            contract?.variable?.let { name ->
+                variables[name]?.let { variable ->
+                    context.bind(receiver.symbol, LatentNetworkEffect(network = Effect.Variable(variable)))
+                }
+            }
+        }
         function.valueParameters.forEach { parameter ->
             val variableName = parameter.effectContract(session)?.variable
                 ?: parameter.returnTypeRef.effectContract(session)?.variable
@@ -78,9 +132,11 @@ internal class KotlinNetworkEffectVisitor(
                 )
             }
         }
-        val bodyEffect: KotlinExpressionEffect = infer(function.body, context)
+        val delegation = if (function is FirConstructor) infer(function.delegatedConstructor, context)
+            else KotlinExpressionEffect()
+        val bodyEffect: KotlinExpressionEffect = delegation.then(infer(function.body, context))
         val expressionResult: LatentNetworkEffect? =
-            if (function.returnTypeRef.coneType.isSomeFunctionType(session)) {
+            if (function.returnTypeRef.coneType.isBandwidthLatentValue(session)) {
                 bodyEffect.latent
             } else {
                 null
@@ -97,8 +153,45 @@ internal class KotlinNetworkEffectVisitor(
     fun infer(
         element: FirElement?,
         context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val effect = context.evaluatedExpressions[element]
+            ?: element?.accept(this, context)
+            ?: KotlinExpressionEffect()
+        // Blocks and returns are control-flow containers: their missing value
+        // metadata must not overwrite values already recorded by recordReturn.
+        if (
+            effect.latent == null && element is FirExpression &&
+            element !is FirBlock && element !is FirReturnExpression &&
+            element.resolvedType.isBandwidthFlow(session)
+        ) {
+            return effect.withExpectedFlowValue(element)
+        }
+        return effect
+    }
+
+    /** Preserves a known null value while making an unknown Flow explicit. */
+    private fun KotlinExpressionEffect.withExpectedFlowValue(
+        expression: FirElement?,
     ): KotlinExpressionEffect =
-        element?.accept(this, context) ?: KotlinExpressionEffect()
+        if (latent != null) this else copy(
+            latent = if (expression.isDefinitelyNullValue()) {
+                LatentNetworkEffect()
+            } else {
+                untrackedFlowEffect()
+            },
+        )
+
+    /** Null alternatives contain no producer to collect; other unknowns do. */
+    private fun FirElement?.isDefinitelyNullValue(): Boolean = when (this) {
+        is FirLiteralExpression -> value == null
+        is FirWrappedArgumentExpression -> expression.isDefinitelyNullValue()
+        is FirWrappedExpression -> expression.isDefinitelyNullValue()
+        is FirTypeOperatorCall -> argumentList.arguments.singleOrNull().isDefinitelyNullValue()
+        is FirBlock -> statements.lastOrNull().isDefinitelyNullValue()
+        is FirWhenExpression -> branches.isNotEmpty() &&
+            branches.all { it.result.isDefinitelyNullValue() }
+        else -> false
+    }
 
     /**
      * Infers an otherwise unsupported element through its conversion operand or
@@ -117,6 +210,14 @@ internal class KotlinNetworkEffectVisitor(
      */
     override fun visitFunction(
         function: FirFunction,
+        data: KotlinEffectContext,
+    ): KotlinExpressionEffect = KotlinExpressionEffect()
+
+    // Some FIR adapters dispatch named declarations to visitElement,
+    // not visitFunction. Its declaration still stays latent; the declaration
+    // checker separately validates the body and any declared contract.
+    override fun visitNamedFunction(
+        namedFunction: FirNamedFunction,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = KotlinExpressionEffect()
 
@@ -155,6 +256,23 @@ internal class KotlinNetworkEffectVisitor(
     ): KotlinExpressionEffect {
         val receivers = inferReceivers(callableReferenceAccess, data)
         val target = callableReferenceAccess.resolvedSymbol()?.fir as? FirFunction
+        if (target?.concurrentMapContract(session) != null) {
+            val message = "@BandwidthConcurrentMap operators must be called directly " +
+                "with a statically known concurrency; callable references are unsupported."
+            problem(
+                key = "concurrent-map-reference:" + callableReferenceAccess.source?.startOffset,
+                source = callableReferenceAccess.source ?: data.function.source,
+                message = message,
+            )
+            return KotlinExpressionEffect(network = Effect.Invalid(message))
+        }
+        if (target?.receiverParameter?.typeRef?.coneType?.isBandwidthFlow(session) == true) {
+            val message = "Flow extension callable references require receiver-effect " +
+                "instantiation; use a lambda with a direct annotated call instead."
+            problem("flow-extension-reference:" + callableReferenceAccess.source?.startOffset,
+                callableReferenceAccess.source ?: data.function.source, message)
+            return KotlinExpressionEffect(network = receivers.network.then(Effect.Invalid(message)))
+        }
         return KotlinExpressionEffect(
             network = receivers.network,
             latent = target?.let(::functionSummary)?.asLatent(),
@@ -169,7 +287,19 @@ internal class KotlinNetworkEffectVisitor(
         property: FirProperty,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect {
-        val initializer = infer(property.initializer, data)
+        val initializer = infer(property.initializer, data).let { effect ->
+            if (property.initializer != null && property.returnTypeRef.coneType.isBandwidthFlow(session)) {
+                effect.withExpectedFlowValue(property.initializer)
+            } else {
+                effect
+            }
+        }
+        if (property.isContractedFlowStorage(session) && property.initializer != null) {
+            property.flowStorageProblem(initializer.latent, session)?.let { message ->
+                problem("flow-storage-init:" + property.symbol.callableId,
+                    property.initializer?.source ?: property.source, message)
+            }
+        }
         data.bind(property.symbol, initializer.latent)
         return KotlinExpressionEffect(
             network = initializer.network,
@@ -182,9 +312,60 @@ internal class KotlinNetworkEffectVisitor(
         data: KotlinEffectContext,
     ): KotlinExpressionEffect {
         val receivers = inferReceivers(propertyAccessExpression, data)
+        val symbol = propertyAccessExpression.resolvedSymbol()
+        val property = symbol?.flowStorageProperty()
+        if (property != null) validateFlowPropertyReceiver(property, propertyAccessExpression, data)
+        if (property?.isContractedFlowStorage(session) == true) {
+            // Getter evaluation can perform eager work; its returned Flow is
+            // described by the stable storage invariant, not any one instance.
+            val getterWork = if (symbol?.fir is FirProperty) {
+                property.getter?.let { functionSummary(it).network } ?: Effect.Empty
+            } else Effect.Empty
+            return KotlinExpressionEffect(
+                network = receivers.network.then(getterWork),
+                latent = property.flowStorageEffect(session),
+            )
+        }
+        // Function summaries are cached independently of mutable storage. A
+        // captured var can change after its getter/helper has been summarized.
+        // Reject these sources until the cache tracks such dependencies.
+        if (property != null && !property.isVal &&
+            property.returnTypeRef.coneType.isBandwidthFlow(session)
+        ) {
+            return KotlinExpressionEffect(
+                network = receivers.network,
+                latent = untrackedFlowEffect(),
+            )
+        }
+        // Unlike Flow storage, ordinary channel storage has no checked
+        // assignment invariant. A mutable channel must not retain the source
+        // metadata of an earlier local allocation after being reassigned.
+        if (property != null && !property.isVal &&
+            property.returnTypeRef.coneType.isBandwidthReceiveChannel(session)
+        ) return KotlinExpressionEffect(network = receivers.network)
+        val localChannel = if (data.latentOf(symbol) == null && property?.isVal == true &&
+            property.status.modality == Modality.FINAL && !property.status.isOverride &&
+            property.getter?.body == null
+        ) {
+            // A nonlocal field's initializer is not necessarily visited by a
+            // function walk. Recover only a visible, effect-free allocation;
+            // never evaluate constructor/startup network work at a read site.
+            val factory = property.initializer as? FirFunctionCall
+            factory?.takeIf {
+                it.resolvedFunction()?.symbol?.callableId?.asSingleFqName()?.asString() ==
+                    "kotlinx.coroutines.channels.Channel"
+            }?.let { infer(it, data) }?.takeIf {
+                it.network.concreteOrNull() == NetworkEffect.EMPTY
+            }?.latent
+        } else null
         return KotlinExpressionEffect(
-            network = receivers.network,
-            latent = data.latentOf(propertyAccessExpression.resolvedSymbol()),
+            network = receivers.network.then(
+                if (symbol?.fir is FirProperty &&
+                    property?.receiverParameter?.typeRef?.coneType?.isBandwidthLatentValue(session) == true
+                ) property.getter?.let { functionSummary(it).network } ?: Effect.Empty
+                else Effect.Empty,
+            ),
+            latent = data.latentOf(symbol) ?: localChannel,
         )
     }
 
@@ -196,13 +377,91 @@ internal class KotlinNetworkEffectVisitor(
         variableAssignment: FirVariableAssignment,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect {
-        val value = infer(variableAssignment.rValue, data)
         val target = (variableAssignment.lValue as? FirPropertyAccessExpression)
             ?.resolvedSymbol()
+        val targetType = (target?.fir as? FirCallableDeclaration)?.returnTypeRef?.coneType
+        val value = infer(variableAssignment.rValue, data).let { effect ->
+            if (targetType?.isBandwidthFlow(session) == true) {
+                effect.withExpectedFlowValue(variableAssignment.rValue)
+            } else {
+                effect
+            }
+        }
+        val storage = target?.flowStorageProperty()?.takeIf { it.isContractedFlowStorage(session) }
+        storage?.flowStorageProblem(value.latent, session)?.let { message ->
+            problem("flow-storage-write:" + data.function.displayName() + ":" +
+                variableAssignment.source?.startOffset, variableAssignment.source, message)
+        }
+        val property = target?.flowStorageProperty()
+        if (property != null) {
+            (variableAssignment.lValue as? FirPropertyAccessExpression)?.let {
+                validateFlowPropertyReceiver(property, it, data)
+            }
+        }
         data.bind(target, value.latent)
+        val setterWork = if (target?.fir is FirProperty && (storage != null ||
+            property?.receiverParameter?.typeRef?.coneType?.isBandwidthLatentValue(session) == true)
+        ) {
+            property?.setter?.let { functionSummary(it).network } ?: Effect.Empty
+        } else Effect.Empty
+        val receivers = (variableAssignment.lValue as? FirPropertyAccessExpression)
+            ?.let { inferReceivers(it, data).network } ?: Effect.Empty
         return KotlinExpressionEffect(
-            network = value.network,
+            network = receivers.then(value.network).then(setterWork),
         )
+    }
+
+    /** Both reading and writing an extension property must satisfy its receiver contract. */
+    private fun validateFlowPropertyReceiver(
+        property: FirProperty,
+        access: FirPropertyAccessExpression,
+        context: KotlinEffectContext,
+    ) {
+        val receiver = property.receiverParameter ?: return
+        if (!receiver.typeRef.coneType.isBandwidthLatentValue(session)) return
+        val actual = (access.extensionReceiver ?: access.explicitReceiver)
+            ?.let { infer(it, context).latent?.network }
+        val contract = receiver.effectContract(session) ?: receiver.typeRef.effectContract(session)
+        val declared = contract?.network ?: NetworkEffect.EMPTY
+        if (contract?.variable != null || actual?.concreteOrNull()?.isCoveredBy(declared) != true) {
+            problem("flow-property-receiver:" + property.symbol.callableId + ":" + access.source?.startOffset,
+                access.source,
+                "Flow receiver effect is not covered by the extension property's concrete contract " + declared.render() + ".")
+        }
+    }
+
+    /** Preserve a nullable latent value while evaluating the receiver exactly once. */
+    override fun visitSafeCallExpression(
+        safeCallExpression: FirSafeCallExpression,
+        data: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val receiver = infer(safeCallExpression.receiver, data)
+        val subject = safeCallExpression.checkedSubjectRef.value
+        val hadPrevious = data.safeCallSubjects.containsKey(subject)
+        val previous = data.safeCallSubjects.put(subject, receiver.latent)
+        return try {
+            receiver.then(infer(safeCallExpression.selector, data))
+        } finally {
+            if (hadPrevious) data.safeCallSubjects[subject] = previous
+            else data.safeCallSubjects.remove(subject)
+        }
+    }
+
+    /** The safe-call subject is a value, not a second evaluation of its producer. */
+    override fun visitCheckedSafeCallSubject(
+        checkedSafeCallSubject: FirCheckedSafeCallSubject,
+        data: KotlinEffectContext,
+    ): KotlinExpressionEffect =
+        KotlinExpressionEffect(latent = data.safeCallSubjects[checkedSafeCallSubject])
+
+    /** Resolves an extension receiver as a latent value, just like a parameter. */
+    override fun visitThisReceiverExpression(
+        thisReceiverExpression: FirThisReceiverExpression,
+        data: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val symbol = thisReceiverExpression.calleeReference.boundSymbol as? FirBasedSymbol<*>
+        val receiver = (symbol?.fir as? FirFunction)?.receiverParameter?.symbol ?: symbol
+        return KotlinExpressionEffect(latent = data.latentOf(receiver))
     }
 
     /** Forwards a type operator to its single operand. */
@@ -242,6 +501,26 @@ internal class KotlinNetworkEffectVisitor(
         data: KotlinEffectContext,
     ): KotlinExpressionEffect = inferCall(functionCall, data)
 
+    /** Constructor delegation obeys the same parameter contracts as ordinary calls. */
+    override fun visitDelegatedConstructorCall(
+        delegatedConstructorCall: FirDelegatedConstructorCall,
+        data: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val call = delegatedConstructorCall
+        val cached = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        fun effectOf(expression: FirExpression): KotlinExpressionEffect =
+            cached.getOrPut(expression) { infer(expression, data) }
+        val inputs = sequence(call.argumentList.arguments.map(::effectOf))
+        val target = (call.calleeReference as? FirResolvedNamedReference)?.resolvedSymbol?.fir as? FirFunction
+            ?: return inputs
+        val substitution = validateHigherOrderArguments(
+            call, target, call.argumentEffectsByParameter(::effectOf), null, data,
+        )
+        return inputs.then(KotlinExpressionEffect(
+            network = functionSummary(target, substitution).network,
+        ))
+    }
+
     /** Infers invocation of a Kotlin function value. */
     override fun visitImplicitInvokeCall(
         implicitInvokeCall: FirImplicitInvokeCall,
@@ -263,6 +542,18 @@ internal class KotlinNetworkEffectVisitor(
             )
         },
     )
+
+    /** Preserve both possible Elvis values; the left operand is evaluated once. */
+    override fun visitElvisExpression(
+        elvisExpression: FirElvisExpression,
+        data: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val left = infer(elvisExpression.lhs, data)
+        val right = infer(elvisExpression.rhs, data)
+        // The right operand is conditional. Counting its eager work after the
+        // left is conservative, while the returned producer is an alternative.
+        return left.then(right).copy(latent = left.latent.join(right.latent))
+    }
 
     /**
      * Joins the try and catch paths as alternatives and appends the finally
@@ -306,7 +597,13 @@ internal class KotlinNetworkEffectVisitor(
         returnExpression: FirReturnExpression,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect {
-        val value = infer(returnExpression.result, data)
+        val value = infer(returnExpression.result, data).let { effect ->
+            if (data.function.returnTypeRef.coneType.isBandwidthFlow(session)) {
+                effect.withExpectedFlowValue(returnExpression.result)
+            } else {
+                effect
+            }
+        }
         data.recordReturn(value.latent)
         return KotlinExpressionEffect(
             network = value.network,
@@ -332,6 +629,9 @@ internal class KotlinNetworkEffectVisitor(
         val target: FirFunction =
             (call.resolvedSymbol() as? FirFunctionSymbol<*>)?.fir
                 ?: return inferChildren(call, context)
+        target.concurrentMapContract(session)?.let { contract ->
+            return inferConcurrentMap(call, contract, context)
+        }
         if (target.isStructuredCoroutineScope()) {
             return inferStructuredCoroutineScope(call, context)
         }
@@ -347,14 +647,90 @@ internal class KotlinNetworkEffectVisitor(
         if (target.isFlowSourceBuilder()) {
             return inferFlowSourceBuilder(call, context)
         }
+        when (target.symbol.callableId.asSingleFqName().asString()) {
+            "kotlinx.coroutines.flow.MutableStateFlow",
+            "kotlinx.coroutines.flow.MutableSharedFlow" ->
+                return inferLocalMutableFlowSource(call, target, context)
+            "kotlinx.coroutines.flow.asStateFlow",
+            "kotlinx.coroutines.flow.asSharedFlow" ->
+                return inferTrackedFlowWrapper(call, target, context)
+            "kotlinx.coroutines.channels.Channel" ->
+                return inferLocalChannelSource(call, target, context)
+            "kotlinx.coroutines.flow.receiveAsFlow" ->
+                return inferTrackedFlowWrapper(call, target, context)
+        }
+        if (target.symbol.callableId.asSingleFqName().asString() == "kotlinx.coroutines.flow.emptyFlow" &&
+            target.receiverParameter == null && target.valueParameters.isEmpty() &&
+            target.returnTypeRef.coneType.isBandwidthFlow(session)
+        ) {
+            // This exact zero-argument cold source emits no values and starts
+            // no producer work. Preserve any eagerly evaluated inputs.
+            return sequence(call.receiverExpressions().map { infer(it, context) } +
+                call.argumentList.arguments.map { infer(it, context) })
+                .copy(latent = LatentNetworkEffect())
+        }
+        if (target.symbol.callableId.asSingleFqName().asString() == "androidx.room.coroutines.createFlow") {
+            return inferRoomQueryFlow(call, target, context)
+        }
+        if (target.symbol.callableId.asSingleFqName().asString() in setOf(
+                "kotlinx.coroutines.flow.cancellable",
+                "kotlinx.coroutines.flow.filterNotNull",
+                "kotlinx.coroutines.flow.buffer",
+                "kotlinx.coroutines.flow.flowOn",
+            )
+        ) {
+            // These operators preserve producer work and add no network callbacks.
+            val receivers = call.receiverExpressions().map { infer(it, context) }
+            return sequence(receivers + call.argumentList.arguments.map { infer(it, context) })
+                .copy(latent = receivers.mapNotNull { it.latent }.singleOrNull())
+        }
+        if (target.symbol.callableId.asSingleFqName().asString() ==
+                "kotlinx.coroutines.flow.distinctUntilChanged" &&
+            target.valueParameters.isEmpty()
+        ) {
+            // The no-comparator overload only compares ordinary values; it
+            // does not invoke a user-supplied network callback. Overloads with
+            // a comparator continue through ordinary callback validation.
+            return inferTrackedFlowWrapper(call, target, context)
+        }
+        if (target.symbol.callableId.asSingleFqName().asString() in setOf(
+                "kotlinx.coroutines.flow.catch", "kotlinx.coroutines.flow.onCompletion",
+                "kotlinx.coroutines.flow.onStart",
+            )
+        ) {
+            return inferFlowCompletionOperator(call, target, context)
+        }
+        if (target.symbol.callableId.asSingleFqName().asString() in setOf(
+                "kotlinx.coroutines.flow.filter",
+                "kotlinx.coroutines.flow.map",
+                "kotlinx.coroutines.flow.transform",
+                "kotlinx.coroutines.flow.onEach",
+            )
+        ) {
+            return inferFlowElementOperator(call, target, context)
+        }
+        if (target.symbol.callableId.asSingleFqName().asString() == "kotlinx.coroutines.flow.emitAll") {
+            return inferFlowEmitAll(call, target, context)
+        }
         if (target.isFlatMapMerge()) {
             return inferFlatMapMerge(call, context)
+        }
+        if (target.symbol.callableId.asSingleFqName().asString() == "kotlinx.coroutines.flow.flatMapConcat") {
+            return inferFlatMapConcat(call, target, context)
+        }
+        if (target.symbol.callableId.asSingleFqName().asString() == "kotlinx.coroutines.flow.toList") {
+            return inferFlowToList(call, context)
         }
         if (target.isSemaphoreWithPermit()) {
             return inferSemaphoreWithPermit(call, context)
         }
         if (target.isFlowCollect()) {
             return inferFlowCollect(call, context)
+        }
+        if (target.symbol.callableId.asSingleFqName().asString() ==
+            "kotlinx.coroutines.flow.launchIn"
+        ) {
+            return inferFlowLaunchIn(call, context)
         }
         val repeatedCallbackPolicy = target.repeatedCallbackPolicy()
         if (repeatedCallbackPolicy != null) {
@@ -382,12 +758,18 @@ internal class KotlinNetworkEffectVisitor(
             call = call,
             target = target,
             argumentEffects = argumentEffects,
+            receiverEffect = target.receiverParameter?.let {
+                (call.extensionReceiver ?: call.explicitReceiver)?.let(::effectOf)
+            },
             context = context,
         )
 
         val evaluatedInputs = receiverEffects.then(evaluatedArguments)
-        if (call is FirImplicitInvokeCall) {
-            val invokedValue = call.explicitReceiver ?: call.dispatchReceiver
+        val invokedReceiver = call.explicitReceiver ?: call.dispatchReceiver
+        val isExplicitFunctionInvoke = target.symbol.callableId.callableName.asString() == "invoke" &&
+            invokedReceiver?.resolvedType?.isSomeFunctionType(session) == true
+        if (call is FirImplicitInvokeCall || isExplicitFunctionInvoke) {
+            val invokedValue = invokedReceiver
             return inferFunctionInvocation(
                 invokedValueEffect = invokedValue?.let(::effectOf),
                 evaluatedInputs = evaluatedInputs,
@@ -461,6 +843,9 @@ internal class KotlinNetworkEffectVisitor(
                 val phases = CoroutinePhaseState<Unit>()
                 phases.recordStatement(repeated.inputs)
                 repeated.body?.let { phases.addChild(handle = null, effect = it) }
+                if (repeated.preparation.network != Effect.Empty) {
+                    phases.recordStatement(repeated.preparation)
+                }
                 return phases.finish()
             }
             problem(
@@ -475,6 +860,21 @@ internal class KotlinNetworkEffectVisitor(
         }
         val children = arguments.mapNotNull { it.structuredChild() }
         if (children.size != arguments.size) {
+            val phases = structuredPhases[context]
+            val ownsEveryHandle = phases != null && arguments.all { argument ->
+                val handle = argument.directCoroutineHandle()
+                val property = handle?.fir as? FirProperty
+                handle != null && property != null && property.isLexicalLocalVariable() && property.isVal &&
+                    phases.hasActiveChild(handle)
+            }
+            if (ownsEveryHandle) {
+                // This wait may be guarded by try/catch or another control-flow
+                // node. Ownership establishes that its children are already
+                // accounted for, but does not prove synchronization on every
+                // continuation. Keep them active until a proven wait/scope end.
+                return sequence(call.receiverExpressions().map { infer(it, context) } +
+                    call.argumentList.arguments.map { infer(it, context) })
+            }
             problem(
                 key = "await-all:${context.function.displayName()}:" +
                     "${call.source?.startOffset}",
@@ -495,17 +895,18 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     /**
-     * Infers a collection `map { async { ... } }` as an unknown number of
-     * concurrently active structured children.
+     * Infers a collection callback ending in `async` as an unknown number of
+     * concurrently active structured children, with serial preparation.
      *
      * The collection source and non-callback arguments are evaluated once.
-     * Each mapped async body may overlap every other body, so all downloads in
-     * one iteration need trusted self bounds before replication is finite.
+     * Each mapped async body may overlap every other body. A visible local
+     * semaphore guarding the entire child bounds this batch only; otherwise
+     * downloads need trusted shared self bounds before replication is finite.
      */
     private fun inferRepeatedCoroutineChildren(
         children: RepeatedStructuredChildren,
         context: KotlinEffectContext,
-    ): CoroutineBuilderEffect {
+    ): RepeatedCoroutineChildrenEffect {
         val mapCall = children.mapCall
         val callback = mapCall.visibleLambdaArgument()
         val inputs = sequence(
@@ -514,36 +915,186 @@ internal class KotlinNetworkEffectVisitor(
                     .filter { it.visibleLambda() !== callback }
                     .map { infer(it, context) },
         )
+        // Bind preparation locals before inferring the returned child's body.
+        // These statements run once per element, and may overlap children from
+        // earlier elements. Their unrelated escaping work is not joined by
+        // awaiting the returned collection.
+        val prefix = sequence(children.preparation.map { infer(it, context) })
         val child = inferCoroutineBuilder(children.builderCall, context)
-        val perElement = child.inputs.then(child.body ?: KotlinExpressionEffect())
-        val network = perElement.network
-        if (network == Effect.Empty) {
-            return CoroutineBuilderEffect(inputs = inputs, body = KotlinExpressionEffect())
-        }
-        if (network.escapingOnly() != Effect.Empty) {
-            problem(
-                key = "mapped-async-escaping:${context.function.displayName()}:" +
+        val preparation = KotlinExpressionEffect(
+            network = repeatNetworkEffect(
+                effect = prefix.then(child.inputs).network,
+                key = "mapped-async-preparation:${context.function.displayName()}:" +
                     "${mapCall.source?.startOffset}",
                 source = mapCall.source ?: context.function.source,
-                message = "Cannot infer map { async { ... } } when an async body starts " +
-                    "network work that may outlive that child. Keep nested work structured.",
-            )
-            return CoroutineBuilderEffect(inputs = inputs, body = perElement)
+                missingBoundMessage = "Escaping network work before a mapped async child may " +
+                    "overlap across an unknown number of elements. Use a self bound for every " +
+                    "escaping download.",
+            ),
+        )
+        val network = child.body?.network ?: Effect.Empty
+        if (network == Effect.Empty) {
+            return RepeatedCoroutineChildrenEffect(inputs, preparation, child.body)
         }
-        val repeated = repeatNetworkEffect(
+        if (network.escapingOnly() != Effect.Empty) {
+            val escapingMessage = "Cannot infer map { async { ... } } when an async body starts " +
+                "network work that may outlive that child without a self bound. " +
+                "Bound retained work independently of the child permit."
+            val key = "mapped-async-escaping:${context.function.displayName()}:" +
+                mapCall.source?.startOffset
+            val source = mapCall.source ?: context.function.source
+            val localCapacity = children.localSemaphoreBatchCapacity(context)
+            val repeated = if (localCapacity != null) {
+                boundedRepeatedNetworkEffect(
+                    effect = network,
+                    maxConcurrentBodies = localCapacity,
+                    key = key,
+                    source = source,
+                    missingBoundMessage = escapingMessage,
+                )
+            } else {
+                val completing = repeatNetworkEffect(
+                    effect = network.completingOnly().withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
+                    key = "$key:completing",
+                    source = source,
+                    missingBoundMessage = "Mapped async children need shared self bounds " +
+                        "or a visible local Semaphore for completing downloads.",
+                ).withLifetime(DownloadLifetime.COMPLETES_WITH_CALL)
+                val escaping = repeatNetworkEffect(
+                    effect = network.escapingOnly(),
+                    key = key,
+                    source = source,
+                    missingBoundMessage = escapingMessage,
+                )
+                completing.parallel(escaping)
+            }
+            return RepeatedCoroutineChildrenEffect(
+                inputs = inputs,
+                preparation = preparation,
+                // Await joins the child, not jobs that the child has retained.
+                // Preserve the latter's lifetime across the awaitAll boundary.
+                body = KotlinExpressionEffect(network = repeated),
+            )
+        }
+        val localCapacity = children.localSemaphoreBatchCapacity(context)
+        val repeated = if (localCapacity != null) {
+            // Consume the lexical gate here. Exporting it as a self bound would
+            // incorrectly merge different allocations in concurrent calls.
+            network.boundedReplication(localCapacity)
+        } else repeatNetworkEffect(
             effect = network.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL),
             key = "mapped-async-self-bound:${context.function.displayName()}:" +
                 "${mapCall.source?.startOffset}",
             source = mapCall.source ?: context.function.source,
             missingBoundMessage = "Mapped async children may overlap across an unknown " +
-                "number of collection elements. Use a self bound for every download.",
+                "number of collection elements. Use a self bound for every download, or " +
+                "guard each complete async body with one constant local Semaphore " +
+                "allocated before map.",
         )
-        return CoroutineBuilderEffect(
+        return RepeatedCoroutineChildrenEffect(
             inputs = inputs,
+            preparation = preparation,
             body = KotlinExpressionEffect(
                 network = repeated.withLifetime(DownloadLifetime.COMPLETES_WITH_CALL),
             ),
         )
+    }
+
+    /**
+     * Recognizes a batch-local resource without allowing it to escape as a
+     * process-wide download bound. The gate must be allocated outside this map
+     * in the analyzed function, and every access must be a direct withPermit
+     * receiver or an availablePermits observation. Aliases, manual release, and
+     * passing the gate elsewhere fail this deliberately narrow rule.
+     *
+     * Only an empty-effect prefix may precede the terminal permit block, so
+     * unprotected work cannot inherit its bound. The ordinary effect inference
+     * separately requires independent self bounds for escaping work and
+     * preserves structured fanout within one permit.
+     */
+    private fun RepeatedStructuredChildren.localSemaphoreBatchCapacity(
+        context: KotlinEffectContext,
+    ): Int? {
+        val childBody = builderCall.visibleLambdaArgument()?.anonymousFunction?.body
+            ?: return null
+        val (permit, prefix) = childBody.semaphoreGuardAndPrefix() ?: return null
+        if (prefix.any { infer(it, context).network != Effect.Empty }) return null
+        val property = permit.receiverExpressions()
+            .mapNotNull { it.resolvedSymbol()?.fir as? FirProperty }
+            .distinct()
+            .singleOrNull()
+            ?: return null
+        if (!property.isVal || !property.isLexicalLocalVariable()) return null
+        val capacity = property.initializer?.semaphoreInitializerCapacity() ?: return null
+        val enclosingBody = context.function.body ?: return null
+        if (!enclosingBody.containsDeclaration(property) || mapCall.containsDeclaration(property)) {
+            return null
+        }
+        var onlyPermitReceivers = true
+        enclosingBody.accept(object : FirVisitorVoid() {
+            override fun visitElement(element: FirElement) {
+                if (onlyPermitReceivers) element.acceptChildren(this)
+            }
+
+            override fun visitFunctionCall(functionCall: FirFunctionCall) {
+                val receivers = functionCall.receiverExpressions()
+                if (functionCall.resolvedFunction()?.isSemaphoreWithPermit() == true &&
+                    receivers.any { it.resolvedSymbol() == property.symbol }
+                ) {
+                    // Do not visit the approved receiver, but check arguments
+                    // and any other receiver for hidden aliases or releases.
+                    receivers.filter { it.resolvedSymbol() != property.symbol }
+                        .forEach { it.accept(this) }
+                    functionCall.argumentList.arguments.forEach { it.accept(this) }
+                } else {
+                    visitElement(functionCall)
+                }
+            }
+
+            override fun visitPropertyAccessExpression(
+                propertyAccessExpression: FirPropertyAccessExpression,
+            ) {
+                val symbol = propertyAccessExpression.resolvedSymbol()
+                if (symbol == property.symbol) {
+                    onlyPermitReceivers = false
+                } else if ((symbol as? FirCallableSymbol<*>)?.callableId
+                        ?.asSingleFqName()?.asString() ==
+                    "kotlinx.coroutines.sync.Semaphore.availablePermits"
+                ) {
+                    propertyAccessExpression.receiverExpressions()
+                        .filter { it.resolvedSymbol() != property.symbol }
+                        .forEach { it.accept(this) }
+                } else {
+                    visitElement(propertyAccessExpression)
+                }
+            }
+        })
+        return capacity.takeIf { onlyPermitReceivers }
+    }
+
+    /** Retains prefix work for an explicit emptiness check, never dropping it. */
+    private fun FirElement.semaphoreGuardAndPrefix(): Pair<FirFunctionCall, List<FirElement>>? = when (this) {
+        is FirFunctionCall -> takeIf { resolvedFunction()?.isSemaphoreWithPermit() == true }
+            ?.let { it to emptyList() }
+        is FirBlock -> statements.lastOrNull()?.semaphoreGuardAndPrefix()?.let { (call, prefix) ->
+            call to (statements.dropLast(1) + prefix)
+        }
+        is FirReturnExpression -> result.semaphoreGuardAndPrefix()
+        is FirWrappedArgumentExpression -> expression.semaphoreGuardAndPrefix()
+        is FirWrappedExpression -> expression.semaphoreGuardAndPrefix()
+        else -> null
+    }
+
+    /** Checks allocation containment by declaration identity, including lambdas. */
+    private fun FirElement.containsDeclaration(property: FirProperty): Boolean {
+        var found = false
+        accept(object : FirVisitorVoid() {
+            override fun visitElement(element: FirElement) {
+                if (element === property) found = true
+                else if (!found) element.acceptChildren(this)
+            }
+        })
+        return found
     }
 
     /**
@@ -604,6 +1155,139 @@ internal class KotlinNetworkEffectVisitor(
         } ?: Effect.Empty
         return evaluatedInputs.copy(
             latent = LatentNetworkEffect(network = sourceNetwork),
+        )
+    }
+
+    /**
+     * MutableStateFlow and MutableSharedFlow allocate local signaling storage;
+     * observing either starts no producer. Initial/configuration expressions
+     * still run now, and independently launched hot producers are charged at
+     * their own start sites, never at collection.
+     */
+    private fun inferLocalMutableFlowSource(
+        call: FirFunctionCall,
+        target: FirFunction,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val receivers = call.receiverExpressions().map { infer(it, context) }
+        val arguments = call.argumentList.arguments.map { infer(it, context) }
+        val name = target.symbol.callableId.callableName.asString()
+        val expectedParameters = when (name) {
+            "MutableStateFlow" -> listOf("value")
+            "MutableSharedFlow" -> listOf("replay", "extraBufferCapacity", "onBufferOverflow")
+            else -> emptyList()
+        }
+        val signatureMatches = target.receiverParameter == null &&
+            target.valueParameters.map { it.name.asString() } == expectedParameters &&
+            target.returnTypeRef.coneType.isBandwidthFlow(session)
+        val latentPayload = arguments.any { it.latent != null } ||
+            call.hasDirectLatentPayload()
+        val invalid = when {
+            !signatureMatches -> "Only the audited $name source has a receiving-effect contract."
+            latentPayload -> "$name cannot hide a Flow or function value in its emitted payload."
+            else -> null
+        }
+        if (invalid != null) problem(
+            "local-hot-flow-source:" + context.function.displayName() + ":" + call.source?.startOffset,
+            call.source ?: context.function.source,
+            invalid,
+        )
+        return sequence(receivers + arguments).copy(
+            latent = LatentNetworkEffect(network = invalid?.let(Effect::Invalid) ?: Effect.Empty),
+        )
+    }
+
+    /**
+     * The ordinary Channel factory allocates local signaling storage and
+     * launches no producer. Track only that receiving effect; this is not a
+     * contract for arbitrary ReceiveChannel implementations or producer(...).
+     * An undelivered-element callback may run later during cancellation, so
+     * only a known empty callback is admitted by this narrow source rule.
+     */
+    private fun inferLocalChannelSource(
+        call: FirFunctionCall,
+        target: FirFunction,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val cache = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        fun effectOf(expression: FirExpression): KotlinExpressionEffect =
+            cache.getOrPut(expression) { infer(expression, context) }
+        val receivers = call.receiverExpressions().map(::effectOf)
+        val arguments = call.argumentList.arguments.map(::effectOf)
+        val byParameter = call.argumentEffectsByParameter(::effectOf)
+        val signatureMatches = target.receiverParameter == null &&
+            target.valueParameters.map { it.name.asString() } ==
+                listOf("capacity", "onBufferOverflow", "onUndeliveredElement")
+        val cleanupParameter = target.valueParameters.singleOrNull {
+            it.name.asString() == "onUndeliveredElement"
+        }
+        val cleanupArgument = call.argumentForParameter("onUndeliveredElement")
+        val cleanup = cleanupParameter?.let { byParameter[it]?.latent }
+        val cleanupIsEmpty = cleanupArgument == null || cleanupArgument.isDefinitelyNullValue() ||
+            cleanup?.let { it.network == Effect.Empty && it.returned == null } == true
+        val hiddenInput = byParameter.any { (parameter, effect) ->
+            parameter !== cleanupParameter && effect.latent != null
+        }
+        val invalid = when {
+            !signatureMatches -> "Only the audited local Channel factory has a receiving-effect contract."
+            !cleanupIsEmpty -> "The local Channel source requires an empty onUndeliveredElement callback effect."
+            hiddenInput || call.hasDirectLatentPayload() ->
+                "A local Channel cannot hide a Flow or function value in its emitted payload."
+            else -> null
+        }
+        if (invalid != null) problem(
+            "channel-source:" + context.function.displayName() + ":" + call.source?.startOffset,
+            call.source ?: context.function.source,
+            invalid,
+        )
+        return sequence(receivers + arguments).copy(
+            latent = LatentNetworkEffect(network = invalid?.let(Effect::Invalid) ?: Effect.Empty),
+        )
+    }
+
+    /** Reject latent element values until emitted-payload effects are modeled. */
+    private fun FirFunctionCall.hasDirectLatentPayload(): Boolean =
+        resolvedType.typeArguments.any { projection ->
+            (projection as? ConeKotlinTypeProjection)?.type?.isBandwidthLatentValue(session) == true
+        }
+
+    /**
+     * Read-only state wrappers and receiveAsFlow preserve known receiving
+     * effects. Unknown channels are not silently declared network-free: their
+     * transport/producer ownership needs a visible local source or contract.
+     */
+    private fun inferTrackedFlowWrapper(
+        call: FirFunctionCall,
+        target: FirFunction,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val receivers = call.receiverExpressions().map { infer(it, context) }
+        val arguments = call.argumentList.arguments.map { infer(it, context) }
+        val source = receivers.mapNotNull { it.latent }.singleOrNull()
+        val name = target.symbol.callableId.callableName.asString()
+        val mutableChannelReceiver = name == "receiveAsFlow" &&
+            call.receiverExpressions().any { receiver ->
+                (receiver.resolvedSymbol()?.flowStorageProperty())?.isVal == false
+            }
+        val invalid = when {
+            target.receiverParameter == null || target.valueParameters.isNotEmpty() ||
+                !target.returnTypeRef.coneType.isBandwidthFlow(session) ->
+                "Only the audited $name receiver wrapper has a receiving-effect contract."
+            mutableChannelReceiver || source == null || source.network.invalidMessage() != null ->
+                if (name == "receiveAsFlow")
+                    "Cannot infer receiveAsFlow on an untracked channel. Use a visible local Channel source or an explicit receiving-effect contract; track its producer separately."
+                else "Cannot infer $name on an untracked Flow. Declare or infer the receiver collection effect."
+            call.hasDirectLatentPayload() ->
+                "$name cannot hide a Flow or function value in its emitted payload."
+            else -> null
+        }
+        if (invalid != null) problem(
+            "tracked-flow-wrapper:" + context.function.displayName() + ":" + call.source?.startOffset,
+            call.source ?: context.function.source,
+            invalid,
+        )
+        return sequence(receivers + arguments).copy(
+            latent = invalid?.let { LatentNetworkEffect(network = Effect.Invalid(it)) } ?: source,
         )
     }
 
@@ -696,6 +1380,149 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     /**
+     * A flatMapConcat callback runs and its returned Flow is collected before
+     * the next callback begins. Only escaped work accumulates across elements.
+     */
+    private fun inferFlatMapConcat(
+        call: FirFunctionCall,
+        target: FirFunction,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val cache = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        fun effectOf(expression: FirExpression): KotlinExpressionEffect =
+            cache.getOrPut(expression) { infer(expression, context) }
+        val receivers = call.receiverExpressions().map(::effectOf)
+        val inputs = sequence(receivers + call.argumentList.arguments.map(::effectOf))
+        val source = receivers.mapNotNull { it.latent }.singleOrNull()
+        val parameter = target.valueParameters.singleOrNull {
+            it.returnTypeRef.coneType.isSomeFunctionType(session)
+        }
+        val transform = parameter?.let { call.argumentEffectsByParameter(::effectOf)[it]?.latent }
+        val inner = transform?.returned
+        val invalid = when {
+            source == null || source.network.invalidMessage() != null ->
+                "Cannot infer flatMapConcat on an untracked source Flow. " +
+                    "Declare or infer its collection effect."
+            transform == null || transform.network.invalidMessage() != null ||
+                inner == null || inner.network.invalidMessage() != null ->
+                "Cannot infer the Flow returned by flatMapConcat's transform. " +
+                    "Use a visible transform returning a tracked Flow."
+            else -> null
+        }
+        if (invalid != null) {
+            problem("flat-map-concat:" + context.function.displayName() + ":" + call.source?.startOffset,
+                call.source ?: context.function.source, invalid)
+        }
+        val repeated = if (invalid == null) repeatNetworkEffect(
+            effect = transform!!.network.then(inner!!.network),
+            key = "flat-map-concat-repeat:" + context.function.displayName() + ":" + call.source?.startOffset,
+            source = call.source ?: context.function.source,
+            missingBoundMessage = "Escaping network work in flatMapConcat may overlap " +
+                "across an unknown number of elements. Use a self bound for every download.",
+        ) else Effect.Invalid(invalid)
+        return inputs.copy(latent = LatentNetworkEffect(
+            network = invalid?.let(Effect::Invalid) ?: source!!.network.parallel(repeated),
+        ))
+    }
+
+    /** toList is a terminal collector with no callback or latent producer result. */
+    private fun inferFlowToList(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val receivers = call.receiverExpressions().map { infer(it, context) }
+        val inputs = sequence(receivers + call.argumentList.arguments.map { infer(it, context) })
+        val source = receivers.mapNotNull { it.latent }.singleOrNull()
+        val invalid = if (source == null || source.network.invalidMessage() != null)
+            "Cannot infer toList on an untracked Flow. Declare or infer its collection effect."
+            else null
+        if (invalid != null) {
+            problem("flow-to-list:" + context.function.displayName() + ":" + call.source?.startOffset,
+                call.source ?: context.function.source, invalid)
+        }
+        return inputs.then(KotlinExpressionEffect(
+            network = invalid?.let(Effect::Invalid) ?: source!!.network,
+        ))
+    }
+
+    /**
+     * Instantiates an audited cold Flow operator contract. Construction only
+     * evaluates the inputs; collection overlaps the upstream with at most k
+     * completing callbacks. Escaped callback work has unknown repetition.
+     */
+    private fun inferConcurrentMap(
+        call: FirFunctionCall,
+        contract: ConcurrentMapContract,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val cached = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        fun effectOf(expression: FirExpression): KotlinExpressionEffect =
+            cached.getOrPut(expression) { infer(expression, context) }
+        val receiverEffects = call.receiverExpressions().map(::effectOf)
+        val evaluatedInputs = sequence(
+            receiverEffects + call.argumentList.arguments.map(::effectOf),
+        )
+        val sourceFlow = receiverEffects.mapNotNull { it.latent }.singleOrNull()
+        val callbackArgument = call.argumentForParameter(contract.callbackParameter)
+        val callback = callbackArgument?.let(::effectOf)?.latent
+        val concurrency = call.argumentForParameter(contract.concurrencyParameter)
+            ?.positiveConstantInt()
+        fun reject(suffix: String, message: String) {
+            problem(
+                key = "concurrent-map-" + suffix + ":" + context.function.displayName() +
+                    ":" + call.source?.startOffset,
+                source = call.source ?: context.function.source,
+                message = message,
+            )
+        }
+        if (sourceFlow == null || sourceFlow.network.invalidMessage() != null) {
+            reject("source", "Cannot infer the source Flow for @BandwidthConcurrentMap; " +
+                "declare or infer its collection effect.")
+        }
+        if (concurrency == null) {
+            reject("concurrency", "@BandwidthConcurrentMap concurrency must be an explicit " +
+                "positive constant.")
+        }
+        if (callback == null || callback.network.invalidMessage() != null) {
+            reject("callback", "Cannot infer the @BandwidthConcurrentMap callback effect; " +
+                "supply a tracked callback explicitly.")
+        }
+        val hiddenLatentArgument = call.argumentEffectsByParameter(::effectOf).any { (parameter, effect) ->
+            parameter.name.asString() != contract.callbackParameter && effect.latent != null
+        }
+        if (hiddenLatentArgument) {
+            reject("extra-input", "@BandwidthConcurrentMap does not support additional latent " +
+                "Flow or function arguments, including values hidden behind generic types.")
+        }
+        if (callback?.returned != null) {
+            reject("returned-value", "@BandwidthConcurrentMap callbacks returning latent " +
+                "function or Flow values are unsupported; return an ordinary value.")
+        }
+        if (sourceFlow == null || sourceFlow.network.invalidMessage() != null ||
+            concurrency == null || callback == null ||
+            callback.network.invalidMessage() != null || callback.returned != null ||
+            hiddenLatentArgument
+        ) {
+            return evaluatedInputs.copy(latent = untrackedFlowEffect())
+        }
+        val repeatedCallback = boundedRepeatedNetworkEffect(
+            effect = callback.network,
+            maxConcurrentBodies = concurrency,
+            key = "concurrent-map-callback-repeat:" + context.function.displayName() +
+                ":" + call.source?.startOffset,
+            source = call.source ?: context.function.source,
+            missingBoundMessage = "Network work escaping a @BandwidthConcurrentMap callback " +
+                "may overlap across an unknown number of elements. Use a self bound " +
+                "for every download.",
+        )
+        return evaluatedInputs.copy(
+            latent = LatentNetworkEffect(
+                network = sourceFlow.network.parallel(repeatedCallback),
+            ),
+        )
+    }
+
+    /**
      * Preserves the effect of one `Semaphore.withPermit { ... }` invocation and
      * records the shared capacity for a surrounding repetition boundary.
      *
@@ -754,7 +1581,180 @@ internal class KotlinNetworkEffectVisitor(
         )
     }
 
-    /** Materializes a tracked Flow at the no-argument `collect()` terminal. */
+    /**
+     * Room 2.8.4 createFlow maps local invalidation signals to one completed
+     * query callback at a time. The callback, including any escaping work, is
+     * repeated lazily per collection; it is never silently assumed pure.
+     */
+    private fun inferRoomQueryFlow(
+        call: FirFunctionCall,
+        target: FirFunction,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val cache = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        fun effectOf(expression: FirExpression): KotlinExpressionEffect =
+            cache.getOrPut(expression) { infer(expression, context) }
+        val receivers = call.receiverExpressions().map(::effectOf)
+        val inputs = sequence(receivers + call.argumentList.arguments.map(::effectOf))
+        val arguments = call.argumentEffectsByParameter(::effectOf)
+        val callback = arguments.entries.singleOrNull { it.key.name.asString() == "block" }?.value?.latent
+        val signatureMatches = target.receiverParameter == null &&
+            target.valueParameters.map { it.name.asString() } == listOf("db", "inTransaction", "tableNames", "block") &&
+            target.returnTypeRef.coneType.isBandwidthFlow(session) &&
+            target.valueParameters.last().returnTypeRef.coneType.isSomeFunctionType(session)
+        val hiddenLatent = receivers.any { it.latent != null } || arguments.any { (parameter, effect) ->
+            parameter.name.asString() != "block" && effect.latent != null
+        }
+        val invalid = when {
+            !signatureMatches -> "Only the audited Room createFlow query overload has an effect contract."
+            callback == null || callback.network.invalidMessage() != null ->
+                "Cannot infer the Room createFlow query callback effect; supply a tracked callback."
+            callback.returned != null ->
+                "Room createFlow cannot hide a latent Flow or function in its emitted query result."
+            hiddenLatent -> "Room createFlow does not support additional latent Flow or function inputs."
+            else -> null
+        }
+        if (invalid != null) {
+            problem("room-query-flow:" + context.function.displayName() + ":" + call.source?.startOffset,
+                call.source ?: context.function.source, invalid)
+        }
+        val query = if (invalid == null) repeatNetworkEffect(
+            effect = callback!!.network,
+            key = "room-query-repeat:" + context.function.displayName() + ":" + call.source?.startOffset,
+            source = call.source ?: context.function.source,
+            missingBoundMessage = "Escaping network work in a Room query callback may overlap " +
+                "across invalidations. Use a self bound for every download.",
+        ) else Effect.Invalid(invalid)
+        return inputs.copy(latent = LatentNetworkEffect(network = query))
+    }
+
+    /**
+     * These actions run lazily at most once per collection. onStart precedes
+     * upstream collection; recovery/completion follows it. Sequential
+     * composition retains work escaping either action or the producer.
+     */
+    private fun inferFlowCompletionOperator(
+        call: FirFunctionCall,
+        target: FirFunction,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val receivers = call.receiverExpressions().map { infer(it, context) }
+        val arguments = call.argumentList.arguments.map { infer(it, context) }
+        val producer = receivers.mapNotNull { it.latent }.singleOrNull()
+        val callback = arguments.singleOrNull()?.latent
+        val invalid = when {
+            producer == null || producer.network.invalidMessage() != null ->
+                "Cannot infer a recovery/completion operator on an untracked Flow. " +
+                    "Declare or infer the source collection effect."
+            callback == null || callback.network.invalidMessage() != null ->
+                "Cannot infer the Flow recovery/completion callback effect. " +
+                    "Use a visible callback or an explicit effect contract."
+            else -> null
+        }
+        if (invalid != null) {
+            problem("flow-completion:" + context.function.displayName() + ":" + call.source?.startOffset,
+                call.source ?: context.function.source, invalid)
+        }
+        return sequence(receivers + arguments).copy(
+            latent = LatentNetworkEffect(network = invalid?.let(Effect::Invalid)
+                ?: if (target.symbol.callableId.asSingleFqName().asString() == "kotlinx.coroutines.flow.onStart")
+                    callback!!.network.then(producer!!.network)
+                else producer!!.network.then(callback!!.network)),
+        )
+    }
+
+    /**
+     * These cold operators invoke one callback at a time for upstream elements.
+     * Callback work starts only when the returned Flow is collected. An upstream
+     * buffer or dispatcher may keep its producer active during a callback, so
+     * producer and repeated consumer effects are conservatively parallel.
+     */
+    private fun inferFlowElementOperator(
+        call: FirFunctionCall,
+        target: FirFunction,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val cache = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        fun effectOf(expression: FirExpression): KotlinExpressionEffect =
+            cache.getOrPut(expression) { infer(expression, context) }
+        val receivers = call.receiverExpressions().map(::effectOf)
+        val arguments = call.argumentList.arguments.map(::effectOf)
+        val producer = receivers.mapNotNull { it.latent }.singleOrNull()
+        val parameter = target.valueParameters.singleOrNull {
+            it.returnTypeRef.coneType.isSomeFunctionType(session)
+        }
+        val callback = parameter?.let { call.argumentEffectsByParameter(::effectOf)[it]?.latent }
+        val invalid = when {
+            producer == null || producer.network.invalidMessage() != null ->
+                "Cannot infer a per-element operator on an untracked Flow. " +
+                    "Declare or infer the source collection effect."
+            callback == null || callback.network.invalidMessage() != null ->
+                "Cannot infer the Flow per-element callback effect. " +
+                    "Use a visible callback or an explicit effect contract."
+            target.symbol.callableId.asSingleFqName().asString() == "kotlinx.coroutines.flow.map" &&
+                callback.returned != null ->
+                "Flow map cannot hide a Flow or function value in its emitted payload. " +
+                    "Collect the returned Flow with a modeled flattening operator."
+            else -> null
+        }
+        if (invalid != null) {
+            problem("flow-element:" + context.function.displayName() + ":" + call.source?.startOffset,
+                call.source ?: context.function.source, invalid)
+        }
+        val consumer = if (invalid == null) repeatNetworkEffect(
+            effect = callback!!.network,
+            key = "flow-element-repeat:" + context.function.displayName() + ":" + call.source?.startOffset,
+            source = call.source ?: context.function.source,
+            missingBoundMessage = "Escaping network work in a Flow per-element callback " +
+                "may overlap across an unknown number of elements. Use a self bound " +
+                "for every download.",
+        ) else Effect.Invalid(invalid)
+        return sequence(receivers + arguments).copy(
+            latent = LatentNetworkEffect(network = invalid?.let(Effect::Invalid)
+                ?: producer!!.network.parallel(consumer)),
+        )
+    }
+
+    /** `emitAll(Flow)` collects that producer; channel ownership needs another contract. */
+    private fun inferFlowEmitAll(
+        call: FirFunctionCall,
+        target: FirFunction,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val cache = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
+        fun effectOf(expression: FirExpression): KotlinExpressionEffect =
+            cache.getOrPut(expression) { infer(expression, context) }
+        val inputs = sequence(call.receiverExpressions().map(::effectOf) +
+            call.argumentList.arguments.map(::effectOf))
+        val parameter = target.valueParameters.singleOrNull {
+            it.returnTypeRef.coneType.isBandwidthFlow(session)
+        }
+        val producer = parameter?.let { call.argumentEffectsByParameter(::effectOf)[it]?.latent }
+        val invalid = when {
+            parameter == null -> "Only the Flow overload of emitAll has a collection-effect contract; " +
+                "channel producers need an explicit lifetime contract."
+            producer == null || producer.network.invalidMessage() != null ->
+                "Cannot infer emitAll on an untracked Flow. Declare or infer its collection effect."
+            else -> null
+        }
+        if (invalid != null) {
+            problem("flow-emit-all:" + context.function.displayName() + ":" + call.source?.startOffset,
+                call.source ?: context.function.source, invalid)
+        }
+        return inputs.then(KotlinExpressionEffect(network = invalid?.let(Effect::Invalid) ?: producer!!.network))
+    }
+
+    /**
+     * Materializes the source Flow and its sequentially invoked collector.
+     * Upstream producers can run concurrently (for example, behind a buffer),
+     * so their effect is conservatively parallel with the consumer effect.
+     * Completing consumer work does not accumulate across elements; escaping
+     * work crosses the ordinary repetition boundary and needs a self bound.
+     * collectLatest has the same conservative bound: its audited transform
+     * implementation cancels AND joins the prior action before starting the
+     * next, so completing actions do not overlap each other. Independent work
+     * escaping an action still crosses the usual repetition/self-bound check.
+     */
     private fun inferFlowCollect(
         call: FirFunctionCall,
         context: KotlinEffectContext,
@@ -763,7 +1763,7 @@ internal class KotlinNetworkEffectVisitor(
         val argumentEffects = call.argumentList.arguments.map { infer(it, context) }
         val evaluatedInputs = sequence(receiverEffects + argumentEffects)
         val flow = receiverEffects.mapNotNull { it.latent }.singleOrNull()
-        if (flow == null) {
+        if (flow == null || flow.network.invalidMessage() != null) {
             problem(
                 key = "flow-collect-source:${context.function.displayName()}:" +
                     call.source?.startOffset,
@@ -773,21 +1773,74 @@ internal class KotlinNetworkEffectVisitor(
                     "function.",
             )
         }
-        if (call.argumentList.arguments.isNotEmpty()) {
+        val consumer = argumentEffects.mapIndexed { index, argument ->
+            val collector = argument.latent
+            if (collector == null || collector.network.invalidMessage() != null) {
+                val message = "Cannot infer the Flow collector callback effect. " +
+                    "Use a visible callback or a value with an explicit effect contract."
+                problem(
+                    key = "flow-collector-callback:${context.function.displayName()}:" +
+                        "${call.source?.startOffset}:$index",
+                    source = call.source ?: context.function.source,
+                    message = message,
+                )
+                Effect.Invalid(message)
+            } else {
+                repeatNetworkEffect(
+                    effect = collector.network,
+                    key = "flow-collector-repeat:${context.function.displayName()}:" +
+                        "${call.source?.startOffset}:$index",
+                    source = call.source ?: context.function.source,
+                    missingBoundMessage = "Escaping network work in a Flow collector callback " +
+                        "may overlap across an unknown number of elements. Use a self bound " +
+                        "for every download.",
+                )
+            }
+        }.fold(Effect.Empty as Effect) { result, effect -> result.parallel(effect) }
+        val producer = flow?.network ?: Effect.Invalid(
+            "Cannot infer collection effect of an untracked Flow.",
+        )
+        return evaluatedInputs.then(
+            KotlinExpressionEffect(network = producer.parallel(consumer)),
+        )
+    }
+
+    /**
+     * `launchIn(scope)` starts one collection and returns its Job immediately.
+     * Per-element work from operators such as onEach is already part of the
+     * source's latent effect; materialize that whole effect as escaping work.
+     *
+     * Receiver construction and scope evaluation remain eager, so neither is
+     * reclassified as child work. The core sequential rule then overlaps this
+     * child with the continuation, preserving its internal sequential phases.
+     * An enclosing loop/handler applies repetition and requires shared bounds.
+     * We do not infer child ownership from a passed scope value: in particular,
+     * a launchIn on an external scope must survive an enclosing coroutineScope.
+     */
+    private fun inferFlowLaunchIn(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val receiverEffects = call.receiverExpressions().map { infer(it, context) }
+        val evaluatedInputs = sequence(
+            receiverEffects + call.argumentList.arguments.map { infer(it, context) },
+        )
+        val producer = receiverEffects.mapNotNull { it.latent }.singleOrNull()
+        val network = if (producer == null || producer.network.invalidMessage() != null) {
+            val message = "Cannot infer launchIn on an untracked Flow. " +
+                "Declare or infer the source collection effect before starting it."
             problem(
-                key = "flow-collector-callback:${context.function.displayName()}:" +
+                key = "flow-launch-in-source:${context.function.displayName()}:" +
                     call.source?.startOffset,
                 source = call.source ?: context.function.source,
-                message = "Cannot infer collect with a collector callback consistently " +
-                    "across supported Kotlin versions. Use no-argument collect() with " +
-                    "network work in a tracked upstream Flow.",
+                message = message,
             )
+            Effect.Invalid(message)
+        } else {
+            producer.network.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
         }
-        return evaluatedInputs.then(
-            KotlinExpressionEffect(
-                network = flow?.network ?: Effect.Empty,
-            ),
-        )
+        return evaluatedInputs.then(KotlinExpressionEffect(network = network))
+            .copy(latent = null)
     }
 
     /**
@@ -928,7 +1981,9 @@ internal class KotlinNetworkEffectVisitor(
                 }
             }
         val bodyNetwork = callbackBody.network
-        if (bodyNetwork == Effect.Empty) return evaluatedInputs
+        // These APIs return an ordinary result (a collection or Unit), not
+        // the callback value used to construct it. Do not leak input metadata.
+        if (bodyNetwork == Effect.Empty) return evaluatedInputs.copy(latent = null)
         val invocationEffect = repeatedCallbackNetwork(
             bodyNetwork = bodyNetwork,
             callbackName = target.displayName(),
@@ -970,6 +2025,9 @@ internal class KotlinNetworkEffectVisitor(
                     "download."
             },
         )
+        if (policy == RepeatedCallbackPolicy.RETAINED_CONCURRENT) {
+            reportInfo("RAW_CALLBACK_EFFECT callback=$callbackName key=$key body=${bodyNetwork.render()} repeated=${repeated.render()}")
+        }
         return if (policy.mayOutliveCall) {
             repeated.withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
         } else {
@@ -986,52 +2044,173 @@ internal class KotlinNetworkEffectVisitor(
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
         val phases = CoroutinePhaseState<FirBasedSymbol<*>>()
-
-        block.statements.forEach { statement ->
-            val repeatedChildren = statement.repeatedStructuredChildren()
-            if (repeatedChildren != null) {
-                val resolved = inferRepeatedCoroutineChildren(repeatedChildren, context)
-                phases.recordStatement(resolved.inputs)
-                resolved.body?.let {
-                    phases.addChild(handle = repeatedChildren.handle, effect = it)
+        val previousPhases = structuredPhases.put(context, phases)
+        try {
+            block.statements.forEach { statement ->
+                val repeatedChildren = statement.repeatedStructuredChildren()
+                if (repeatedChildren != null) {
+                    val resolved = inferRepeatedCoroutineChildren(repeatedChildren, context)
+                    phases.recordStatement(resolved.inputs)
+                    resolved.body?.let {
+                        phases.addChild(handle = repeatedChildren.handle, effect = it)
+                    }
+                    // The callback returns immediately after starting its child.
+                    // All mapped children may therefore overlap preparation in
+                    // later iterations; only the child group remains tracked.
+                    if (resolved.preparation.network != Effect.Empty) {
+                        phases.recordStatement(resolved.preparation)
+                    }
+                    return@forEach
                 }
-                return@forEach
+
+                val child = statement.structuredChild()
+                if (child != null) {
+                    val resolved = inferCoroutineBuilder(child.call, context)
+                    phases.recordStatement(resolved.inputs)
+                    resolved.body?.let { phases.addChild(handle = child.handle, effect = it) }
+                    return@forEach
+                }
+
+                val waitedHandle = statement.coroutineWaitedHandle()
+                val waitedProperty = waitedHandle?.fir as? FirProperty
+                if (waitedHandle != null && waitedProperty?.isVal == true &&
+                    waitedProperty.isLexicalLocalVariable() && phases.synchronize(waitedHandle)
+                ) {
+                    return@forEach
+                }
+
+                inferCoroutineStatement(statement, context, phases)
             }
 
-            val child = statement.structuredChild()
-            if (child != null) {
-                val resolved = inferCoroutineBuilder(child.call, context)
-                phases.recordStatement(resolved.inputs)
-                resolved.body?.let { phases.addChild(handle = child.handle, effect = it) }
-                return@forEach
-            }
-
-            val waitedHandle = statement.coroutineWaitedHandle()
-            if (waitedHandle != null && phases.synchronize(waitedHandle)) {
-                return@forEach
-            }
-
-            phases.recordStatement(infer(statement, context))
+            return phases.finish()
+        } finally {
+            if (previousPhases == null) structuredPhases.remove(context)
+            else structuredPhases[context] = previousPhases
         }
-
-        return phases.finish()
     }
 
     /**
-     * Unwraps this element as an eager collection `map` whose visible callback
-     * consists solely of one structured `async` child.
+     * Splits unconditional eager expression evaluation at a tracked awaitAll.
+     * Inputs are recorded before the parent invocation, whose normal visitor
+     * reuses their values with only their already-recorded eager effects cleared.
+     * This preserves callback effects and evaluation order without exposing the
+     * mutable phase state to inference of branches or deferred function bodies.
+     */
+    private fun inferCoroutineStatement(
+        statement: FirElement,
+        context: KotlinEffectContext,
+        phases: CoroutinePhaseState<FirBasedSymbol<*>>,
+    ) {
+        fun trackedAwait(element: FirElement): List<FirBasedSymbol<*>>? {
+            val call = element as? FirFunctionCall ?: return null
+            if (call.resolvedFunction()?.isAwaitAll() != true) return null
+            val arguments = call.argumentList.arguments.flatMap { it.flattenVarargArguments() }
+            val handles = if (arguments.isEmpty()) {
+                listOfNotNull(call.coroutineWaitedHandle())
+            } else {
+                arguments.map { it.directCoroutineHandle() ?: return null }
+            }
+            if (handles.isEmpty()) return null
+            // A mutable collection may have been replaced since its children
+            // started. Only an immutable local binding establishes this link.
+            if (handles.any { handle ->
+                    val property = handle.fir as? FirProperty
+                    property == null || !property.isLexicalLocalVariable() || !property.isVal ||
+                        !phases.hasActiveChild(handle)
+                }
+            ) return null
+            return handles.distinct()
+        }
+
+        fun containsTrackedAwait(element: FirElement): Boolean =
+            trackedAwait(element) != null ||
+                element.eagerCoroutineInputs().any(::containsTrackedAwait)
+
+        if (!containsTrackedAwait(statement)) {
+            phases.recordStatement(infer(statement, context))
+            return
+        }
+
+        val previous = IdentityHashMap<FirElement, KotlinExpressionEffect?>()
+        fun evaluate(element: FirElement) {
+            if (previous.containsKey(element)) return
+            if (containsTrackedAwait(element)) {
+                element.eagerCoroutineInputs().forEach(::evaluate)
+            }
+            val handles = trackedAwait(element)
+            val value = if (handles != null) {
+                handles.forEach { check(phases.synchronize(it)) }
+                KotlinExpressionEffect()
+            } else {
+                infer(element, context).also(phases::recordStatement)
+            }
+            previous[element] = context.evaluatedExpressions.put(
+                element,
+                value.copy(network = Effect.Empty),
+            )
+        }
+
+        try {
+            evaluate(statement)
+        } finally {
+            previous.forEach { (element, value) ->
+                if (value == null) context.evaluatedExpressions.remove(element)
+                else context.evaluatedExpressions[element] = value
+            }
+        }
+    }
+
+    /**
+     * Only unconditional eager inputs, in source evaluation order. Control-flow
+     * nodes, safe calls, and function/coroutine bodies stay atomic: a wait in one
+     * of those bodies cannot synchronize this statement's surrounding scope.
+     */
+    private fun FirElement.eagerCoroutineInputs(): List<FirElement> = when (this) {
+        is FirProperty -> listOfNotNull(initializer)
+        is FirReturnExpression -> listOf(result)
+        is FirVariableAssignment -> {
+            val access = lValue as? FirPropertyAccessExpression
+            val target = access?.resolvedSymbol()?.fir as? FirProperty
+            if (target?.isLexicalLocalVariable() == true && target.delegate == null &&
+                access.receiverExpressions().isEmpty()
+            ) {
+                listOf(rValue)
+            } else {
+                emptyList()
+            }
+        }
+        is FirFunctionCall -> receiverExpressions() + argumentList.arguments
+        is FirPropertyAccessExpression -> receiverExpressions()
+        is FirCallableReferenceAccess -> receiverExpressions()
+        is FirTypeOperatorCall -> argumentList.arguments
+        is FirVarargArgumentsExpression -> arguments
+        is FirWrappedArgumentExpression -> listOf(expression)
+        is FirNamedArgumentExpression -> listOf(expression)
+        is FirSpreadArgumentExpression -> listOf(expression)
+        is FirWrappedExpression -> listOf(expression)
+        else -> emptyList()
+    }
+
+    /**
+     * Unwraps an eager collection `map` whose callback runs ordinary statements
+     * and returns one visible structured child. mapNotNull may skip an element
+     * via an early null return; alternate returned jobs remain excluded.
      */
     private fun FirElement.repeatedStructuredChildren(): RepeatedStructuredChildren? {
         functionTypeConversionOperand()?.let { return it.repeatedStructuredChildren() }
         return when (this) {
             is FirFunctionCall -> {
                 if (resolvedFunction()?.isEagerCollectionMap() != true) return null
-                val body = visibleLambdaArgument()?.anonymousFunction?.body ?: return null
-                val child = body.statements.singleOrNull()?.structuredChild() ?: return null
+                val callback = visibleLambdaArgument()?.anonymousFunction ?: return null
+                val body = callback.body ?: return null
+                val allowNullReturns = resolvedFunction()?.symbol?.callableId
+                    ?.asSingleFqName()?.asString() == "kotlin.collections.mapNotNull"
+                val returned = body.returnedMappedChild(callback, allowNullReturns) ?: return null
                 RepeatedStructuredChildren(
                     handle = null,
                     mapCall = this,
-                    builderCall = child.call,
+                    preparation = returned.preparation,
+                    builderCall = returned.call,
                 )
             }
             is FirProperty -> initializer
@@ -1044,6 +2223,86 @@ internal class KotlinNetworkEffectVisitor(
             is FirReturnExpression -> result.repeatedStructuredChildren()
             else -> null
         }
+    }
+
+    /**
+     * Follows the value produced by a callback block, retaining preceding work.
+     * FIR can wrap a destructured lambda's original body in a returned block;
+     * these ordinary blocks introduce no coroutine synchronization boundary.
+     */
+    private fun FirElement.returnedMappedChild(
+        callback: FirFunction,
+        allowNullReturns: Boolean = false,
+    ): ReturnedMappedChild? {
+        functionTypeConversionOperand()?.let { return it.returnedMappedChild(callback, allowNullReturns) }
+        return when (this) {
+            is FirBlock -> {
+                val result = statements.lastOrNull()?.returnedMappedChild(callback, allowNullReturns)
+                    ?: return null
+                val preparation = statements.dropLast(1)
+                if (preparation.any {
+                        if (allowNullReturns) it.hasUnsafeNullableMapPreparation(callback)
+                        else it.hasReturnTo(callback)
+                    }
+                ) return null
+                result.copy(preparation = preparation + result.preparation)
+            }
+            is FirReturnExpression -> if (target.labeledElement === callback) {
+                result.returnedMappedChild(callback, allowNullReturns)
+            } else {
+                null
+            }
+            is FirFunctionCall -> structuredChild()
+                ?.takeUnless { hasReturnTo(callback) }
+                ?.let { ReturnedMappedChild(emptyList(), it.call) }
+            is FirWrappedArgumentExpression -> expression.returnedMappedChild(callback, allowNullReturns)
+            is FirNamedArgumentExpression -> expression.returnedMappedChild(callback, allowNullReturns)
+            is FirSpreadArgumentExpression -> expression.returnedMappedChild(callback, allowNullReturns)
+            is FirWrappedExpression -> expression.returnedMappedChild(callback, allowNullReturns)
+            else -> null
+        }
+    }
+
+    /**
+     * mapNotNull may skip an element before its final child starts. Other child
+     * returns and branch starts would require a separate returned-job proof.
+     */
+    private fun FirElement.hasUnsafeNullableMapPreparation(callback: FirFunction): Boolean {
+        var unsafe = false
+        accept(object : FirVisitorVoid() {
+            override fun visitElement(element: FirElement) {
+                if (!unsafe) element.acceptChildren(this)
+            }
+
+            override fun visitReturnExpression(returnExpression: FirReturnExpression) {
+                if (returnExpression.target.labeledElement === callback &&
+                    !returnExpression.result.isDefinitelyNullValue()
+                ) unsafe = true
+                else visitElement(returnExpression)
+            }
+
+            override fun visitFunctionCall(functionCall: FirFunctionCall) {
+                if (functionCall.resolvedFunction()?.isCoroutineBuilder() == true) unsafe = true
+                else visitElement(functionCall)
+            }
+        })
+        return unsafe
+    }
+
+    /** Finds an alternate return of this callback, including inside inline calls. */
+    private fun FirElement.hasReturnTo(function: FirFunction): Boolean {
+        var found = false
+        accept(object : FirVisitorVoid() {
+            override fun visitElement(element: FirElement) {
+                if (!found) element.acceptChildren(this)
+            }
+
+            override fun visitReturnExpression(returnExpression: FirReturnExpression) {
+                if (returnExpression.target.labeledElement === function) found = true
+                else visitElement(returnExpression)
+            }
+        })
+        return found
     }
 
     /**
@@ -1140,6 +2399,15 @@ internal class KotlinNetworkEffectVisitor(
             listOf(this)
         }
 
+    /** Only a direct local handle is a proof of the identity being synchronized. */
+    private fun FirExpression.directCoroutineHandle(): FirBasedSymbol<*>? = when (this) {
+        is FirWrappedArgumentExpression -> expression.directCoroutineHandle()
+        is FirNamedArgumentExpression -> expression.directCoroutineHandle()
+        is FirWrappedExpression -> expression.directCoroutineHandle()
+        is FirPropertyAccessExpression -> resolvedSymbol()
+        else -> null
+    }
+
     /** Returns this call's resolved FIR function, if resolution succeeded. */
     private fun FirFunctionCall.resolvedFunction(): FirFunction? =
         (resolvedSymbol() as? FirFunctionSymbol<*>)?.fir
@@ -1178,7 +2446,7 @@ internal class KotlinNetworkEffectVisitor(
 
     /** Returns whether this function terminally collects a Flow. */
     private fun FirFunction.isFlowCollect(): Boolean =
-        symbol.callableId.asSingleFqName().asString() in FLOW_COLLECT_FQ_NAMES
+        unwrapFakeOverrides().symbol.callableId.asSingleFqName().asString() in FLOW_COLLECT_FQ_NAMES
 
     /** Returns whether this function eagerly maps every collection element once. */
     private fun FirFunction.isEagerCollectionMap(): Boolean =
@@ -1251,26 +2519,34 @@ internal class KotlinNetworkEffectVisitor(
         call: FirFunctionCall? = null,
         context: KotlinEffectContext? = null,
     ): KotlinFunctionEffect {
-        target.downloadContract(session)?.let { contract ->
+        if (target.concurrentMapContract(session) != null) {
+            return KotlinFunctionEffect(network = Effect.Invalid(
+                "@BandwidthConcurrentMap requires direct call-site instantiation.",
+            ))
+        }
+        // Class type substitution can create a callable with no visible body
+        // (or with a body referring to its original parameter symbols). Infer
+        // the definition, then translate the call's effect-variable bindings.
+        // Real source overrides are retained: only substitution wrappers peel.
+        val definition = generateSequence(target) { it.originalForSubstitutionOverride }.last()
+        definition.downloadContract(session)?.let { contract ->
             return KotlinFunctionEffect(
-                network = NetworkEffect.download(
-                    maxBytes = contract.maxBytes,
-                    completeTimeoutMillis = contract.completeTimeoutMillis,
-                ).asEffect(),
+                network = contract.network.asEffect(),
             )
         }
 
-        val invocationContract = target.effectContract(session)
-        val symbolicInvocation = target.symbolicInvocationEffect(session)
+        val invocationContract = definition.effectContract(session)
+        val symbolicInvocation = definition.symbolicInvocationEffect(session)
         val returnedContract = target.returnTypeRef.effectContract(session)
-        val variables = target.effectVariableIds(session)
-        val returnsFunction =
-            target.returnTypeRef.coneType.isSomeFunctionType(session)
+            ?: definition.returnTypeRef.effectContract(session)
+        val variables = definition.effectVariableIds(session)
+        val returnsLatentValue =
+            target.returnTypeRef.coneType.isBandwidthLatentValue(session)
         val needsVisibleBody =
             invocationContract == null ||
-                (returnsFunction && returnedContract == null)
-        val shouldInfer = target.body != null && needsVisibleBody
-        val inferred = if (shouldInfer) inferFunction(target) else null
+                (returnsLatentValue && returnedContract == null)
+        val shouldInfer = definition.body != null && needsVisibleBody
+        val inferred = if (shouldInfer) inferFunction(definition) else null
         val symbolic = KotlinFunctionEffect(
             network = symbolicInvocation
                 ?: invocationContract?.network?.asEffect()
@@ -1280,12 +2556,19 @@ internal class KotlinNetworkEffectVisitor(
                 LatentNetworkEffect(network = it.network.asEffect())
             } ?: inferred?.returned,
         )
-        val instantiated = symbolic.substitute(effectBindings)
+        val definitionBindings = if (definition.symbol == target.symbol) effectBindings else EffectSubstitution(
+            effectBindings.bindings.mapKeys { (id, _) ->
+                if (id.owner == target.symbol) {
+                    variables.firstOrNull { it.index == id.index && it.name == id.name } ?: id
+                } else id
+            },
+        )
+        val instantiated = symbolic.substitute(definitionBindings)
         if (call != null && context != null) {
             val unbound = buildSet {
                 addAll(instantiated.network.freeVariables())
                 instantiated.returned?.network?.freeVariables()?.let(::addAll)
-            }.filter { it.owner == target.symbol }
+            }.filter { it.owner == definition.symbol || it.owner == target.symbol }
             if (unbound.isNotEmpty()) {
                 problem(
                     key = "unbound-effect-variable:${context.function.displayName()}:" +
@@ -1315,9 +2598,10 @@ internal class KotlinNetworkEffectVisitor(
      * An unannotated source parameter has the trusted empty-effect contract.
      */
     private fun validateHigherOrderArguments(
-        call: FirFunctionCall,
+        call: FirCall,
         target: FirFunction,
         argumentEffects: Map<FirValueParameter, KotlinExpressionEffect>,
+        receiverEffect: KotlinExpressionEffect?,
         context: KotlinEffectContext,
     ): EffectSubstitution {
         // launch/async are handled by structured coroutine rules, including
@@ -1326,20 +2610,78 @@ internal class KotlinNetworkEffectVisitor(
         if (target.isCoroutineBuilder()) return EffectSubstitution.EMPTY
         val variables = target.effectVariableIds(session).associateBy(EffectVariableId::name)
         val bindings = mutableMapOf<EffectVariableId, Effect>()
+        target.receiverParameter?.let { receiver ->
+            if (receiver.typeRef.coneType.isBandwidthLatentValue(session)) {
+                val contract = receiver.effectContract(session) ?: receiver.typeRef.effectContract(session)
+                val actual = receiverEffect?.latent
+                val label = if (receiver.typeRef.coneType.isBandwidthFlow(session)) "Flow receiver" else "function receiver"
+                if (actual == null || actual.network.invalidMessage() != null) {
+                    problem("latent-receiver-unknown:" + context.function.displayName() + ":" + call.source?.startOffset,
+                        call.source ?: context.function.source,
+                        "Cannot infer the " + label + " effect of " + target.displayName() + ". Declare or infer its latent effect.")
+                } else {
+                    val variable = contract?.variable?.let(variables::get)
+                    if (variable != null) bindings[variable] = actual.network
+                    if (variable == null || contract?.network != NetworkEffect.EMPTY) {
+                        val declared = contract?.network ?: NetworkEffect.EMPTY
+                        val concrete = actual.network.concreteOrNull()
+                        if (concrete == null || !concrete.isCoveredBy(declared)) {
+                            problem("latent-receiver-contract:" + context.function.displayName() + ":" + call.source?.startOffset,
+                                call.source ?: context.function.source,
+                                label + " effect " + actual.network.render() + " is not covered by its contract " +
+                                    declared.render() + " on " + target.displayName() + ".")
+                        }
+                    }
+                }
+            }
+        }
         target.valueParameters.forEach { parameter ->
-            if (!parameter.returnTypeRef.coneType.isSomeFunctionType(session)) {
+            if (!parameter.returnTypeRef.coneType.isBandwidthLatentValue(session)) {
                 return@forEach
             }
             val contract =
                 parameter.effectContract(session)
                     ?: parameter.returnTypeRef.effectContract(session)
-            val suppliedArgument = argumentEffects[parameter]
+            val isFlowParameter = parameter.returnTypeRef.coneType.isBandwidthFlow(session)
+            val suppliedArgument = argumentEffects[parameter]?.let { effect ->
+                if (isFlowParameter) {
+                    effect.withExpectedFlowValue(call.argumentForParameter(parameter.name.asString()))
+                } else {
+                    effect
+                }
+            }
             if (suppliedArgument == null) {
+                if (isFlowParameter) {
+                    // Default expressions may perform eager work or construct an
+                    // opaque producer. Do not silently certify an omitted value.
+                    problem(
+                        key = "untracked-flow-default:${context.function.displayName()}:" +
+                            "${call.source?.startOffset}:${parameter.name}",
+                        source = call.source ?: context.function.source,
+                        message = "Cannot infer an omitted default for Flow parameter " +
+                            "'${parameter.name}' of ${target.displayName()}: " +
+                            "its untracked Flow default effect is unsupported. Pass the Flow explicitly.",
+                    )
+                    return@forEach
+                }
                 contract?.variable?.let { variableName ->
                     variables[variableName]?.let { variable ->
                         bindings[variable] = Effect.Empty
                     }
                 }
+                return@forEach
+            }
+            if (isFlowParameter &&
+                (suppliedArgument.latent == null ||
+                    suppliedArgument.latent.network.invalidMessage() != null)
+            ) {
+                problem(
+                    key = "untracked-flow-argument:${context.function.displayName()}:" +
+                        "${call.source?.startOffset}:${parameter.name}",
+                    source = call.source ?: context.function.source,
+                    message = "Cannot pass an untracked Flow to parameter '${parameter.name}' " +
+                        "of ${target.displayName()}. Declare or infer its collection effect.",
+                )
                 return@forEach
             }
             val actual = suppliedArgument.latent ?: LatentNetworkEffect()
@@ -1377,8 +2719,8 @@ internal class KotlinNetworkEffectVisitor(
 
             val declaredEffect = contract.network
             if (
-                declaredEffect != NetworkEffect.EMPTY &&
-                actualEffect.concreteOrNull()?.isCoveredBy(declaredEffect) == false
+                (contract.variable == null || declaredEffect != NetworkEffect.EMPTY) &&
+                (actualEffect.concreteOrNull()?.isCoveredBy(declaredEffect) != true)
             ) {
                 problem(
                     key = "higher-order-contract:${context.function.displayName()}:" +
@@ -1512,7 +2854,7 @@ internal class KotlinNetworkEffectVisitor(
      * Maps resolved value parameters to their evaluated argument effects,
      * sequencing multiple expressions assigned to the same vararg parameter.
      */
-    private fun FirFunctionCall.argumentEffectsByParameter(
+    private fun FirCall.argumentEffectsByParameter(
         effectOf: (FirExpression) -> KotlinExpressionEffect,
     ): Map<FirValueParameter, KotlinExpressionEffect> {
         val mapping = (argumentList as? FirResolvedArgumentList)?.mapping ?: return emptyMap()
@@ -1527,7 +2869,7 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     /** Returns the resolved argument mapped to the parameter named [name]. */
-    private fun FirFunctionCall.argumentForParameter(name: String): FirExpression? {
+    private fun FirCall.argumentForParameter(name: String): FirExpression? {
         val mapping = (argumentList as? FirResolvedArgumentList)?.mapping ?: return null
         return mapping.entries.firstOrNull { (_, parameter) ->
             parameter.name.asString() == name
@@ -1709,7 +3051,19 @@ internal class KotlinNetworkEffectVisitor(
         data class RepeatedStructuredChildren(
             val handle: FirBasedSymbol<*>?,
             val mapCall: FirFunctionCall,
+            val preparation: List<FirElement>,
             val builderCall: FirFunctionCall,
+        )
+
+        data class ReturnedMappedChild(
+            val preparation: List<FirElement>,
+            val call: FirFunctionCall,
+        )
+
+        data class RepeatedCoroutineChildrenEffect(
+            val inputs: KotlinExpressionEffect,
+            val preparation: KotlinExpressionEffect,
+            val body: KotlinExpressionEffect?,
         )
 
         data class CoroutineBuilderEffect(
@@ -1719,6 +3073,7 @@ internal class KotlinNetworkEffectVisitor(
 
         val STRUCTURED_COROUTINE_SCOPE_FQ_NAMES: Set<String> = setOf(
             "kotlinx.coroutines.coroutineScope",
+            "kotlinx.coroutines.supervisorScope",
             "kotlinx.coroutines.withContext",
         )
         val COROUTINE_BUILDER_FQ_NAMES: Set<String> = setOf(
@@ -1745,11 +3100,17 @@ internal class KotlinNetworkEffectVisitor(
         )
         val FLOW_COLLECT_FQ_NAMES: Set<String> = setOf(
             "kotlinx.coroutines.flow.collect",
+            "kotlinx.coroutines.flow.collectLatest",
             "kotlinx.coroutines.flow.Flow.collect",
+            "kotlinx.coroutines.flow.SharedFlow.collect",
+            "kotlinx.coroutines.flow.StateFlow.collect",
+            "kotlinx.coroutines.flow.MutableSharedFlow.collect",
+            "kotlinx.coroutines.flow.MutableStateFlow.collect",
         )
         val EAGER_COLLECTION_MAP_FQ_NAMES: Set<String> = setOf(
             "kotlin.collections.map",
             "kotlin.collections.mapIndexed",
+            "kotlin.collections.mapNotNull",
         )
         val SINGLE_CALLBACK_FQ_NAMES: Set<String> = setOf(
             "androidx.tracing.traceAsync",
@@ -1759,20 +3120,34 @@ internal class KotlinNetworkEffectVisitor(
             "io.beatmaps.util.requireAuthorization",
             "io.beatmaps.api.scores.ssTry",
             "io.ktor.server.auth.authenticate",
+            "io.ktor.server.application.serverConfig",
+            "io.ktor.server.application.ServerConfigBuilder.module",
             "io.ktor.server.engine.embeddedServer",
+            "io.ktor.server.routing.route",
             "io.ktor.server.routing.routing",
+            // These contracts cover callback timing only. Their own HTTP/
+            // WebSocket transport must have a separate download/lifetime
+            // contract at the audited application boundary.
+            "io.ktor.client.statement.HttpStatement.execute",
+            "io.ktor.client.plugins.websocket.webSocket",
+            "io.ktor.client.plugins.websocket.ws",
+            "io.ktor.client.plugins.websocket.wss",
             "kotlinx.coroutines.runBlocking",
+            "kotlinx.coroutines.sync.withLock",
             "kotlin.also",
             "kotlin.apply",
             "kotlin.let",
             "kotlin.run",
+            "kotlin.with",
             "kotlin.runCatching",
             "kotlin.use",
             "kotlin.io.use",
+            "kotlin.collections.getOrPut",
             "org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction",
             "org.jetbrains.exposed.sql.transactions.transaction",
         )
         val IMMEDIATE_REPEATED_CALLBACK_FQ_NAMES: Set<String> = setOf(
+            "kotlin.repeat",
             "kotlin.collections.map",
             "kotlin.collections.mapIndexed",
             "kotlin.collections.mapNotNull",
@@ -1839,6 +3214,7 @@ internal class KotlinNetworkEffectVisitor(
             "io.ktor.server.routing.patch",
             "io.ktor.server.routing.post",
             "io.ktor.server.routing.put",
+            "io.ktor.server.websocket.webSocketRaw",
         )
     }
 }

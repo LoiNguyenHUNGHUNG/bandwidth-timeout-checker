@@ -47,7 +47,7 @@ us test the calculus independently and reuse it from other frontends later.
 Kotlin's FIR compiler-plugin API is experimental, so the checker treats the FIR
 surface as a versioned adapter. Shared inference code remains under
 `compiler-plugin/src`, while the small incompatible seams live under
-`src-kotlin-2.2`, `src-kotlin-2.3`, and `src-kotlin-2.4`. The selected adapter,
+`src-kotlin-2.2`, `src-kotlin-2.3`, `src-kotlin-2.3.20`, and `src-kotlin-2.4`. The selected adapter,
 Kotlin Gradle plugin, and `org.jetbrains.kotlin` compiler dependencies are
 aligned through:
 
@@ -343,12 +343,15 @@ one syntactic branch globally "low bandwidth." Nested checks such as
   semaphore with constant capacity, preserving one invocation while carrying a
   whole-block bound to enclosing repetition. Escaping work receives no gate
   bound.
-- [x] Keep visible `flow`, collection `asFlow`, and `flatMapMerge` pipelines
-  latent until no-argument `collect()`. Require an explicit positive constant
-  concurrency bound, apply it to completing inner-flow work, and route escaping
-  transform and inner-flow work through the core repetition rule. Reject
-  collector callbacks until their incompatible version-specific FIR shapes are
-  normalized.
+- [x] Track cold Flow producer effects through collection, parameters, returns,
+  and contracted storage. Collection conservatively overlaps the upstream and
+  callback effects. Opaque and unknown producers require contracts.
+- [x] Instantiate audited `@BandwidthConcurrentMap` operators at a positive
+  constant concurrency, using finite parallel composition of the complete
+  callback effect. Escaped work retains independent lifetime obligations.
+- [x] Check Flow property initializers, accessors, assignments, and override
+  contracts, including local and anonymous owners. Pure local hot signaling
+  values are distinct from the separately running producers that feed them.
 - [x] Lower `forEach` through the core repetition rule and model AndroidX
   `traceAsync` as one callback invocation; unknown higher-order library calls
   still require contracts.

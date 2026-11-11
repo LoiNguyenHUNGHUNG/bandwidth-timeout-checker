@@ -91,7 +91,10 @@ try {
 }
 ```
 
-`@NetworkDownload` applies only at primitive/library boundaries.
+`@NetworkDownload` applies only at primitive/library boundaries. Omit both
+bounds, or set both to `None`, for an untimed download with no size bound. It
+contributes rate zero and concurrency one, so its interference is retained.
+A zero timeout or a partially specified bound is rejected.
 `@BandwidthEffect` supplies a conservative list of download effects when a
 higher-order or library body is unavailable. The original
 `rMaxBytesPerSecond`/`nMax` arguments remain shorthand for one completing
@@ -168,18 +171,28 @@ structured. The checker trusts the client configuration; for OkHttp, set the
 matching `Dispatcher.maxRequests` value.
 
 An eager collection `map { async { ... } }` inside a structured scope creates
-an unknown number of concurrently active children. Every download in the async
-body therefore needs a self bound. A direct or stored collection `awaitAll()`
-ends that group's overlap with later statements; an untracked Deferred
-collection is rejected because its child effects are unknown.
+an unknown number of concurrently active children. A visible local constant
+`Semaphore` can bound these children; otherwise their downloads require shared
+self bounds. `awaitAll()` is recognized in statements, initializers, returns,
+and chained expressions, and ends only the joined children's overlap. Work
+that escapes a child keeps its own lifetime and requires an independent bound.
 
-Visible `flow { ... }`, collection `asFlow()`, and `flatMapMerge` pipelines keep
-their network effects latent until no-argument `collect()`. An explicit positive
-constant `flatMapMerge(concurrency = k)` bounds concurrently collected inner
-flows by `k`; dynamic or default concurrency and untracked Flow values are rejected.
-Repeated transforms still use the same core repetition rule, so work escaping
-an invocation requires a self bound. Collector callbacks are rejected because
-supported Kotlin versions expose incompatible FIR shapes for them.
+Cold `Flow` producers carry latent effects until collection. This information
+propagates through parameters, returns, aliases, and explicitly contracted
+properties, including `StateFlow` and `SharedFlow` subtypes. Opaque producers
+need contracts; an unknown producer is not assumed empty. A local signaling
+channel or shared-flow value is network-free, while any separately launched
+producer remains independently charged.
+
+`collect` and `collectLatest` combine upstream work with the collector callback's
+network effect, conservatively allowing overlap. An explicit positive constant
+`flatMapMerge(concurrency = k)` bounds concurrent inner flows. For an audited
+custom Flow mapper, `@BandwidthConcurrentMap` identifies its concurrency and
+callback parameters; the checker composes that many copies of the callback's
+full pair-set effect. These are trusted operator contracts, not inferred
+properties of arbitrary implementations. Repeated escaping work still needs
+independent self bounds. Unknown `stateIn`/`shareIn` producer lifetimes are not
+silently treated as empty.
 
 A visible `kotlinx.coroutines.sync.Semaphore.withPermit` block on an immutable
 top-level semaphore carries its constant capacity to an enclosing repetition.
@@ -391,6 +404,7 @@ version without changing source:
 ```shell
 ./gradlew clean build -PkotlinVersion=2.2.20
 ./gradlew clean build -PkotlinVersion=2.3.0
+./gradlew clean build -PkotlinVersion=2.3.20
 ./gradlew clean build -PkotlinVersion=2.4.10
 ```
 

@@ -8,6 +8,9 @@ internal class CoroutinePhaseState<Handle : Any> {
     private val activeChildren = linkedMapOf<Handle, KotlinExpressionEffect>()
     private val untrackedChildren = mutableListOf<KotlinExpressionEffect>()
 
+    /** Whether this scope still owns the live child or collection [handle]. */
+    fun hasActiveChild(handle: Handle): Boolean = handle in activeChildren
+
     /**
      * Starts a structured [effect] in the current phase.
      *
