@@ -1,5 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
+import io.github.loinguyen.bandwidth.core.AnalysisMode
 import org.jetbrains.kotlin.fir.FirAnnotationContainer
 import org.jetbrains.kotlin.fir.FirElement
 import org.jetbrains.kotlin.fir.FirSession
@@ -108,6 +109,7 @@ internal class KotlinEffectContext(
     val function: FirFunction,
     private val session: FirSession,
     private val latentValues: MutableMap<FirBasedSymbol<*>, LatentNetworkEffect>,
+    private val analysisMode: AnalysisMode,
 ) {
     /** Values whose eager work was already recorded by the current phase walk. */
     val evaluatedExpressions = IdentityHashMap<FirElement, KotlinExpressionEffect>()
@@ -140,7 +142,7 @@ internal class KotlinEffectContext(
         symbol ?: return null
         symbol.flowStorageProperty()?.let { property ->
             if (property.isContractedFlowStorage(session)) {
-                return property.flowStorageEffect(session)
+                return property.flowStorageEffect(session, analysisMode)
             }
         }
         // A synthetic setter value parameter does not consistently retain
@@ -151,14 +153,14 @@ internal class KotlinEffectContext(
             if (accessor?.isSetter == true &&
                 parameter.returnTypeRef.coneType.isBandwidthFlow(session)
             ) {
-                return accessor.propertySymbol.fir.flowStorageEffect(session)
+                return accessor.propertySymbol.fir.flowStorageEffect(session, analysisMode)
             }
         }
         latentValues[symbol]?.let { return it }
         val declaration = symbol.fir
         if (declaration is FirReceiverParameter) {
-            val contract = declaration.effectContract(session)
-                ?: declaration.typeRef.effectContract(session)
+            val contract = declaration.effectContract(session, analysisMode)
+                ?: declaration.typeRef.effectContract(session, analysisMode)
             if (contract != null && contract.variable == null) return contract.toLatentEffect()
             if (contract?.variable != null) {
                 return LatentNetworkEffect(
@@ -173,13 +175,13 @@ internal class KotlinEffectContext(
             }
         }
         val direct = (declaration as? FirAnnotationContainer)
-            ?.effectContract(session)
+            ?.effectContract(session, analysisMode)
             ?.takeIf { it.variable == null }
             ?.toLatentEffect()
         if (direct != null) return direct
         val typed = (declaration as? FirCallableDeclaration)
             ?.returnTypeRef
-            ?.effectContract(session)
+            ?.effectContract(session, analysisMode)
             ?.takeIf { it.variable == null }
             ?.toLatentEffect()
         if (typed != null) return typed
@@ -223,8 +225,11 @@ internal fun FirProperty.isContractedFlowStorage(session: FirSession): Boolean =
  * symbolic contracts require class-level effect polymorphism, which is not
  * currently supported and must not silently become an empty contract.
  */
-internal fun FirProperty.flowStorageEffect(session: FirSession): LatentNetworkEffect {
-    val contract = returnTypeRef.effectContract(session) ?: effectContract(session)
+internal fun FirProperty.flowStorageEffect(
+    session: FirSession,
+    analysisMode: AnalysisMode,
+): LatentNetworkEffect {
+    val contract = returnTypeRef.effectContract(session, analysisMode) ?: effectContract(session, analysisMode)
     if (contract?.variable != null) {
         return LatentNetworkEffect(
             network = Effect.Invalid(
@@ -240,8 +245,9 @@ internal fun FirProperty.flowStorageEffect(session: FirSession): LatentNetworkEf
 internal fun FirProperty.flowStorageProblem(
     actual: LatentNetworkEffect?,
     session: FirSession,
+    analysisMode: AnalysisMode,
 ): String? {
-    val declaredEffect = flowStorageEffect(session).network
+    val declaredEffect = flowStorageEffect(session, analysisMode).network
     declaredEffect.invalidMessage()?.let { return it }
     val declared = declaredEffect.concreteOrNull() ?: return (
         "Cannot verify Flow storage contract for ${symbol.callableId}: " +

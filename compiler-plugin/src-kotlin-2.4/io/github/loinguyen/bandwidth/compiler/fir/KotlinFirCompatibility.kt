@@ -1,5 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
+import io.github.loinguyen.bandwidth.core.AnalysisMode
 import org.jetbrains.kotlin.diagnostics.DiagnosticReporter
 import org.jetbrains.kotlin.fir.FirElement
 import org.jetbrains.kotlin.fir.analysis.checkers.MppCheckerKind
@@ -45,12 +46,13 @@ internal fun FirExpression.annotationArrayElements(): List<FirExpression>? =
 internal fun FirFunction.overriddenEffectContracts(
     session: org.jetbrains.kotlin.fir.FirSession,
     context: CheckerContext,
+    analysisMode: AnalysisMode,
 ): List<EffectContract> {
     val function = this as? FirNamedFunction ?: return emptyList()
     return buildList {
         with(context) {
             function.symbol.processOverriddenFunctionsSafe { overridden ->
-                overridden.fir.effectContract(session)?.let(::add)
+                overridden.fir.effectContract(session, analysisMode)?.let(::add)
             }
         }
     }
@@ -60,6 +62,7 @@ internal fun FirFunction.overriddenEffectContracts(
 internal fun FirFunction.overriddenReturnedEffectContracts(
     session: org.jetbrains.kotlin.fir.FirSession,
     context: CheckerContext,
+    analysisMode: AnalysisMode,
 ): List<EffectContract> {
     val function = this as? FirNamedFunction ?: return emptyList()
     return buildList {
@@ -67,7 +70,7 @@ internal fun FirFunction.overriddenReturnedEffectContracts(
             function.symbol.processOverriddenFunctionsSafe { overridden ->
                 val returnType = overridden.fir.returnTypeRef
                 if (returnType.coneType.isBandwidthFlow(session)) {
-                    returnType.effectContract(session)?.let(::add)
+                    returnType.effectContract(session, analysisMode)?.let(::add)
                 }
             }
         }

@@ -1,5 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
+import io.github.loinguyen.bandwidth.core.AnalysisMode
 import io.github.loinguyen.bandwidth.core.DownloadLifetime
 import io.github.loinguyen.bandwidth.core.NetworkEffect
 import org.jetbrains.kotlin.KtSourceElement
@@ -107,16 +108,19 @@ internal fun FirAnnotationContainer.annotation(
  *
  * @return the parsed contract, or `null` when the annotation is absent or invalid.
  */
-internal fun FirAnnotationContainer.downloadContract(session: FirSession): DownloadContract? {
+internal fun FirAnnotationContainer.downloadContract(
+    session: FirSession,
+    analysisMode: AnalysisMode = AnalysisMode.DETAILED,
+): DownloadContract? {
     val annotation: FirAnnotation = annotation(NETWORK_DOWNLOAD_ANNOTATION, session) ?: return null
     val maxBytes: Long = annotation.downloadBound(MAX_BYTES, session) ?: return null
     val timeoutMillis: Long =
         annotation.downloadBound(COMPLETE_TIMEOUT_MILLIS, session) ?: return null
     if (maxBytes == NO_DOWNLOAD_BOUND && timeoutMillis == NO_DOWNLOAD_BOUND) {
-        return DownloadContract(NetworkEffect.summary(rMaxBytesPerSecond = 0, nMax = 1))
+        return DownloadContract(NetworkEffect.summary(rMaxBytesPerSecond = 0, nMax = 1, analysisMode = analysisMode))
     }
     if (maxBytes < 0 || timeoutMillis <= 0) return null
-    return DownloadContract(NetworkEffect.download(maxBytes, timeoutMillis))
+    return DownloadContract(NetworkEffect.download(maxBytes, timeoutMillis, analysisMode))
 }
 
 /** Returns whether this declaration is a framework-invoked request handler. */
@@ -129,14 +133,17 @@ internal fun FirAnnotationContainer.isEntryPoint(session: FirSession): Boolean =
  *
  * @return the parsed effect, or `null` when the annotation is absent or invalid.
  */
-internal fun FirAnnotationContainer.effectContract(session: FirSession): EffectContract? {
+internal fun FirAnnotationContainer.effectContract(
+    session: FirSession,
+    analysisMode: AnalysisMode = AnalysisMode.DETAILED,
+): EffectContract? {
     val annotation: FirAnnotation = annotation(BANDWIDTH_EFFECT_ANNOTATION, session) ?: return null
     val effects = mutableListOf<NetworkEffect>()
     val rMax: Long = annotation.longArgument(R_MAX_BYTES_PER_SECOND, session) ?: 0
     val nMax: Int = annotation.intArgument(N_MAX, session) ?: 0
     if (rMax < 0 || nMax < 0 || (rMax > 0 && nMax == 0)) return null
     if (rMax > 0 || nMax > 0) {
-        effects += NetworkEffect.summary(rMax, nMax)
+        effects += NetworkEffect.summary(rMax, nMax, analysisMode = analysisMode)
     }
     annotation.downloadContracts(session).forEach { download ->
         val rate = download.rMaxBytesPerSecond ?: return null
@@ -148,7 +155,7 @@ internal fun FirAnnotationContainer.effectContract(session: FirSession): EffectC
         } else {
             DownloadLifetime.COMPLETES_WITH_CALL
         }
-        val effect = NetworkEffect.summary(rate, concurrency, lifetime)
+        val effect = NetworkEffect.summary(rate, concurrency, lifetime, analysisMode)
         effects += if (selfBound == 0) {
             effect
         } else {
@@ -175,8 +182,11 @@ internal fun FirFunction.effectVariableIds(session: FirSession): List<EffectVari
         }
 
 /** Resolves a declaration-level symbolic invocation contract in its binder scope. */
-internal fun FirFunction.symbolicInvocationEffect(session: FirSession): Effect? {
-    val variableName = effectContract(session)?.variable ?: return null
+internal fun FirFunction.symbolicInvocationEffect(
+    session: FirSession,
+    analysisMode: AnalysisMode = AnalysisMode.DETAILED,
+): Effect? {
+    val variableName = effectContract(session, analysisMode)?.variable ?: return null
     val variable = effectVariableIds(session).firstOrNull { it.name == variableName }
         ?: return Effect.Invalid(
             "Effect variable '$variableName' is not declared by @BandwidthVariable.",

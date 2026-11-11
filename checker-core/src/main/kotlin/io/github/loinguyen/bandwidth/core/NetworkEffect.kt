@@ -77,19 +77,24 @@ public data class DownloadEffect(
 }
 
 /**
- * A normalized finite set of lifetime-tagged primitive download effects.
+ * An immutable finite set of lifetime-tagged primitive download effects.
+ *
+ * [analysisMode] selects normalization/composition for this effect. Existing
+ * factory overloads retain detailed analysis; alternate modes are explicit.
  *
  * Stored concurrency is local to one lifetime component. Public obligations
  * materialize completing and escaping work in parallel exactly once.
  */
 public class NetworkEffect private constructor(
     private val downloads: List<DownloadEffect>,
+    /** Immutable algebra selected when this effect was created. */
+    public val analysisMode: AnalysisMode = AnalysisMode.DETAILED,
     /** All work in this effect belongs to one shared, bounded invocation region. */
     private val concurrentInvocationBound: Int? = null,
 ) {
     /** Final bandwidth obligations after lifetime overlap is materialized. */
     public val obligations: List<DownloadEffect>
-        get() = normalizeMaterialized(materializedDownloads()).sortedWith(
+        get() = normalizeMaterialized(materializedDownloads(), analysisMode).sortedWith(
             compareByDescending<DownloadEffect> { it.requiredRateBytesPerSecond }
                 .thenByDescending { it.concurrency },
         )
@@ -110,35 +115,42 @@ public class NetworkEffect private constructor(
      * that may outlive either operand remains mutually parallel.
      */
     public fun then(other: NetworkEffect): NetworkEffect {
+        requireCompatibleMode(other)
         if (downloads.isEmpty()) return other
         if (other.downloads.isEmpty()) return this
         return fromComponents(
-            completing = normalize(completingDownloads() + other.completingDownloads()),
-            escaping = parallelDownloads(escapingDownloads(), other.escapingDownloads()),
+            completing = normalize(completingDownloads() + other.completingDownloads(), analysisMode),
+            escaping = parallelDownloads(escapingDownloads(), other.escapingDownloads(), analysisMode),
+            analysisMode = analysisMode,
         )
     }
 
     /** Parallel composition from Table 2, applied within each lifetime component. */
     public fun parallel(other: NetworkEffect): NetworkEffect {
+        requireCompatibleMode(other)
         if (downloads.isEmpty()) return other
         if (other.downloads.isEmpty()) return this
         return fromComponents(
             completing = parallelDownloads(
                 completingDownloads(),
                 other.completingDownloads(),
+                analysisMode,
             ),
             escaping = parallelDownloads(
                 escapingDownloads(),
                 other.escapingDownloads(),
+                analysisMode,
             ),
+            analysisMode = analysisMode,
         )
     }
 
     /** Alternative-path join: only one operand executes. */
     public fun choice(other: NetworkEffect): NetworkEffect {
+        requireCompatibleMode(other)
         if (downloads.isEmpty()) return other
         if (other.downloads.isEmpty()) return this
-        return of(downloads + other.downloads)
+        return of(downloads + other.downloads, analysisMode)
     }
 
     /** Models at most [maxConcurrentBodies] overlapping copies of one body. */
@@ -155,7 +167,7 @@ public class NetworkEffect private constructor(
      */
     public fun withSelfBound(selfBound: Int): NetworkEffect {
         require(selfBound > 0) { "selfBound must be positive" }
-        return of(downloads.map { it.copy(selfBound = selfBound) })
+        return of(downloads.map { it.copy(selfBound = selfBound) }, analysisMode)
             .withInvocationBound(concurrentInvocationBound)
     }
 
@@ -190,6 +202,7 @@ public class NetworkEffect private constructor(
                     selfBound = download.selfBound?.coerceAtMost(gateBound) ?: gateBound,
                 )
             },
+            analysisMode,
         ).withInvocationBound(
             concurrentInvocationBound?.coerceAtMost(maxConcurrentInvocations)
                 ?: maxConcurrentInvocations,
@@ -250,25 +263,26 @@ public class NetworkEffect private constructor(
                 } ?: selfBoundTotal
                 it.copy(concurrency = Math.toIntExact(concurrency), lifetime = lifetime)
             },
+            analysisMode,
         )
     }
 
     /** Materializes this whole effect at a new enclosing lifetime boundary. */
     public fun withLifetime(lifetime: DownloadLifetime): NetworkEffect =
-        of(obligations.map { it.copy(lifetime = lifetime) })
+        of(obligations.map { it.copy(lifetime = lifetime) }, analysisMode)
             .withInvocationBound(concurrentInvocationBound)
 
     /** Projection used by structured-coroutine phase tracking. */
-    public fun completingOnly(): NetworkEffect = of(completingDownloads())
+    public fun completingOnly(): NetworkEffect = of(completingDownloads(), analysisMode)
         .withInvocationBound(concurrentInvocationBound)
 
     /** Projection used by structured-coroutine phase tracking. */
-    public fun escapingOnly(): NetworkEffect = of(escapingDownloads())
+    public fun escapingOnly(): NetworkEffect = of(escapingDownloads(), analysisMode)
         .withInvocationBound(concurrentInvocationBound)
 
     /** Attaches a bound only while it still covers every download in the effect. */
     private fun withInvocationBound(bound: Int?): NetworkEffect =
-        if (downloads.isEmpty() || bound == null) this else NetworkEffect(downloads, bound)
+        if (downloads.isEmpty() || bound == null) this else NetworkEffect(downloads, analysisMode, bound)
 
     /** `ReqBW(Phi) = max { r * n | (r, n) in Phi }`. */
     public fun requiredBandwidthBytesPerSecond(): Rational {
@@ -306,11 +320,13 @@ public class NetworkEffect private constructor(
     /** Returns whether [other] has the same component entries and invocation bound. */
     public override fun equals(other: Any?): Boolean =
         other is NetworkEffect && downloads == other.downloads &&
+            analysisMode == other.analysisMode &&
             concurrentInvocationBound == other.concurrentInvocationBound
 
     /** Returns a hash code consistent with [equals]. */
-    public override fun hashCode(): Int = 31 * downloads.hashCode() +
-        (concurrentInvocationBound?.hashCode() ?: 0)
+    public override fun hashCode(): Int =
+        31 * (31 * downloads.hashCode() + analysisMode.hashCode()) +
+            (concurrentInvocationBound?.hashCode() ?: 0)
 
     /** Returns the materialized obligations in set notation. */
     public override fun toString(): String = obligations.joinToString(prefix = "{", postfix = "}")
@@ -324,7 +340,14 @@ public class NetworkEffect private constructor(
          * @return a normalized immutable effect.
          */
         public fun of(downloads: Collection<DownloadEffect>): NetworkEffect =
-            NetworkEffect(normalize(downloads))
+            of(downloads, AnalysisMode.DETAILED)
+
+        /** Creates an effect using the explicitly selected immutable algebra. */
+        public fun of(
+            downloads: Collection<DownloadEffect>,
+            analysisMode: AnalysisMode,
+        ): NetworkEffect = if (downloads.isEmpty()) EMPTY else
+            NetworkEffect(normalize(downloads, analysisMode), analysisMode)
 
         /**
          * Creates the singleton effect of a transfer with a complete-call
@@ -337,14 +360,22 @@ public class NetworkEffect private constructor(
          * @throws IllegalArgumentException if [maxBytes] is negative or
          * [completeTimeoutMillis] is not positive.
          */
-        public fun download(maxBytes: Long, completeTimeoutMillis: Long): NetworkEffect {
+        public fun download(maxBytes: Long, completeTimeoutMillis: Long): NetworkEffect =
+            download(maxBytes, completeTimeoutMillis, AnalysisMode.DETAILED)
+
+        /** Creates a primitive transfer in the selected algebra. */
+        public fun download(
+            maxBytes: Long,
+            completeTimeoutMillis: Long,
+            analysisMode: AnalysisMode,
+        ): NetworkEffect {
             require(maxBytes >= 0) { "maximum transfer size must be non-negative" }
             require(completeTimeoutMillis > 0) { "complete-call timeout must be positive" }
             val rate = Rational.of(
                 maxBytes.toBigInteger() * BigInteger.valueOf(1_000),
                 completeTimeoutMillis.toBigInteger(),
             )
-            return of(listOf(DownloadEffect(rate, concurrency = 1)))
+            return of(listOf(DownloadEffect(rate, concurrency = 1)), analysisMode)
         }
 
         /**
@@ -360,11 +391,20 @@ public class NetworkEffect private constructor(
             rMaxBytesPerSecond: Long,
             nMax: Int,
             lifetime: DownloadLifetime = DownloadLifetime.COMPLETES_WITH_CALL,
+        ): NetworkEffect = summary(rMaxBytesPerSecond, nMax, lifetime, AnalysisMode.DETAILED)
+
+        /** Creates a declared summary in the selected algebra. */
+        public fun summary(
+            rMaxBytesPerSecond: Long,
+            nMax: Int,
+            lifetime: DownloadLifetime = DownloadLifetime.COMPLETES_WITH_CALL,
+            analysisMode: AnalysisMode,
         ): NetworkEffect {
             require(rMaxBytesPerSecond >= 0) { "rMax must be non-negative" }
             require(nMax >= 0) { "nMax must be non-negative" }
             return if (nMax == 0) EMPTY else of(
                 listOf(DownloadEffect(Rational.of(rMaxBytesPerSecond), nMax, lifetime = lifetime)),
+                analysisMode,
             )
         }
 
@@ -372,7 +412,12 @@ public class NetworkEffect private constructor(
          * Pareto-normalizes [downloads] independently within each lifetime and
          * combines self bounds when entries collapse.
          */
-        private fun normalize(downloads: Collection<DownloadEffect>): List<DownloadEffect> {
+        private fun normalize(
+            downloads: Collection<DownloadEffect>,
+            analysisMode: AnalysisMode,
+        ): List<DownloadEffect> {
+            if (analysisMode == AnalysisMode.SIMPLIFIED) return collapse(downloads)
+            if (analysisMode == AnalysisMode.DIAGNOSTIC) return retainDistinct(downloads)
             val normalized = mutableListOf<DownloadEffect>()
             downloads.forEach { download ->
                 var merged = download
@@ -400,11 +445,35 @@ public class NetworkEffect private constructor(
             return normalized
         }
 
+        /** The baseline independently maximizes rate and concurrency at every merge. */
+        private fun collapse(downloads: Collection<DownloadEffect>): List<DownloadEffect> =
+            downloads.groupBy { it.lifetime }.values.map { group ->
+                DownloadEffect(
+                    requiredRateBytesPerSecond = group.maxOf { it.requiredRateBytesPerSecond },
+                    concurrency = group.maxOf { it.concurrency },
+                    selfBound = if (group.any { it.selfBound == null }) null else
+                        Math.toIntExact(group.sumOf { requireNotNull(it.selfBound).toLong() }),
+                    lifetime = group.first().lifetime,
+                )
+            }
+
+        /** Placeholder rates are identities in diagnostics, never numeric dominance evidence. */
+        private fun retainDistinct(downloads: Collection<DownloadEffect>): List<DownloadEffect> {
+            val retained = mutableListOf<DownloadEffect>()
+            downloads.forEach { download ->
+                val index = retained.indexOfFirst { it.hasSameRateAndConcurrency(download) }
+                if (index < 0) retained += download
+                else retained[index] = retained[index].mergeSelfBound(download)
+            }
+            return retained
+        }
+
         /** Creates an effect from already separated completing and escaping components. */
         private fun fromComponents(
             completing: Collection<DownloadEffect>,
             escaping: Collection<DownloadEffect>,
-        ): NetworkEffect = NetworkEffect(normalize(completing + escaping))
+            analysisMode: AnalysisMode,
+        ): NetworkEffect = of(completing + escaping, analysisMode)
 
         /**
          * Applies the parallel-composition concurrency shifts to [left] and
@@ -413,12 +482,14 @@ public class NetworkEffect private constructor(
         private fun parallelDownloads(
             left: Collection<DownloadEffect>,
             right: Collection<DownloadEffect>,
+            analysisMode: AnalysisMode,
         ): List<DownloadEffect> {
             val leftShift = right.maxOfOrNull { it.concurrency } ?: 0
             val rightShift = left.maxOfOrNull { it.concurrency } ?: 0
             return normalize(
                 left.map { it.copy(concurrency = it.concurrency + leftShift) } +
                     right.map { it.copy(concurrency = it.concurrency + rightShift) },
+                analysisMode,
             )
         }
 
@@ -428,7 +499,9 @@ public class NetworkEffect private constructor(
          */
         private fun normalizeMaterialized(
             downloads: Collection<DownloadEffect>,
+            analysisMode: AnalysisMode,
         ): List<DownloadEffect> {
+            if (analysisMode == AnalysisMode.DIAGNOSTIC) return retainDistinct(downloads)
             val normalized = mutableListOf<DownloadEffect>()
             downloads.forEach { download ->
                 var merged = download
@@ -463,7 +536,14 @@ public class NetworkEffect private constructor(
 
     /** Materializes completing and escaping entries as mutually parallel work. */
     private fun materializedDownloads(): List<DownloadEffect> =
-        parallelDownloads(completingDownloads(), escapingDownloads())
+        parallelDownloads(completingDownloads(), escapingDownloads(), analysisMode)
+
+    /** Prevents accidental combinations of summaries produced by different analyses. */
+    private fun requireCompatibleMode(other: NetworkEffect) {
+        require(downloads.isEmpty() || other.downloads.isEmpty() || analysisMode == other.analysisMode) {
+            "Cannot compose effects from different analysis modes"
+        }
+    }
 
     /** Returns whether this lifetime is at least as conservative as [other]. */
     private fun DownloadLifetime.covers(other: DownloadLifetime): Boolean =

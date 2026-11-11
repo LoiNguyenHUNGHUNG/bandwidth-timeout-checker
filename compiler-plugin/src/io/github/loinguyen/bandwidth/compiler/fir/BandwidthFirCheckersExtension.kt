@@ -1,5 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
+import io.github.loinguyen.bandwidth.core.AnalysisMode
 import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.diagnostics.DiagnosticReporter
 import org.jetbrains.kotlin.diagnostics.reportOn
@@ -19,12 +20,14 @@ internal class BandwidthFirCheckersExtension(
     messages: MessageCollector,
     reportEffects: Boolean,
     applicationEntryPoints: ApplicationEntryPointEffects,
+    analysisMode: AnalysisMode,
 ) : FirAdditionalCheckersExtension(session) {
     private val inference = KotlinNetworkEffectInference(
         session = session,
         messages = messages,
         reportEffects = reportEffects,
         applicationEntryPoints = applicationEntryPoints,
+        analysisMode = analysisMode,
     )
 
     override val declarationCheckers: DeclarationCheckers =

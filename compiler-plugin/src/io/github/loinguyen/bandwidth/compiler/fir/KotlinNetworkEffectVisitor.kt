@@ -1,5 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
+import io.github.loinguyen.bandwidth.core.AnalysisMode
 import io.github.loinguyen.bandwidth.core.NetworkEffect
 import io.github.loinguyen.bandwidth.core.DownloadLifetime
 import java.util.IdentityHashMap
@@ -63,6 +64,7 @@ import org.jetbrains.kotlin.descriptors.Modality
  */
 internal class KotlinNetworkEffectVisitor(
     private val session: FirSession,
+    private val analysisMode: AnalysisMode,
     private val inferFunction: (FirFunction) -> KotlinFunctionEffect,
     private val reportInfo: (String) -> Unit,
     private val reportProblem: (
@@ -111,10 +113,10 @@ internal class KotlinNetworkEffectVisitor(
                 return KotlinFunctionEffect(returned = summary.returned)
             }
         }
-        val context = KotlinEffectContext(function, session, latentValues)
+        val context = KotlinEffectContext(function, session, latentValues, analysisMode)
         val variables = function.effectVariableIds(session).associateBy(EffectVariableId::name)
         function.receiverParameter?.let { receiver ->
-            val contract = receiver.effectContract(session) ?: receiver.typeRef.effectContract(session)
+            val contract = receiver.effectContract(session, analysisMode) ?: receiver.typeRef.effectContract(session, analysisMode)
             contract?.variable?.let { name ->
                 variables[name]?.let { variable ->
                     context.bind(receiver.symbol, LatentNetworkEffect(network = Effect.Variable(variable)))
@@ -122,8 +124,8 @@ internal class KotlinNetworkEffectVisitor(
             }
         }
         function.valueParameters.forEach { parameter ->
-            val variableName = parameter.effectContract(session)?.variable
-                ?: parameter.returnTypeRef.effectContract(session)?.variable
+            val variableName = parameter.effectContract(session, analysisMode)?.variable
+                ?: parameter.returnTypeRef.effectContract(session, analysisMode)?.variable
                 ?: return@forEach
             variables[variableName]?.let { variable ->
                 context.bind(
@@ -295,7 +297,7 @@ internal class KotlinNetworkEffectVisitor(
             }
         }
         if (property.isContractedFlowStorage(session) && property.initializer != null) {
-            property.flowStorageProblem(initializer.latent, session)?.let { message ->
+            property.flowStorageProblem(initializer.latent, session, analysisMode)?.let { message ->
                 problem("flow-storage-init:" + property.symbol.callableId,
                     property.initializer?.source ?: property.source, message)
             }
@@ -323,7 +325,7 @@ internal class KotlinNetworkEffectVisitor(
             } else Effect.Empty
             return KotlinExpressionEffect(
                 network = receivers.network.then(getterWork),
-                latent = property.flowStorageEffect(session),
+                latent = property.flowStorageEffect(session, analysisMode),
             )
         }
         // Function summaries are cached independently of mutable storage. A
@@ -388,7 +390,7 @@ internal class KotlinNetworkEffectVisitor(
             }
         }
         val storage = target?.flowStorageProperty()?.takeIf { it.isContractedFlowStorage(session) }
-        storage?.flowStorageProblem(value.latent, session)?.let { message ->
+        storage?.flowStorageProblem(value.latent, session, analysisMode)?.let { message ->
             problem("flow-storage-write:" + data.function.displayName() + ":" +
                 variableAssignment.source?.startOffset, variableAssignment.source, message)
         }
@@ -421,7 +423,7 @@ internal class KotlinNetworkEffectVisitor(
         if (!receiver.typeRef.coneType.isBandwidthLatentValue(session)) return
         val actual = (access.extensionReceiver ?: access.explicitReceiver)
             ?.let { infer(it, context).latent?.network }
-        val contract = receiver.effectContract(session) ?: receiver.typeRef.effectContract(session)
+        val contract = receiver.effectContract(session, analysisMode) ?: receiver.typeRef.effectContract(session, analysisMode)
         val declared = contract?.network ?: NetworkEffect.EMPTY
         if (contract?.variable != null || actual?.concreteOrNull()?.isCoveredBy(declared) != true) {
             problem("flow-property-receiver:" + property.symbol.callableId + ":" + access.source?.startOffset,
@@ -2529,16 +2531,16 @@ internal class KotlinNetworkEffectVisitor(
         // the definition, then translate the call's effect-variable bindings.
         // Real source overrides are retained: only substitution wrappers peel.
         val definition = generateSequence(target) { it.originalForSubstitutionOverride }.last()
-        definition.downloadContract(session)?.let { contract ->
+        definition.downloadContract(session, analysisMode)?.let { contract ->
             return KotlinFunctionEffect(
                 network = contract.network.asEffect(),
             )
         }
 
-        val invocationContract = definition.effectContract(session)
-        val symbolicInvocation = definition.symbolicInvocationEffect(session)
-        val returnedContract = target.returnTypeRef.effectContract(session)
-            ?: definition.returnTypeRef.effectContract(session)
+        val invocationContract = definition.effectContract(session, analysisMode)
+        val symbolicInvocation = definition.symbolicInvocationEffect(session, analysisMode)
+        val returnedContract = target.returnTypeRef.effectContract(session, analysisMode)
+            ?: definition.returnTypeRef.effectContract(session, analysisMode)
         val variables = definition.effectVariableIds(session)
         val returnsLatentValue =
             target.returnTypeRef.coneType.isBandwidthLatentValue(session)
@@ -2612,7 +2614,7 @@ internal class KotlinNetworkEffectVisitor(
         val bindings = mutableMapOf<EffectVariableId, Effect>()
         target.receiverParameter?.let { receiver ->
             if (receiver.typeRef.coneType.isBandwidthLatentValue(session)) {
-                val contract = receiver.effectContract(session) ?: receiver.typeRef.effectContract(session)
+                val contract = receiver.effectContract(session, analysisMode) ?: receiver.typeRef.effectContract(session, analysisMode)
                 val actual = receiverEffect?.latent
                 val label = if (receiver.typeRef.coneType.isBandwidthFlow(session)) "Flow receiver" else "function receiver"
                 if (actual == null || actual.network.invalidMessage() != null) {
@@ -2640,8 +2642,8 @@ internal class KotlinNetworkEffectVisitor(
                 return@forEach
             }
             val contract =
-                parameter.effectContract(session)
-                    ?: parameter.returnTypeRef.effectContract(session)
+                parameter.effectContract(session, analysisMode)
+                    ?: parameter.returnTypeRef.effectContract(session, analysisMode)
             val isFlowParameter = parameter.returnTypeRef.coneType.isBandwidthFlow(session)
             val suppliedArgument = argumentEffects[parameter]?.let { effect ->
                 if (isFlowParameter) {
@@ -3019,7 +3021,7 @@ internal class KotlinNetworkEffectVisitor(
      * download call's receivers or arguments.
      */
     private fun FirFunctionCall.clientSelfBound(target: FirFunction): Int? {
-        if (target.downloadContract(session) == null) return null
+        if (target.downloadContract(session, analysisMode) == null) return null
         val bounds = (receiverExpressions() + argumentList.arguments)
             .mapNotNull { it.boundedClientCapacity() }
             .distinct()

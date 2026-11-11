@@ -61,6 +61,7 @@ class BandwidthCheckerGradlePlugin : KotlinCompilerPluginSupportPlugin {
             val extension: BandwidthCheckerGradleExtension =
                 project.extensions.getByType(BandwidthCheckerGradleExtension::class.java)
             listOf(
+                SubpluginOption("analysisMode", extension.analysisMode.get()),
                 SubpluginOption("enabled", extension.enabled.get().toString()),
                 SubpluginOption("reportEffects", extension.reportEffects.get().toString()),
             )

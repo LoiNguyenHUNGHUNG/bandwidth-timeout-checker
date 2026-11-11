@@ -1,5 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler
 
+import io.github.loinguyen.bandwidth.core.AnalysisMode
 import io.github.loinguyen.bandwidth.BuildConfig
 import org.jetbrains.kotlin.compiler.plugin.AbstractCliOption
 import org.jetbrains.kotlin.compiler.plugin.CliOption
@@ -11,14 +12,15 @@ class BandwidthCommandLineProcessor : CommandLineProcessor {
     override val pluginId: String = BuildConfig.KOTLIN_PLUGIN_ID
 
     override val pluginOptions: Collection<CliOption> = listOf(
+        ANALYSIS_MODE_OPTION,
         ENABLED_OPTION,
         REPORT_EFFECTS_OPTION,
     )
 
     /**
-     * Parses a supported Boolean option into [configuration].
+     * Parses a supported Boolean or analysis-mode option into [configuration].
      *
-     * @throws IllegalArgumentException if [value] is not a strict Boolean.
+     * @throws IllegalArgumentException if [value] is not a strict Boolean or supported mode.
      * @throws IllegalStateException if [option] is not declared by this plugin.
      */
     override fun processOption(
@@ -27,6 +29,10 @@ class BandwidthCommandLineProcessor : CommandLineProcessor {
         configuration: CompilerConfiguration,
     ) {
         when (option.optionName) {
+            ANALYSIS_MODE_OPTION.optionName -> configuration.put(
+                BandwidthConfiguration.ANALYSIS_MODE,
+                AnalysisMode.parse(value),
+            )
             ENABLED_OPTION.optionName -> configuration.put(
                 BandwidthConfiguration.ENABLED,
                 value.toBooleanStrict(),
@@ -40,6 +46,13 @@ class BandwidthCommandLineProcessor : CommandLineProcessor {
     }
 
     private companion object {
+        val ANALYSIS_MODE_OPTION: CliOption = CliOption(
+            optionName = "analysisMode",
+            valueDescription = "<detailed|simplified|diagnostic>",
+            description = "Select the effect algebra (default: detailed).",
+            required = false,
+            allowMultipleOccurrences = false,
+        )
         val ENABLED_OPTION: CliOption = CliOption(
             optionName = "enabled",
             valueDescription = "<true|false>",

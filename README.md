@@ -289,6 +289,52 @@ bandwidthChecker {
 }
 ```
 
+### Reproducible analysis modes
+
+The same compiler-plugin JAR supports three effect algebras. Set a mode for each
+compilation; the default is `detailed`:
+
+```kotlin
+bandwidthChecker {
+    analysisMode.set("simplified") // or "detailed", "diagnostic"
+    reportEffects.set(true)
+}
+```
+
+With the Kotlin compiler directly, pass both plugin options:
+
+```sh
+kotlinc -Xplugin=compiler-plugin.jar \
+  -P plugin:io.github.loinguyen.bandwidth:analysisMode=simplified \
+  -P plugin:io.github.loinguyen.bandwidth:reportEffects=true MyServer.kt
+```
+
+- `detailed` uses Pareto-normalized pair sets, preserving correlations between
+  download rates and concurrency.
+- `simplified` uses the `(q,k)` baseline: **each composition** independently
+  maximizes rate and concurrency within each lifetime component. Completing and
+  escaping work still overlap according to the same lifetime rules. This is an
+  analysis variant, not merely a different bandwidth formula for a detailed
+  result.
+- `diagnostic` disables numeric dominance normalization throughout inference,
+  contract parsing, and final effect reporting. Only exactly equal rate,
+  concurrency, and lifetime entries merge, conservatively combining their
+  self bounds. Distinct placeholder rates remain visible in the existing
+  per-function reports. These numeric placeholders stand for independently
+  varying downloads; this mode does not create symbolic identities automatically.
+  Use distinct rates for distinct download classes and rerun an ordinary mode
+  with actual numeric bounds before interpreting a precision comparison.
+
+For a rate-100 download followed by three parallel rate-1 downloads, the
+`detailed` result is `{(100,1),(1,3)}` with required bandwidth 100 bytes/s;
+`simplified` produces `{(100,3)}` with required bandwidth 300 bytes/s.
+All modes use the same frontend, annotations, and JAR. Unknown option values are
+rejected. The chosen mode is immutable compilation-local state, so separate
+compilations (including Gradle daemon reuse) do not change one another's mode.
+The core API also accepts an optional `AnalysisMode` on `of`, `download`, and
+`summary`; existing calls continue to use `DETAILED`. Nonempty effects from
+incompatible modes cannot be composed.
+
 The recursion-free milestone rejects unannotated recursion, unbounded escaping
 work in general loops, and effectful callbacks passed to opaque higher-order
 APIs without a parameter contract. Trusted library models cover sequential

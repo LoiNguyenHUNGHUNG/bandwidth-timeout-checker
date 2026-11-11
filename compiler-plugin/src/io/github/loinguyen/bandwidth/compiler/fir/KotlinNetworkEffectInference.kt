@@ -1,5 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
+import io.github.loinguyen.bandwidth.core.AnalysisMode
 import io.github.loinguyen.bandwidth.core.DownloadLifetime
 import io.github.loinguyen.bandwidth.core.NetworkEffect
 import org.jetbrains.kotlin.KtSourceElement
@@ -40,6 +41,7 @@ internal class KotlinNetworkEffectInference(
     private val messages: MessageCollector,
     private val reportEffects: Boolean,
     private val applicationEntryPoints: ApplicationEntryPointEffects,
+    private val analysisMode: AnalysisMode,
 ) {
     private val inferredEffects:
         MutableMap<FirFunctionSymbol<*>, KotlinFunctionEffect> = mutableMapOf()
@@ -53,6 +55,7 @@ internal class KotlinNetworkEffectInference(
     private var diagnosticReporter: DiagnosticReporter? = null
     private val effectVisitor = KotlinNetworkEffectVisitor(
         session = session,
+        analysisMode = analysisMode,
         inferFunction = ::inferFunctionEffect,
         reportProblem = ::problem,
         reportInfo = { message ->
@@ -95,7 +98,7 @@ internal class KotlinNetworkEffectInference(
                     } else {
                         val result = effectVisitor.infer(
                             initializer,
-                            KotlinEffectContext(owner, session, latentValues),
+                            KotlinEffectContext(owner, session, latentValues, analysisMode),
                         )
                         if (result.network.concreteOrNull() != NetworkEffect.EMPTY) {
                             error(
@@ -109,17 +112,17 @@ internal class KotlinNetworkEffectInference(
                 }
                 return
             }
-            property.flowStorageEffect(session).network.invalidMessage()?.let {
+            property.flowStorageEffect(session, analysisMode).network.invalidMessage()?.let {
                 error(property.source, it)
             }
-            val declared = property.flowStorageEffect(session).network.concreteOrNull()
+            val declared = property.flowStorageEffect(session, analysisMode).network.concreteOrNull()
             with(context) {
                 property.symbol.processOverriddenPropertiesWithActionSafe { overridden ->
                     val base = overridden.fir
                     if (!base.returnTypeRef.coneType.isBandwidthFlow(session)) {
                         return@processOverriddenPropertiesWithActionSafe ProcessorAction.NEXT
                     }
-                    val inherited = base.flowStorageEffect(session).network.concreteOrNull()
+                    val inherited = base.flowStorageEffect(session, analysisMode).network.concreteOrNull()
                     if (declared != null && inherited != null) {
                         if (!declared.isCoveredBy(inherited)) {
                             error(
@@ -159,7 +162,7 @@ internal class KotlinNetworkEffectInference(
                 } else {
                     val inferred = effectVisitor.infer(
                         initializer,
-                        KotlinEffectContext(owner, session, latentValues),
+                        KotlinEffectContext(owner, session, latentValues, analysisMode),
                     )
                     if (inferred.network.concreteOrNull() != NetworkEffect.EMPTY) {
                         error(
@@ -172,7 +175,7 @@ internal class KotlinNetworkEffectInference(
                     val actual = inferred.latent ?: if (
                         initializer is FirLiteralExpression && initializer.value == null
                     ) LatentNetworkEffect() else null
-                    property.flowStorageProblem(actual, session)?.let {
+                    property.flowStorageProblem(actual, session, analysisMode)?.let {
                         error(initializer.source ?: property.source, it)
                     }
                 }
@@ -188,7 +191,7 @@ internal class KotlinNetworkEffectInference(
                             "explicit function with a checked effect contract.",
                     )
                 }
-                property.flowStorageProblem(result.returned, session)?.let {
+                property.flowStorageProblem(result.returned, session, analysisMode)?.let {
                     error(getter.source ?: property.source, it)
                 }
             }
@@ -262,7 +265,7 @@ internal class KotlinNetworkEffectInference(
         try {
             val result = effectVisitor.infer(
                 initializer.body,
-                KotlinEffectContext(owner, session, latentValues),
+                KotlinEffectContext(owner, session, latentValues, analysisMode),
             )
             if (result.network.concreteOrNull() != NetworkEffect.EMPTY) {
                 error(
@@ -308,19 +311,19 @@ internal class KotlinNetworkEffectInference(
             validateFlowParameterDefaults(function)
             val inferred: KotlinFunctionEffect = inferFunctionEffect(function)
             val returnsFlow = function.returnTypeRef.coneType.isBandwidthFlow(session)
-            val overriddenReturnedContracts = function.overriddenReturnedEffectContracts(session, context)
+            val overriddenReturnedContracts = function.overriddenReturnedEffectContracts(session, context, analysisMode)
             if (function.body != null && (returnsFlow || overriddenReturnedContracts.isNotEmpty())) {
                 // Primitive and symbolic eager contracts bypass body inference. They do
                 // not certify the effect suspended inside a returned Flow.
                 val returned = if (
-                    function.downloadContract(session) != null ||
-                    function.symbolicInvocationEffect(session) != null
+                    function.downloadContract(session, analysisMode) != null ||
+                    function.symbolicInvocationEffect(session, analysisMode) != null
                 ) {
                     effectVisitor.inferFunctionBody(function, latentValues).returned
                 } else {
                     inferred.returned
                 }
-                function.returnTypeRef.effectContract(session)?.let { contract ->
+                function.returnTypeRef.effectContract(session, analysisMode)?.let { contract ->
                     validateReturnedFlowContract(function, returned, contract, overridden = false)
                 }
                 overriddenReturnedContracts.forEach { contract ->
@@ -354,7 +357,7 @@ internal class KotlinNetworkEffectInference(
                 )
             }
             if (inferredEffect != null) {
-                function.effectContract(session)?.let { contract ->
+                function.effectContract(session, analysisMode)?.let { contract ->
                     val declaredEffect: NetworkEffect = contract.network
                     if (!inferredEffect.isCoveredBy(declaredEffect)) {
                         error(
@@ -364,7 +367,7 @@ internal class KotlinNetworkEffectInference(
                         )
                     }
                 }
-                function.overriddenEffectContracts(session, context).forEach { contract ->
+                function.overriddenEffectContracts(session, context, analysisMode).forEach { contract ->
                     val declaredEffect: NetworkEffect = contract.network
                     if (!inferredEffect.isCoveredBy(declaredEffect)) {
                         error(
@@ -376,7 +379,7 @@ internal class KotlinNetworkEffectInference(
                     }
                 }
                 if (!returnsFlow && overriddenReturnedContracts.isEmpty()) {
-                    function.returnTypeRef.effectContract(session)?.let { contract ->
+                    function.returnTypeRef.effectContract(session, analysisMode)?.let { contract ->
                         val inferredLatent = inferred.returned?.network?.concreteOrNull()
                             ?: NetworkEffect.EMPTY
                         val declaredLatent: NetworkEffect = contract.network
@@ -392,7 +395,7 @@ internal class KotlinNetworkEffectInference(
                 }
                 when {
                     isDeclarationHandler -> {
-                        val handlerBody = function.effectContract(session)
+                        val handlerBody = function.effectContract(session, analysisMode)
                             ?.takeIf { it.variable == null }
                             ?.network
                             ?: inferredEffect
@@ -452,17 +455,17 @@ internal class KotlinNetworkEffectInference(
         }
         if (defaults.isEmpty()) return
         val variables = function.effectVariableIds(session).associateBy(EffectVariableId::name)
-        val context = KotlinEffectContext(function, session, latentValues)
+        val context = KotlinEffectContext(function, session, latentValues, analysisMode)
         function.valueParameters.forEach { parameter ->
-            val name = parameter.effectContract(session)?.variable
-                ?: parameter.returnTypeRef.effectContract(session)?.variable
+            val name = parameter.effectContract(session, analysisMode)?.variable
+                ?: parameter.returnTypeRef.effectContract(session, analysisMode)?.variable
             variables[name]?.let { variable ->
                 context.bind(parameter.symbol, LatentNetworkEffect(network = Effect.Variable(variable)))
             }
         }
         function.receiverParameter?.let { receiver ->
-            val name = receiver.effectContract(session)?.variable
-                ?: receiver.typeRef.effectContract(session)?.variable
+            val name = receiver.effectContract(session, analysisMode)?.variable
+                ?: receiver.typeRef.effectContract(session, analysisMode)?.variable
             variables[name]?.let { variable ->
                 context.bind(receiver.symbol, LatentNetworkEffect(network = Effect.Variable(variable)))
             }
@@ -477,8 +480,8 @@ internal class KotlinNetworkEffectInference(
                         "boundaries. Use an explicit initialization argument.",
                 )
             }
-            val contract = parameter.effectContract(session)
-                ?: parameter.returnTypeRef.effectContract(session)
+            val contract = parameter.effectContract(session, analysisMode)
+                ?: parameter.returnTypeRef.effectContract(session, analysisMode)
             val expected = contract?.variable?.let { name ->
                 variables[name]?.let { Effect.Variable(it) }
             }
@@ -542,12 +545,12 @@ internal class KotlinNetworkEffectInference(
      * contracts and annotated recursion boundaries when available.
      */
     private fun inferFunctionEffect(function: FirFunction): KotlinFunctionEffect {
-        function.downloadContract(session)?.let { contract ->
+        function.downloadContract(session, analysisMode)?.let { contract ->
             return KotlinFunctionEffect(
                 network = contract.network.asEffect(),
             )
         }
-        function.symbolicInvocationEffect(session)?.let { contract ->
+        function.symbolicInvocationEffect(session, analysisMode)?.let { contract ->
             return KotlinFunctionEffect(network = contract)
         }
         inferredEffects[function.symbol]?.let { return it }

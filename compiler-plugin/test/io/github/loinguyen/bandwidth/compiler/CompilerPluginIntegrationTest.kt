@@ -10021,17 +10021,161 @@ class CompilerPluginIntegrationTest {
         }
     """
 
+    @Test
+    fun `uses the same compiler build for detailed simplified and diagnostic modes`() {
+        val source = """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
+            suspend fun heavy() = Unit
+            @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000)
+            suspend fun light() = Unit
+            suspend fun load() {
+                heavy()
+                coroutineScope { awaitAll(async { light() }, async { light() }, async { light() }) }
+            }
+            suspend fun placeholders() { light(); heavy() }
+        """
+        val detailed = compile(source, reportEffects = true, analysisMode = "detailed")
+        assertEquals(0, detailed.exitCode, detailed.output)
+        detailed.assertOutputContains("Inferred bandwidth effect for load: {(100, 1), (1, 3)}, ReqBW=100 bytes/s")
+        val simplified = compile(source, reportEffects = true, analysisMode = "simplified")
+        assertEquals(0, simplified.exitCode, simplified.output)
+        simplified.assertOutputContains("Inferred bandwidth effect for load: {(100, 3)}, ReqBW=300 bytes/s")
+        val diagnostic = compile(source, reportEffects = true, analysisMode = "diagnostic")
+        assertEquals(0, diagnostic.exitCode, diagnostic.output)
+        diagnostic.assertOutputContains("Inferred bandwidth effect for placeholders: {(100, 1), (1, 1)}")
+        val default = compile(source, reportEffects = true)
+        assertEquals(0, default.exitCode, default.output)
+        default.assertOutputContains("Inferred bandwidth effect for load: {(100, 1), (1, 3)}, ReqBW=100 bytes/s")
+    }
+
+    @Test
+    fun `analysis mode also applies while parsing explicit contracts`() {
+        val source = """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            @BandwidthEffect(downloads = [BandwidthDownload(100, 1), BandwidthDownload(1, 3)])
+            fun opaque() = Unit
+            fun load() { opaque() }
+        """
+        val simplified = compile(source, reportEffects = true, analysisMode = "simplified")
+        assertEquals(0, simplified.exitCode, simplified.output)
+        simplified.assertOutputContains("Inferred bandwidth effect for load: {(100, 3)}")
+        val diagnostic = compile(source, reportEffects = true, analysisMode = "diagnostic")
+        assertEquals(0, diagnostic.exitCode, diagnostic.output)
+        diagnostic.assertOutputContains("Inferred bandwidth effect for load: {(100, 1), (1, 3)}")
+    }
+
+    @Test
+    fun `rejects an invalid analysis mode instead of silently choosing a baseline`() {
+        val result = compile("fun noNetwork() = Unit", analysisMode = "simplifed")
+        assertNotEquals(0, result.exitCode)
+        result.assertOutputContains("Invalid analysisMode 'simplifed'; expected detailed, simplified, or diagnostic")
+    }
+
+    @Test
+    fun `analysis modes propagate through Flow parameter return receiver and storage contracts`() {
+        val source = """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthDownload
+            import kotlinx.coroutines.flow.Flow
+            import kotlinx.coroutines.flow.collect
+
+            interface Factory {
+                fun stream(): @BandwidthEffect(downloads = [BandwidthDownload(100, 1),
+                    BandwidthDownload(1, 3), BandwidthDownload(2, 1)]) Flow<Int>
+            }
+            class Holder(val stream: @BandwidthEffect(downloads = [BandwidthDownload(100, 1),
+                BandwidthDownload(1, 3), BandwidthDownload(2, 1)]) Flow<Int>)
+            suspend fun consumeReturned(factory: Factory) { factory.stream().collect { } }
+            suspend fun consumeStored(holder: Holder) { holder.stream.collect { } }
+            suspend fun consumeParameter(
+                @BandwidthEffect(downloads = [BandwidthDownload(100, 1),
+                    BandwidthDownload(1, 3), BandwidthDownload(2, 1)]) source: Flow<Int>,
+            ) { source.collect { } }
+            suspend fun @BandwidthEffect(downloads = [BandwidthDownload(100, 1),
+                BandwidthDownload(1, 3), BandwidthDownload(2, 1)]) Flow<Int>.consumeExtension() {
+                collect { }
+            }
+        """
+        val expected = mapOf(
+            "detailed" to "{(100, 1), (1, 3)}, ReqBW=100 bytes/s",
+            "simplified" to "{(100, 3)}, ReqBW=300 bytes/s",
+            "diagnostic" to "{(100, 1), (2, 1), (1, 3)}, ReqBW=100 bytes/s",
+        )
+        expected.forEach { (mode, effect) ->
+            val result = compile(source, reportEffects = true, analysisMode = mode)
+            assertEquals(0, result.exitCode, result.output)
+            listOf("consumeReturned", "consumeStored", "consumeParameter", "consumeExtension").forEach {
+                result.assertOutputContains("Inferred bandwidth effect for $it: $effect")
+            }
+        }
+    }
+
+    @Test
+    fun `analysis modes preserve finite handler replication with Flow collectors and chained awaits`() {
+        val source = """
+            import io.github.loinguyen.bandwidth.annotations.Handler
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.awaitAll
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.flow.collect
+            import kotlinx.coroutines.flow.flow
+            import kotlinx.coroutines.sync.Semaphore
+            import kotlinx.coroutines.sync.withPermit
+
+            val gate = Semaphore(3)
+            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
+            suspend fun heavy() = Unit
+            @NetworkDownload(maxBytes = 2, completeTimeoutMillis = 1_000)
+            suspend fun marker() = Unit
+            @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000)
+            suspend fun light(): Int = 1
+            @Handler
+            suspend fun handle() = gate.withPermit {
+                heavy()
+                marker()
+                flow { emit(Unit) }.collect {
+                    coroutineScope {
+                        val first = async { light() }
+                        val second = async { light() }
+                        val third = async { light() }
+                        val results = awaitAll(first, second, third).sortedBy { it }
+                    }
+                }
+            }
+        """
+        val expected = mapOf(
+            "detailed" to "{(100, 7), (1, 9)}, ReqBW=700 bytes/s",
+            "simplified" to "{(100, 9)}, ReqBW=900 bytes/s",
+            "diagnostic" to "{(100, 7), (2, 7), (1, 9), (1, 8), (1, 7)}, ReqBW=700 bytes/s",
+        )
+        expected.forEach { (mode, effect) ->
+            val result = compile(source, reportEffects = true, analysisMode = mode)
+            assertEquals(0, result.exitCode, result.output)
+            result.assertOutputContains("Inferred application entry-point effect from 1 entry point(s): $effect")
+        }
+    }
+
     private fun compile(
         source: String,
         reportEffects: Boolean = false,
+        analysisMode: String? = null,
     ): CompilationResult = compileSources(
         sources = listOf(source),
         reportEffects = reportEffects,
+        analysisMode = analysisMode,
     )
 
     private fun compileSources(
         sources: List<String>,
         reportEffects: Boolean = false,
+        analysisMode: String? = null,
     ): CompilationResult {
         val directory: Path = Files.createTempDirectory("bandwidth-compiler-test")
         val sourceFiles: List<Path> = sources.mapIndexed { index, source ->
@@ -10072,6 +10216,9 @@ class CompilerPluginIntegrationTest {
                 "-P",
                 "plugin:io.github.loinguyen.bandwidth:reportEffects=true",
             )
+        }
+        analysisMode?.let {
+            command += listOf("-P", "plugin:io.github.loinguyen.bandwidth:analysisMode=$it")
         }
         command += sourceFiles.map(Path::toString)
 
