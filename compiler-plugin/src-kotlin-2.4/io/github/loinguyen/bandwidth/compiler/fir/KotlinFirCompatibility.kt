@@ -5,6 +5,7 @@ import org.jetbrains.kotlin.fir.FirElement
 import org.jetbrains.kotlin.fir.analysis.checkers.MppCheckerKind
 import org.jetbrains.kotlin.fir.analysis.checkers.context.CheckerContext
 import org.jetbrains.kotlin.fir.analysis.checkers.declaration.FirDeclarationChecker
+import org.jetbrains.kotlin.fir.analysis.checkers.declaration.DeclarationCheckers
 import org.jetbrains.kotlin.fir.declarations.FirNamedFunction
 import org.jetbrains.kotlin.fir.declarations.FirFunction
 import org.jetbrains.kotlin.fir.expressions.FirExpression
@@ -13,11 +14,13 @@ import org.jetbrains.kotlin.fir.expressions.FirCollectionLiteral
 import org.jetbrains.kotlin.fir.expressions.FirFunctionTypeConversionExpression
 import org.jetbrains.kotlin.fir.analysis.checkers.processOverriddenFunctionsSafe
 
-/** Creates the Kotlin 2.4 function-checker set backed by [inference]. */
-internal fun bandwidthFunctionEffectCheckers(
+/** Registers the version-specific function checker behind a shared base. */
+internal open class BandwidthFunctionDeclarationCheckers(
     inference: KotlinNetworkEffectInference,
-): Set<FirDeclarationChecker<FirNamedFunction>> =
-    setOf(BandwidthFunctionEffectChecker(inference))
+) : DeclarationCheckers() {
+    override val simpleFunctionCheckers: Set<FirDeclarationChecker<FirNamedFunction>> =
+        setOf(BandwidthFunctionEffectChecker(inference))
+}
 
 private class BandwidthFunctionEffectChecker(
     private val inference: KotlinNetworkEffectInference,
