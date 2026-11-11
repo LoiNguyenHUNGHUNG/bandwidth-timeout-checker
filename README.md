@@ -451,6 +451,7 @@ version without changing source:
 ./gradlew clean build -PkotlinVersion=2.2.20
 ./gradlew clean build -PkotlinVersion=2.3.0
 ./gradlew clean build -PkotlinVersion=2.3.20
+./gradlew clean build -PkotlinVersion=2.3.21
 ./gradlew clean build -PkotlinVersion=2.4.10
 ```
 

@@ -7,7 +7,10 @@ val kotlinCompilerVersion =
     providers.gradleProperty("kotlinVersion").orElse(libs.versions.kotlin)
 val kotlinAdapterDirectory = when {
     kotlinCompilerVersion.get().startsWith("2.2.") -> "src-kotlin-2.2"
-    kotlinCompilerVersion.get() == "2.3.20" -> "src-kotlin-2.3.20"
+    // FIR renamed its function and collection-literal nodes in 2.3.20.
+    kotlinCompilerVersion.get().startsWith("2.3.") &&
+        (kotlinCompilerVersion.get().substringBefore('-').substringBefore('+')
+            .substringAfterLast('.').toIntOrNull() ?: 0) >= 20 -> "src-kotlin-2.3.20"
     kotlinCompilerVersion.get().startsWith("2.3.") -> "src-kotlin-2.3"
     kotlinCompilerVersion.get().startsWith("2.4.") -> "src-kotlin-2.4"
     else -> error(
