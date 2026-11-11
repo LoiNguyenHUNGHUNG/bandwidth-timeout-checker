@@ -21,11 +21,14 @@ import org.jetbrains.kotlin.fir.expressions.FirWrappedArgumentExpression
 import org.jetbrains.kotlin.fir.expressions.FirWrappedExpression
 import org.jetbrains.kotlin.fir.expressions.impl.FirResolvedArgumentList
 import org.jetbrains.kotlin.fir.declarations.evaluateAs
+import org.jetbrains.kotlin.fir.resolve.fullyExpandedType
 import org.jetbrains.kotlin.name.ClassId
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.name.Name
+import org.jetbrains.kotlin.fir.types.classId
 import org.jetbrains.kotlin.fir.types.coneType
 import org.jetbrains.kotlin.fir.types.isSomeFunctionType
+import org.jetbrains.kotlin.fir.types.isMarkedNullable
 
 internal val NETWORK_DOWNLOAD_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.NetworkDownload"))
@@ -35,6 +38,8 @@ internal val BANDWIDTH_EFFECT_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BandwidthEffect"))
 internal val BANDWIDTH_VARIABLE_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BandwidthVariable"))
+internal val BANDWIDTH_CONCURRENT_MAP_ANNOTATION: ClassId =
+    ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.BandwidthConcurrentMap"))
 internal val HANDLER_ANNOTATION: ClassId =
     ClassId.topLevel(FqName("io.github.loinguyen.bandwidth.annotations.Handler"))
 internal val BOUNDED_SCOPE_ANNOTATION: ClassId =
@@ -52,10 +57,12 @@ private val NAMES: Name = Name.identifier("names")
 private val MAY_OUTLIVE_CALL: Name = Name.identifier("mayOutliveCall")
 private val SELF_BOUND: Name = Name.identifier("selfBound")
 private val K: Name = Name.identifier("k")
+private val CONCURRENCY_PARAMETER: Name = Name.identifier("concurrencyParameter")
+private val CALLBACK_PARAMETER: Name = Name.identifier("callbackParameter")
+private const val NO_DOWNLOAD_BOUND: Long = -1
 
 internal data class DownloadContract(
-    val maxBytes: Long,
-    val completeTimeoutMillis: Long,
+    val network: NetworkEffect,
 )
 
 internal data class EffectContract(
@@ -69,6 +76,11 @@ private data class BandwidthDownloadContract(
     val nMax: Int?,
     val mayOutliveCall: Boolean,
     val selfBound: Int?,
+)
+
+internal data class ConcurrentMapContract(
+    val concurrencyParameter: String,
+    val callbackParameter: String,
 )
 
 internal data class BoundedClientContract(
@@ -97,11 +109,14 @@ internal fun FirAnnotationContainer.annotation(
  */
 internal fun FirAnnotationContainer.downloadContract(session: FirSession): DownloadContract? {
     val annotation: FirAnnotation = annotation(NETWORK_DOWNLOAD_ANNOTATION, session) ?: return null
-    val maxBytes: Long = annotation.longArgument(MAX_BYTES, session) ?: return null
+    val maxBytes: Long = annotation.downloadBound(MAX_BYTES, session) ?: return null
     val timeoutMillis: Long =
-        annotation.longArgument(COMPLETE_TIMEOUT_MILLIS, session) ?: return null
+        annotation.downloadBound(COMPLETE_TIMEOUT_MILLIS, session) ?: return null
+    if (maxBytes == NO_DOWNLOAD_BOUND && timeoutMillis == NO_DOWNLOAD_BOUND) {
+        return DownloadContract(NetworkEffect.summary(rMaxBytesPerSecond = 0, nMax = 1))
+    }
     if (maxBytes < 0 || timeoutMillis <= 0) return null
-    return DownloadContract(maxBytes, timeoutMillis)
+    return DownloadContract(NetworkEffect.download(maxBytes, timeoutMillis))
 }
 
 /** Returns whether this declaration is a framework-invoked request handler. */
@@ -187,6 +202,80 @@ internal fun FirAnnotationContainer.boundedClientContract(
     return BoundedClientContract(k = bound)
 }
 
+/** Parses a valid audited bounded concurrent-map contract. */
+internal fun FirFunction.concurrentMapContract(session: FirSession): ConcurrentMapContract? {
+    val annotation = annotation(BANDWIDTH_CONCURRENT_MAP_ANNOTATION, session) ?: return null
+    if (concurrentMapAnnotationProblems(annotation, session).isNotEmpty()) return null
+    return ConcurrentMapContract(
+        concurrencyParameter = annotation.stringArgument(CONCURRENCY_PARAMETER, session)
+            ?: "maxConcurrency",
+        callbackParameter = annotation.stringArgument(CALLBACK_PARAMETER, session) ?: "f",
+    )
+}
+
+/** Validates the supported signature and incompatible effect contracts. */
+private fun FirFunction.concurrentMapAnnotationProblems(
+    annotation: FirAnnotation,
+    session: FirSession,
+): List<AnnotationProblem> = buildList {
+    fun problem(message: String) {
+        add(AnnotationProblem(annotation.source ?: source, message))
+    }
+    if (
+        this@concurrentMapAnnotationProblems.annotation(NETWORK_DOWNLOAD_ANNOTATION, session) != null ||
+        this@concurrentMapAnnotationProblems.annotation(BANDWIDTH_EFFECT_ANNOTATION, session) != null ||
+        this@concurrentMapAnnotationProblems.annotation(BANDWIDTH_VARIABLE_ANNOTATION, session) != null ||
+        returnTypeRef.annotation(BANDWIDTH_EFFECT_ANNOTATION, session) != null
+    ) {
+        problem(
+            "@BandwidthConcurrentMap cannot be combined with @NetworkDownload, " +
+                "@BandwidthEffect, @BandwidthVariable, or a returned effect contract.",
+        )
+    }
+    if (symbol.callableId.classId != null || symbol.callableId.isLocal) {
+        problem("@BandwidthConcurrentMap requires a top-level function.")
+    }
+    if (contextParameters.isNotEmpty()) {
+        problem("@BandwidthConcurrentMap does not support context parameters or receivers.")
+    }
+    if (receiverParameter?.typeRef?.coneType?.isBandwidthFlow(session) != true) {
+        problem("@BandwidthConcurrentMap requires a Flow extension receiver.")
+    }
+    if (!returnTypeRef.coneType.isBandwidthFlow(session)) {
+        problem("@BandwidthConcurrentMap requires a Flow return type.")
+    }
+    val concurrencyName = annotation.stringArgument(CONCURRENCY_PARAMETER, session)
+        ?: "maxConcurrency"
+    val callbackName = annotation.stringArgument(CALLBACK_PARAMETER, session) ?: "f"
+    if (concurrencyName.isBlank() || callbackName.isBlank() || concurrencyName == callbackName) {
+        problem("@BandwidthConcurrentMap parameter names must be distinct non-blank strings.")
+    }
+    val concurrency = valueParameters.firstOrNull { it.name.asString() == concurrencyName }
+    val callback = valueParameters.firstOrNull { it.name.asString() == callbackName }
+    if (concurrency == null) {
+        problem("@BandwidthConcurrentMap concurrency parameter '$concurrencyName' does not exist.")
+    } else if (
+        concurrency.returnTypeRef.coneType.fullyExpandedType(session).classId
+            ?.asSingleFqName()?.asString() != "kotlin.Int" ||
+        concurrency.returnTypeRef.coneType.isMarkedNullable
+    ) {
+        problem("@BandwidthConcurrentMap concurrency parameter '$concurrencyName' must have type Int.")
+    }
+    if (callback == null) {
+        problem("@BandwidthConcurrentMap callback parameter '$callbackName' does not exist.")
+    } else if (!callback.returnTypeRef.coneType.isSomeFunctionType(session)) {
+        problem("@BandwidthConcurrentMap callback parameter '$callbackName' must have a function type.")
+    }
+    valueParameters.filter { it !== callback && it !== concurrency }.forEach { parameter ->
+        if (parameter.returnTypeRef.coneType.isBandwidthLatentValue(session)) {
+            problem(
+                "@BandwidthConcurrentMap does not support additional function-valued or Flow " +
+                    "parameter '${parameter.name.asString()}'.",
+            )
+        }
+    }
+}
+
 /**
  * Validates every supported bandwidth annotation on this declaration and its
  * callable return type.
@@ -208,6 +297,15 @@ internal fun FirDeclaration.validateBandwidthAnnotations(
                     "the same declaration.",
             ),
         )
+    }
+
+    container.annotation(BANDWIDTH_CONCURRENT_MAP_ANNOTATION, session)?.let { annotation ->
+        val function = this@validateBandwidthAnnotations as? FirFunction
+        if (function == null) {
+            add(AnnotationProblem(annotation.source ?: source, "@BandwidthConcurrentMap requires a function."))
+        } else {
+            addAll(function.concurrentMapAnnotationProblems(annotation, session))
+        }
     }
 
     download?.let { validateDownloadAnnotation(it, session) }
@@ -268,12 +366,12 @@ internal fun FirDeclaration.validateBandwidthAnnotations(
 
     if (this@validateBandwidthAnnotations is FirValueParameter) {
         val variable = effectContract(session)?.variable
-        if (variable != null && !returnTypeRef.coneType.isSomeFunctionType(session)) {
+        if (variable != null && !returnTypeRef.coneType.isBandwidthLatentValue(session)) {
             add(
                 AnnotationProblem(
                     effect?.source ?: source,
                     "A symbolic @BandwidthEffect variable can annotate only a " +
-                        "function-valued parameter.",
+                        "function-valued or Flow parameter.",
                 ),
             )
         }
@@ -302,6 +400,22 @@ internal fun FirDeclaration.validateBandwidthAnnotations(
                 ),
             )
         }
+        receiverParameter?.let { receiver ->
+            receiver.typeRef.annotation(BANDWIDTH_EFFECT_ANNOTATION, session)?.let { annotation ->
+                validateEffectAnnotation(annotation, session)
+            }
+            val receiverVariable = receiver.effectContract(session)?.variable
+                ?: receiver.typeRef.effectContract(session)?.variable
+            if (receiverVariable != null && receiverVariable !in declaredByName) {
+                add(AnnotationProblem(receiver.source ?: source,
+                    "Effect variable '" + receiverVariable + "' is not declared by @BandwidthVariable on " +
+                        symbol.callableId.callableName + "."))
+            }
+            if (receiverVariable != null && !receiver.typeRef.coneType.isBandwidthLatentValue(session)) {
+                add(AnnotationProblem(receiver.source ?: source,
+                    "A symbolic @BandwidthEffect variable can annotate only a function-valued or Flow receiver."))
+            }
+        }
         valueParameters.forEach { parameter ->
             val parameterVariable = parameter.effectContract(session)?.variable
                 ?: parameter.returnTypeRef.effectContract(session)?.variable
@@ -324,8 +438,9 @@ private fun MutableList<AnnotationProblem>.validateDownloadAnnotation(
     annotation: FirAnnotation,
     session: FirSession,
 ) {
-    val maxBytes: Long? = annotation.longArgument(MAX_BYTES, session)
-    val timeoutMillis: Long? = annotation.longArgument(COMPLETE_TIMEOUT_MILLIS, session)
+    val maxBytes: Long? = annotation.downloadBound(MAX_BYTES, session)
+    val timeoutMillis: Long? = annotation.downloadBound(COMPLETE_TIMEOUT_MILLIS, session)
+    if (maxBytes == NO_DOWNLOAD_BOUND && timeoutMillis == NO_DOWNLOAD_BOUND) return
     if (maxBytes == null || maxBytes < 0) {
         add(
             AnnotationProblem(
@@ -418,6 +533,10 @@ private fun MutableList<AnnotationProblem>.validateEffectAnnotation(
         }
     }
 }
+
+/** Uses the annotation default only for omitted bounds, never invalid expressions. */
+private fun FirAnnotation.downloadBound(name: Name, session: FirSession): Long? =
+    if (argument(name) == null) NO_DOWNLOAD_BOUND else longArgument(name, session)
 
 /** Returns the integral constant [name] as a [Long], or `null` if unavailable. */
 private fun FirAnnotation.longArgument(name: Name, session: FirSession): Long? =

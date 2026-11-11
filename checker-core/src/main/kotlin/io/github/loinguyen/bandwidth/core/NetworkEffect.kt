@@ -278,6 +278,21 @@ public class NetworkEffect private constructor(
             ?: Rational.ZERO
     }
 
+    /**
+     * Independent-maxima baseline: `max(r) * max(n)` over the final obligations.
+     *
+     * This shares the inferred concurrency and lifetime assumptions with the
+     * pair-set result, but discards the correlation between rate and overlap.
+     * The two maxima may therefore come from different sequential phases.
+     */
+    public fun independentMaximaBandwidthBytesPerSecond(): Rational {
+        val materialized = obligations
+        val maximumRate = materialized.maxOfOrNull { it.requiredRateBytesPerSecond }
+            ?: Rational.ZERO
+        val maximumConcurrency = materialized.maxOfOrNull { it.concurrency } ?: 0
+        return maximumRate * maximumConcurrency
+    }
+
     /** True when [other] is a safe over-approximation of this effect. */
     public fun isCoveredBy(other: NetworkEffect): Boolean =
         obligations.all { pair ->

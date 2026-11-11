@@ -10,6 +10,7 @@ import org.jetbrains.kotlin.fir.declarations.FirFunction
 import org.jetbrains.kotlin.fir.declarations.FirSimpleFunction
 import org.jetbrains.kotlin.fir.expressions.FirArrayLiteral
 import org.jetbrains.kotlin.fir.expressions.FirExpression
+import org.jetbrains.kotlin.fir.types.coneType
 
 /** Creates the Kotlin 2.2 function-checker set backed by [inference]. */
 internal fun bandwidthFunctionEffectCheckers(
@@ -53,6 +54,24 @@ internal fun FirFunction.overriddenEffectContracts(
         with(context) {
             function.symbol.processOverriddenFunctionsSafe { overridden ->
                 overridden.fir.effectContract(session)?.let(::add)
+            }
+        }
+    }
+}
+
+/** Collects inherited contracts for supported Flow-valued results. */
+internal fun FirFunction.overriddenReturnedEffectContracts(
+    session: org.jetbrains.kotlin.fir.FirSession,
+    context: CheckerContext,
+): List<EffectContract> {
+    val function = this as? FirSimpleFunction ?: return emptyList()
+    return buildList {
+        with(context) {
+            function.symbol.processOverriddenFunctionsSafe { overridden ->
+                val returnType = overridden.fir.returnTypeRef
+                if (returnType.coneType.isBandwidthFlow(session)) {
+                    returnType.effectContract(session)?.let(::add)
+                }
             }
         }
     }
