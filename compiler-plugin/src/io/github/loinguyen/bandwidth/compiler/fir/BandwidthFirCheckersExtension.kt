@@ -1,5 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
+import io.github.loinguyen.bandwidth.core.AnalysisMode
 import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.diagnostics.DiagnosticReporter
 import org.jetbrains.kotlin.diagnostics.reportOn
@@ -10,27 +11,61 @@ import org.jetbrains.kotlin.fir.analysis.checkers.declaration.DeclarationChecker
 import org.jetbrains.kotlin.fir.analysis.checkers.declaration.FirDeclarationChecker
 import org.jetbrains.kotlin.fir.analysis.extensions.FirAdditionalCheckersExtension
 import org.jetbrains.kotlin.fir.declarations.FirDeclaration
+import org.jetbrains.kotlin.fir.declarations.FirAnonymousInitializer
+import org.jetbrains.kotlin.fir.declarations.FirConstructor
+import org.jetbrains.kotlin.fir.declarations.FirProperty
 
 internal class BandwidthFirCheckersExtension(
     session: FirSession,
     messages: MessageCollector,
     reportEffects: Boolean,
     applicationEntryPoints: ApplicationEntryPointEffects,
+    analysisMode: AnalysisMode,
 ) : FirAdditionalCheckersExtension(session) {
     private val inference = KotlinNetworkEffectInference(
         session = session,
         messages = messages,
         reportEffects = reportEffects,
         applicationEntryPoints = applicationEntryPoints,
+        analysisMode = analysisMode,
     )
 
     override val declarationCheckers: DeclarationCheckers =
-        object : DeclarationCheckers() {
+        object : BandwidthFunctionDeclarationCheckers(inference) {
             override val basicDeclarationCheckers =
                 setOf(BandwidthAnnotationChecker)
-            override val simpleFunctionCheckers =
-                bandwidthFunctionEffectCheckers(inference)
+            override val propertyCheckers = setOf(BandwidthPropertyEffectChecker(inference))
+            override val constructorCheckers = setOf(BandwidthConstructorEffectChecker(inference))
+            override val anonymousInitializerCheckers =
+                setOf(BandwidthInitializerEffectChecker(inference))
         }
+}
+
+private class BandwidthPropertyEffectChecker(
+    private val inference: KotlinNetworkEffectInference,
+) : FirDeclarationChecker<FirProperty>(MppCheckerKind.Common) {
+    context(context: CheckerContext, reporter: DiagnosticReporter)
+    override fun check(declaration: FirProperty) {
+        inference.analyzeProperty(declaration, context, reporter)
+    }
+}
+
+private class BandwidthConstructorEffectChecker(
+    private val inference: KotlinNetworkEffectInference,
+) : FirDeclarationChecker<FirConstructor>(MppCheckerKind.Common) {
+    context(context: CheckerContext, reporter: DiagnosticReporter)
+    override fun check(declaration: FirConstructor) {
+        inference.analyze(declaration, context, reporter)
+    }
+}
+
+private class BandwidthInitializerEffectChecker(
+    private val inference: KotlinNetworkEffectInference,
+) : FirDeclarationChecker<FirAnonymousInitializer>(MppCheckerKind.Common) {
+    context(context: CheckerContext, reporter: DiagnosticReporter)
+    override fun check(declaration: FirAnonymousInitializer) {
+        inference.analyzeInitializer(declaration, context, reporter)
+    }
 }
 
 private object BandwidthAnnotationChecker :

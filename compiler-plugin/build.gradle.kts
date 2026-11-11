@@ -7,7 +7,15 @@ val kotlinCompilerVersion =
     providers.gradleProperty("kotlinVersion").orElse(libs.versions.kotlin)
 val kotlinAdapterDirectory = when {
     kotlinCompilerVersion.get().startsWith("2.2.") -> "src-kotlin-2.2"
+    // FIR renamed its function and collection-literal nodes in 2.3.20.
+    kotlinCompilerVersion.get().startsWith("2.3.") &&
+        (kotlinCompilerVersion.get().substringBefore('-').substringBefore('+')
+            .substringAfterLast('.').toIntOrNull() ?: 0) >= 20 -> "src-kotlin-2.3.20"
     kotlinCompilerVersion.get().startsWith("2.3.") -> "src-kotlin-2.3"
+    // Function-checker registration and message-collector access changed in 2.4.20.
+    kotlinCompilerVersion.get().startsWith("2.4.") &&
+        (kotlinCompilerVersion.get().substringBefore('-').substringBefore('+')
+            .substringAfterLast('.').toIntOrNull() ?: 0) >= 20 -> "src-kotlin-2.4.20"
     kotlinCompilerVersion.get().startsWith("2.4.") -> "src-kotlin-2.4"
     else -> error(
         "Unsupported Kotlin compiler ${kotlinCompilerVersion.get()}. " +
@@ -65,6 +73,9 @@ kotlin {
         }
         optIn.add("org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi")
         optIn.add("org.jetbrains.kotlin.fir.symbols.SymbolInternals")
+        if (kotlinAdapterDirectory == "src-kotlin-2.4.20") {
+            optIn.add("org.jetbrains.kotlin.config.MessageCollectorAccess")
+        }
     }
 }
 

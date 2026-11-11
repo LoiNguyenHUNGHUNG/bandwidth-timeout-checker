@@ -1,16 +1,26 @@
 package io.github.loinguyen.bandwidth.annotations
 
+/** An absent primitive-download size bound or complete-call deadline. */
+public const val None: Long = -1
+
 /**
  * Declares a primitive network operation.
  *
  * The timeout is the complete-call deadline used for the transfer, not merely
  * a connect or read-idle timeout.
+ *
+ * Set both arguments to [None], or omit both, for an untimed download with no
+ * declared size bound.
+ * It still counts as one competing download, with required rate zero. Supply
+ * both a non-negative size and a positive timeout for a timed download. The
+ * [None] denotes an absent bound, not a zero-duration timeout. The transfer
+ * must complete or be cancelled before the annotated call returns.
  */
 @Target(AnnotationTarget.FUNCTION)
 @Retention(AnnotationRetention.BINARY)
 public annotation class NetworkDownload(
-    public val maxBytes: Long,
-    public val completeTimeoutMillis: Long,
+    public val maxBytes: Long = None,
+    public val completeTimeoutMillis: Long = None,
 )
 
 /**
@@ -79,6 +89,29 @@ public annotation class BandwidthEffect(
     public val rMaxBytesPerSecond: Long = 0,
     public val nMax: Int = 0,
     public val downloads: Array<BandwidthDownload> = [],
+)
+
+/**
+ * Audited contract for a pure Flow extension that maps callbacks concurrently.
+ *
+ * Calling the extension only constructs a cold Flow. Collecting its result runs
+ * the source Flow concurrently with at most the positive, compile-time constant
+ * number of callback invocations supplied to [concurrencyParameter]. The latent
+ * collection effect is the parallel composition of the source effect and that
+ * many copies of the effect of [callbackParameter]. Other parameters must not
+ * carry function or Flow effects.
+ *
+ * This is a trusted library boundary: the checker does not verify the operator's
+ * implementation against this contract. Work that escapes a callback's return
+ * must have its own finite self bound; the callback limit alone does not bound
+ * that work. The annotation applies only to top-level Flow extensions returning
+ * Flow, with an Int concurrency parameter and a function-valued callback.
+ */
+@Target(AnnotationTarget.FUNCTION)
+@Retention(AnnotationRetention.BINARY)
+public annotation class BandwidthConcurrentMap(
+    public val concurrencyParameter: String = "maxConcurrency",
+    public val callbackParameter: String = "f",
 )
 
 /**

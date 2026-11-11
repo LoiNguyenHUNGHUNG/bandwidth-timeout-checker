@@ -8,6 +8,61 @@ import kotlin.test.assertTrue
 
 class NetworkEffectTest {
     @Test
+    fun `independent maxima preserves exact fractional rates`() {
+        val result = NetworkEffect.download(1, 3).then(
+            NetworkEffect.download(1, 1_000).boundedReplication(2),
+        )
+
+        assertEquals(Rational.of(1_000, 3), result.requiredBandwidthBytesPerSecond())
+        assertEquals(Rational.of(2_000, 3), result.independentMaximaBandwidthBytesPerSecond())
+    }
+
+    @Test
+    fun `independent maxima includes escaping overlap exactly once`() {
+        val result = NetworkEffect.download(2, 1_000)
+            .withLifetime(DownloadLifetime.MAY_OUTLIVE_CALL)
+            .then(NetworkEffect.download(10, 1_000))
+            .then(NetworkEffect.download(1, 1_000).boundedReplication(3))
+
+        assertEquals(4, result.maxConcurrency)
+        assertEquals(Rational.of(20), result.requiredBandwidthBytesPerSecond())
+        assertEquals(Rational.of(40), result.independentMaximaBandwidthBytesPerSecond())
+    }
+
+    @Test
+    fun `empty independent maxima requires no bandwidth`() {
+        assertEquals(Rational.ZERO, NetworkEffect.EMPTY.independentMaximaBandwidthBytesPerSecond())
+    }
+
+    @Test
+    fun `independent maxima agrees for homogeneous download phases`() {
+        val download = NetworkEffect.download(7, 1_000)
+        val result = download.then(download.boundedReplication(3))
+
+        assertEquals(Rational.of(21), result.requiredBandwidthBytesPerSecond())
+        assertEquals(Rational.of(21), result.independentMaximaBandwidthBytesPerSecond())
+    }
+
+    @Test
+    fun `independent maxima agrees when heterogeneous downloads overlap`() {
+        val result = NetworkEffect.download(10, 1_000)
+            .parallel(NetworkEffect.download(1, 1_000))
+
+        assertEquals(Rational.of(20), result.requiredBandwidthBytesPerSecond())
+        assertEquals(Rational.of(20), result.independentMaximaBandwidthBytesPerSecond())
+    }
+
+    @Test
+    fun `independent maxima overestimates separate high rate and high overlap phases`() {
+        val result = NetworkEffect.download(10, 1_000).then(
+            NetworkEffect.download(1, 1_000).boundedReplication(3),
+        )
+
+        assertEquals(Rational.of(10), result.requiredBandwidthBytesPerSecond())
+        assertEquals(Rational.of(30), result.independentMaximaBandwidthBytesPerSecond())
+    }
+
+    @Test
     fun `keeps known concurrency separate from self bound`() {
         val download = NetworkEffect.download(
             maxBytes = 1_000,

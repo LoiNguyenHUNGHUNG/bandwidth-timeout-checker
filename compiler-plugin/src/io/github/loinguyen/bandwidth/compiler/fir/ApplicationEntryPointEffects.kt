@@ -1,6 +1,7 @@
 package io.github.loinguyen.bandwidth.compiler.fir
 
 import io.github.loinguyen.bandwidth.core.NetworkEffect
+import io.github.loinguyen.bandwidth.core.Rational
 import org.jetbrains.kotlin.backend.common.extensions.IrGenerationExtension
 import org.jetbrains.kotlin.backend.common.extensions.IrPluginContext
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSeverity
@@ -39,11 +40,15 @@ internal class ApplicationEntryPointEffects(
         val application = snapshot.fold(NetworkEffect.EMPTY) { result, effect ->
             result.parallel(effect)
         }
+        val maximumRate = application.obligations.maxOfOrNull { it.requiredRateBytesPerSecond }
+            ?: Rational.ZERO
         messages.report(
             CompilerMessageSeverity.INFO,
             "Inferred application entry-point effect from ${snapshot.size} entry point(s): " +
                 "${application.render()}, " +
-                "ReqBW=${application.requiredBandwidthBytesPerSecond()} bytes/s.",
+                "ReqBW=${application.requiredBandwidthBytesPerSecond()} bytes/s. " +
+                "IndependentMaximaBW=${application.independentMaximaBandwidthBytesPerSecond()} " +
+                "bytes/s (rMax=$maximumRate bytes/s, nMax=${application.maxConcurrency}).",
         )
     }
 }

@@ -1,5 +1,6 @@
 package io.github.loinguyen.bandwidth.compiler
 
+import io.github.loinguyen.bandwidth.core.AnalysisMode
 import io.github.loinguyen.bandwidth.compiler.fir.ApplicationEntryPointEffects
 import io.github.loinguyen.bandwidth.compiler.fir.BandwidthFirExtensionRegistrar
 import org.jetbrains.kotlin.backend.common.extensions.IrGenerationExtension
@@ -24,6 +25,7 @@ abstract class AbstractBandwidthCompilerPluginRegistrar : CompilerPluginRegistra
 
         val messages: MessageCollector =
             configuration.get(CommonConfigurationKeys.MESSAGE_COLLECTOR_KEY, MessageCollector.NONE)
+        val analysisMode = configuration.get(BandwidthConfiguration.ANALYSIS_MODE, AnalysisMode.DETAILED)
         val applicationEntryPoints = ApplicationEntryPointEffects(
             messages = messages,
             reportEffects = configuration.get(BandwidthConfiguration.REPORT_EFFECTS, false),
@@ -33,6 +35,7 @@ abstract class AbstractBandwidthCompilerPluginRegistrar : CompilerPluginRegistra
                 messages = messages,
                 reportEffects = configuration.get(BandwidthConfiguration.REPORT_EFFECTS, false),
                 applicationEntryPoints = applicationEntryPoints,
+                analysisMode = analysisMode,
             ),
         )
         IrGenerationExtension.registerExtension(applicationEntryPoints)
