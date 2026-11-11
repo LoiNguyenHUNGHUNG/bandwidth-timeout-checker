@@ -82,12 +82,13 @@ internal class KotlinNetworkEffectInference(
             ?: property.symbol.callableId?.classId?.takeUnless { it.isLocal }?.let { classId ->
                 session.symbolProvider.getClassLikeSymbolByClassId(classId)?.fir as? FirClass
             }
-        if (!flowStorage && enclosingClass?.containsFlowStorage() != true) return
+        val modeledConstructor = enclosingClass?.hasModeledConstructorInitialization() == true
+        if (!flowStorage && modeledConstructor && enclosingClass.containsFlowStorage() != true) return
         diagnosticContext = context
         diagnosticReporter = reporter
         try {
             if (!flowStorage) {
-                property.initializer?.let { initializer ->
+                (property.delegate ?: property.initializer)?.let { initializer ->
                     val owner = property.getter ?: context.containingDeclarations
                         .filterIsInstance<FirFunction>().lastOrNull()
                     if (owner == null) {
@@ -100,7 +101,7 @@ internal class KotlinNetworkEffectInference(
                             initializer,
                             KotlinEffectContext(owner, session, latentValues, analysisMode),
                         )
-                        if (result.network.concreteOrNull() != NetworkEffect.EMPTY) {
+                        if (!modeledConstructor && result.network.concreteOrNull() != NetworkEffect.EMPTY) {
                             error(
                                 initializer.source ?: property.source,
                                 "Flow wrapper initializer performs eager network work that is " +
@@ -164,7 +165,7 @@ internal class KotlinNetworkEffectInference(
                         initializer,
                         KotlinEffectContext(owner, session, latentValues, analysisMode),
                     )
-                    if (inferred.network.concreteOrNull() != NetworkEffect.EMPTY) {
+                    if (!modeledConstructor && inferred.network.concreteOrNull() != NetworkEffect.EMPTY) {
                         error(
                             initializer.source ?: property.source,
                             "Eager network work during Flow property initialization is not " +
@@ -256,7 +257,8 @@ internal class KotlinNetworkEffectInference(
         reporter: DiagnosticReporter,
     ) {
         if (!analyzedInitializers.add(initializer.symbol)) return
-        val owner = (initializer.containingDeclarationSymbol.fir as? FirClass)
+        val ownerClass = initializer.containingDeclarationSymbol.fir as? FirClass
+        val owner = ownerClass
             ?.declarations?.filterIsInstance<FirConstructor>()?.firstOrNull()
             ?: context.containingDeclarations.filterIsInstance<FirConstructor>().lastOrNull()
             ?: return
@@ -267,7 +269,9 @@ internal class KotlinNetworkEffectInference(
                 initializer.body,
                 KotlinEffectContext(owner, session, latentValues, analysisMode),
             )
-            if (result.network.concreteOrNull() != NetworkEffect.EMPTY) {
+            if (ownerClass?.hasModeledConstructorInitialization() != true &&
+                result.network.concreteOrNull() != NetworkEffect.EMPTY
+            ) {
                 error(
                     initializer.source,
                     "Eager network work in an init block is not modeled at constructor " +
@@ -457,10 +461,11 @@ internal class KotlinNetworkEffectInference(
         }
     }
 
-    /** Default arguments obey the same Flow contract as explicitly passed values. */
+    /** Defaults preserve Flow contracts; eager constructor defaults require an explicit argument. */
     private fun validateFlowParameterDefaults(function: FirFunction) {
         val defaults = function.valueParameters.filter {
-            it.defaultValue != null && it.returnTypeRef.coneType.isBandwidthFlow(session)
+            it.defaultValue != null &&
+                (function is FirConstructor || it.returnTypeRef.coneType.isBandwidthFlow(session))
         }
         if (defaults.isEmpty()) return
         val variables = function.effectVariableIds(session).associateBy(EffectVariableId::name)
@@ -483,12 +488,14 @@ internal class KotlinNetworkEffectInference(
             val expression = parameter.defaultValue ?: return@forEach
             val inferred = effectVisitor.infer(expression, context)
             if (inferred.network.concreteOrNull() != NetworkEffect.EMPTY) {
+                val kind = if (function is FirConstructor) "constructor" else "Flow"
                 error(
                     expression.source ?: parameter.source,
-                    "Eager network work in a Flow default argument is not modeled at call " +
+                    "Eager network work in a $kind default argument is not modeled at call " +
                         "boundaries. Use an explicit initialization argument.",
                 )
             }
+            if (!parameter.returnTypeRef.coneType.isBandwidthFlow(session)) return@forEach
             val contract = parameter.effectContract(session, analysisMode)
                 ?: parameter.returnTypeRef.effectContract(session, analysisMode)
             val expected = contract?.variable?.let { name ->

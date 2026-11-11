@@ -11,6 +11,10 @@ import org.jetbrains.kotlin.fir.unwrapFakeOverrides
 import org.jetbrains.kotlin.KtSourceElement
 import org.jetbrains.kotlin.fir.declarations.FirFunction
 import org.jetbrains.kotlin.fir.declarations.FirConstructor
+import org.jetbrains.kotlin.fir.declarations.FirAnonymousObject
+import org.jetbrains.kotlin.fir.declarations.FirClass
+import org.jetbrains.kotlin.fir.declarations.FirAnonymousInitializer
+import org.jetbrains.kotlin.fir.declarations.DirectDeclarationsAccess
 import org.jetbrains.kotlin.fir.declarations.FirCallableDeclaration
 import org.jetbrains.kotlin.fir.declarations.FirProperty
 import org.jetbrains.kotlin.fir.declarations.FirPropertyAccessor
@@ -135,7 +139,10 @@ internal class KotlinNetworkEffectVisitor(
         }
         val delegation = if (function is FirConstructor) infer(function.delegatedConstructor, context)
             else KotlinExpressionEffect()
-        val bodyEffect: KotlinExpressionEffect = delegation.then(infer(function.body, context))
+        val initialization = if (function is FirConstructor && function.delegatedConstructor?.isThis != true) {
+            inferConstructorInitialization(function, context)
+        } else KotlinExpressionEffect()
+        val bodyEffect: KotlinExpressionEffect = delegation.then(initialization).then(infer(function.body, context))
         val expressionResult: LatentNetworkEffect? =
             if (function.returnTypeRef.coneType.isBandwidthLatentValue(session)) {
                 bodyEffect.latent
@@ -146,6 +153,25 @@ internal class KotlinNetworkEffectVisitor(
             network = bodyEffect.network,
             returned = context.returnedLatent.join(expressionResult),
         )
+    }
+
+    /** Super construction precedes lexical field/init work; this-delegation owns it already. */
+    @OptIn(DirectDeclarationsAccess::class)
+    private fun inferConstructorInitialization(
+        constructor: FirConstructor,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
+        val owner = constructor.initializationOwner(session)
+            ?.takeIf { it.hasModeledConstructorInitialization() }
+            ?: return KotlinExpressionEffect()
+        return owner.declarations.fold(KotlinExpressionEffect()) { accumulated, declaration ->
+            val effect = when (declaration) {
+                is FirProperty -> infer(declaration, context)
+                is FirAnonymousInitializer -> infer(declaration.body, context)
+                else -> KotlinExpressionEffect()
+            }
+            accumulated.then(effect)
+        }
     }
 
     /**
@@ -207,6 +233,9 @@ internal class KotlinNetworkEffectVisitor(
         // routes keep declarations latent; declaration checkers still validate
         // every body and contract independently.
         if (element is FirFunction) return KotlinExpressionEffect()
+        // A named local class declaration does not construct an instance.
+        // Its fields/init blocks are charged through constructor calls only.
+        if (element is FirClass && element !is FirAnonymousObject) return KotlinExpressionEffect()
         return element.functionTypeConversionOperand()?.let { infer(it, data) }
             ?: inferChildren(element, data)
     }
@@ -286,8 +315,11 @@ internal class KotlinNetworkEffectVisitor(
         property: FirProperty,
         data: KotlinEffectContext,
     ): KotlinExpressionEffect {
-        val initializer = infer(property.initializer, data).let { effect ->
-            if (property.initializer != null && property.returnTypeRef.coneType.isBandwidthFlow(session)) {
+        val initializationExpression = property.delegate ?: property.initializer
+        val initializer = infer(initializationExpression, data).let { effect ->
+            if (property.delegate == null && property.initializer != null &&
+                property.returnTypeRef.coneType.isBandwidthFlow(session)
+            ) {
                 effect.withExpectedFlowValue(property.initializer)
             } else {
                 effect
@@ -2544,7 +2576,7 @@ internal class KotlinNetworkEffectVisitor(
         val needsVisibleBody =
             invocationContract == null ||
                 (returnsLatentValue && returnedContract == null)
-        val shouldInfer = definition.body != null && needsVisibleBody
+        val shouldInfer = definition.hasInferableNetworkBody(session) && needsVisibleBody
         val inferred = if (shouldInfer) inferFunction(definition) else null
         val symbolic = KotlinFunctionEffect(
             network = symbolicInvocation
@@ -3109,6 +3141,7 @@ internal class KotlinNetworkEffectVisitor(
         val EAGER_COLLECTION_MAP_FQ_NAMES: Set<String> = setOf(
             "kotlin.collections.map",
             "kotlin.collections.mapIndexed",
+            "kotlin.collections.zip",
             "kotlin.collections.mapNotNull",
         )
         val SINGLE_CALLBACK_FQ_NAMES: Set<String> = setOf(
@@ -3149,6 +3182,7 @@ internal class KotlinNetworkEffectVisitor(
             "kotlin.repeat",
             "kotlin.collections.map",
             "kotlin.collections.mapIndexed",
+            "kotlin.collections.zip",
             "kotlin.collections.mapNotNull",
             "kotlin.collections.forEach",
             "kotlin.collections.forEachIndexed",
