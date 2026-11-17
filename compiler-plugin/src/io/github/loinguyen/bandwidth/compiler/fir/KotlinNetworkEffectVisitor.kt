@@ -79,6 +79,7 @@ internal class KotlinNetworkEffectVisitor(
     /** Scope ownership may justify a guarded wait without ending its overlap phase. */
     private val structuredPhases =
         IdentityHashMap<KotlinEffectContext, CoroutinePhaseState<FirBasedSymbol<*>>>()
+    private val modeledDownloadCalls = IdentityHashMap<FirFunctionCall, Boolean>()
 
     /**
      * Infers the eager effect and callback-valued return of [function].
@@ -657,6 +658,24 @@ internal class KotlinNetworkEffectVisitor(
         call: FirFunctionCall,
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
+        val effect = inferCallModel(call, context)
+        if (call.downloadContract(session, analysisMode) != null &&
+            !modeledDownloadCalls.containsKey(call)
+        ) {
+            problem(
+                key = "unsupported-download-call:${context.function.displayName()}:${call.source?.startOffset}",
+                source = call.source,
+                message = "@NetworkDownload cannot annotate this modeled operation. " +
+                    "Annotate the primitive library call inside it instead.",
+            )
+        }
+        return effect
+    }
+
+    private fun inferCallModel(
+        call: FirFunctionCall,
+        context: KotlinEffectContext,
+    ): KotlinExpressionEffect {
         val target: FirFunction =
             (call.resolvedSymbol() as? FirFunctionSymbol<*>)?.fir
                 ?: return inferChildren(call, context)
@@ -773,7 +792,7 @@ internal class KotlinNetworkEffectVisitor(
             )
         }
         if (target.isSingleCallbackFunction()) {
-            return inferSingleCallbackCall(call, context)
+            return inferSingleCallbackCall(call, target, context)
         }
         val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
         /** Infers [expression] at most once for this call site. */
@@ -800,11 +819,13 @@ internal class KotlinNetworkEffectVisitor(
         val isExplicitFunctionInvoke = target.symbol.callableId.callableName.asString() == "invoke" &&
             invokedReceiver?.resolvedType?.isSomeFunctionType(session) == true
         if (call is FirImplicitInvokeCall || isExplicitFunctionInvoke) {
-            val invokedValue = invokedReceiver
-            return inferFunctionInvocation(
-                invokedValueEffect = invokedValue?.let(::effectOf),
-                evaluatedInputs = evaluatedInputs,
+            val latent = invokedReceiver?.let(::effectOf)?.latent ?: LatentNetworkEffect()
+            val invocation = primitiveCallSummary(
+                call,
+                KotlinFunctionEffect(network = latent.network, returned = latent.returned),
+                context,
             )
+            return evaluatedInputs.then(KotlinExpressionEffect(invocation.network, invocation.returned))
         }
 
         val summary = functionSummary(
@@ -813,9 +834,19 @@ internal class KotlinNetworkEffectVisitor(
             call = call,
             context = context,
         )
-        val invocation = call.clientSelfBound(target)?.let { bound ->
-            summary.copy(network = summary.network.withSelfBound(bound))
-        } ?: summary
+        if (call.downloadContract(session, analysisMode) != null &&
+            !target.hasInferableNetworkBody(session) && target.effectContract(session, analysisMode) == null &&
+            argumentEffects.values.any { it.latent?.network?.concreteOrNull()?.let { n -> n != NetworkEffect.EMPTY }
+                ?: (it.latent != null) }
+        ) {
+            problem(
+                key = "download-callback-contract:${context.function.displayName()}:${call.source?.startOffset}",
+                source = call.source,
+                message = "A primitive library call with an effectful callback requires an " +
+                    "explicit library invocation contract; @NetworkDownload cannot hide callback work.",
+            )
+        }
+        val invocation = primitiveCallSummary(call, summary, context)
         return evaluatedInputs.then(
             KotlinExpressionEffect(
                 network = invocation.network,
@@ -824,6 +855,28 @@ internal class KotlinNetworkEffectVisitor(
         ).copy(
             latent = invocation.returned,
         )
+    }
+
+    /** Adds only the callee obligation; receivers/arguments remain separate effects. */
+    private fun primitiveCallSummary(
+        call: FirFunctionCall,
+        summary: KotlinFunctionEffect,
+        context: KotlinEffectContext,
+    ): KotlinFunctionEffect {
+        val contract = call.downloadContract(session, analysisMode) ?: return summary
+        modeledDownloadCalls[call] = true
+        val actual = summary.network.concreteOrNull()
+        if (actual == null || !actual.isCoveredBy(contract.network)) {
+            problem(
+                key = "download-call-contract:${context.function.displayName()}:${call.source?.startOffset}",
+                source = call.source,
+                message = "Call effect ${summary.network.render()} is not covered by " +
+                    "@NetworkDownload contract ${contract.network.render()}. " +
+                    "Use the callee's inferred or declared @BandwidthEffect instead.",
+            )
+        }
+        val network = call.clientSelfBound()?.let(contract.network::withSelfBound) ?: contract.network
+        return summary.copy(network = network.asEffect())
     }
 
     /**
@@ -1950,6 +2003,7 @@ internal class KotlinNetworkEffectVisitor(
      */
     private fun inferSingleCallbackCall(
         call: FirFunctionCall,
+        target: FirFunction,
         context: KotlinEffectContext,
     ): KotlinExpressionEffect {
         val cachedEffects = IdentityHashMap<FirExpression, KotlinExpressionEffect>()
@@ -1960,14 +2014,48 @@ internal class KotlinNetworkEffectVisitor(
         val receiverEffects = sequence(call.receiverExpressions().map(::effectOf))
         val argumentEffects = call.argumentList.arguments.map(::effectOf)
         val evaluatedArguments = sequence(argumentEffects)
+        // An explicit invocation contract summarizes the whole operation,
+        // including its callbacks. Instantiate and use it normally rather than
+        // overriding it with the callback-timing-only library model.
+        if (target.effectContract(session, analysisMode) != null) {
+            val bindings = validateHigherOrderArguments(
+                call, target, call.argumentEffectsByParameter(::effectOf),
+                target.receiverParameter?.let {
+                    (call.extensionReceiver ?: call.explicitReceiver)?.let(::effectOf)
+                }, context,
+            )
+            val summary = functionSummary(target, bindings, call, context)
+            val invocation = primitiveCallSummary(call, summary, context)
+            return receiverEffects.then(evaluatedArguments).then(
+                KotlinExpressionEffect(invocation.network, invocation.returned),
+            )
+        }
         val invokedCallbacks = argumentEffects.fold(KotlinExpressionEffect()) { effect, argument ->
             effect.then(
                 KotlinExpressionEffect(
                     network = argument.latent?.network ?: Effect.Empty,
+                    latent = argument.latent?.returned,
                 ),
             )
         }
-        return receiverEffects.then(evaluatedArguments).then(invokedCallbacks)
+        val primitive = call.downloadContract(session, analysisMode)?.let {
+            // The timing-only model does not discover the library's own
+            // transfer. Check any visible callee work before adding that
+            // primitive alongside the separately modeled callback work.
+            val summary = functionSummary(target, call = call, context = context)
+            primitiveCallSummary(call, summary, context).network
+        } ?: Effect.Empty
+        val returned = if (call.resolvedType.isBandwidthLatentValue(session)) {
+            if (target.symbol.callableId.asSingleFqName().asString() in setOf("kotlin.also", "kotlin.apply")) {
+                receiverEffects.latent
+            } else invokedCallbacks.latent
+        } else null
+        return receiverEffects.then(evaluatedArguments).then(
+            KotlinExpressionEffect(
+                network = primitive.parallel(invokedCallbacks.network),
+                latent = returned,
+            ),
+        )
     }
 
     /** Infers a callback body once, then applies the core repetition rule. */
@@ -2524,23 +2612,6 @@ internal class KotlinNetworkEffectVisitor(
     }
 
     /**
-     * Materializes the latent effect of an implicitly invoked function value
-     * after its receiver and argument inputs have been evaluated.
-     */
-    private fun inferFunctionInvocation(
-        invokedValueEffect: KotlinExpressionEffect?,
-        evaluatedInputs: KotlinExpressionEffect,
-    ): KotlinExpressionEffect {
-        val latent = invokedValueEffect?.latent ?: LatentNetworkEffect()
-        return evaluatedInputs.then(
-            KotlinExpressionEffect(
-                network = latent.network,
-                latent = latent.returned,
-            ),
-        )
-    }
-
-    /**
      * Resolves [target] through primitive, declared, cached, or inferred eager
      * and returned-latent effects.
      */
@@ -2560,12 +2631,7 @@ internal class KotlinNetworkEffectVisitor(
         // the definition, then translate the call's effect-variable bindings.
         // Real source overrides are retained: only substitution wrappers peel.
         val definition = generateSequence(target) { it.originalForSubstitutionOverride }.last()
-        // A primitive size/deadline declaration is shorthand for a singleton
-        // invocation contract. Use the same source-body and returned-latent
-        // handling as an ordinary concrete @BandwidthEffect.
-        val invocationContract = definition.downloadContract(session, analysisMode)?.let {
-            EffectContract(network = it.network, variable = null)
-        } ?: definition.effectContract(session, analysisMode)
+        val invocationContract = definition.effectContract(session, analysisMode)
         val symbolicInvocation = definition.symbolicInvocationEffect(session, analysisMode)
         val returnedContract = target.returnTypeRef.effectContract(session, analysisMode)
             ?: definition.returnTypeRef.effectContract(session, analysisMode)
@@ -3048,8 +3114,8 @@ internal class KotlinNetworkEffectVisitor(
      * Returns the unique bounded-client capacity attached to a primitive
      * download call's receivers or arguments.
      */
-    private fun FirFunctionCall.clientSelfBound(target: FirFunction): Int? {
-        if (target.downloadContract(session, analysisMode) == null) return null
+    private fun FirFunctionCall.clientSelfBound(): Int? {
+        if (downloadContract(session, analysisMode) == null) return null
         val bounds = (receiverExpressions() + argumentList.arguments)
             .mapNotNull { it.boundedClientCapacity() }
             .distinct()

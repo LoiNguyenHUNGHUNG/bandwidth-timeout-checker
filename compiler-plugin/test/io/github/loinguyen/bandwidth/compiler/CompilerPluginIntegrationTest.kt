@@ -11,15 +11,231 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 
 class CompilerPluginIntegrationTest {
+
     @Test
-    fun `primitive boundary preserves an annotated anonymous function contract`() {
+    fun `call-site download assigns a singleton to an opaque library call`() {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            fun opaqueFetch() = Unit
             fun root() {
-                val callback = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-                    fun() { opaqueFetch() }
-                callback()
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+                checkNotNull(Unit)
+            }
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for root: {(1000, 1)}")
+        result.assertFunctionBandwidth("root", 1000)
+    }
+
+    @Test
+    fun `call-site download evaluates constant bounds in milliseconds`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            const val TRANSFER_BYTES = 6_000L
+            const val COMPLETE_TIMEOUT = 10_000L
+            fun root() = @NetworkDownload(
+                maxBytes = TRANSFER_BYTES,
+                completeTimeoutMillis = COMPLETE_TIMEOUT,
+            ) checkNotNull("payload")
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for root: {(600, 1)}")
+        result.assertFunctionBandwidth("root", 600)
+    }
+
+    @Test
+    fun `call-site download keeps explicit None and omitted bounds as competing downloads`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import io.github.loinguyen.bandwidth.annotations.None
+            fun explicit() = @NetworkDownload(
+                maxBytes = None, completeTimeoutMillis = None,
+            ) checkNotNull(Unit)
+            fun omitted() = @NetworkDownload() checkNotNull(Unit)
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for explicit: {(0, 1)}")
+        result.assertOutputContains("Inferred bandwidth effect for omitted: {(0, 1)}")
+    }
+
+    @Test
+    fun `call-site download rejects function declaration placement`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            @BandwidthEffect(rMaxBytesPerSecond = 1000, nMax = 1)
+            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
+            fun download() = Unit
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("not applicable to target")
+    }
+
+    @Test
+    fun `call-site download rejects annotated values and function expressions`() {
+        val expressions = listOf("Unit", "1", "{ Unit }", "fun() = Unit")
+        expressions.forEach { expression ->
+            val result = compile("""
+                import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+                fun unused() {
+                    val value = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
+                        $expression
+                }
+            """)
+            assertNotEquals(0, result.exitCode, "$expression\n${result.output}")
+            result.assertOutputContains("@NetworkDownload applies only to a function call expression")
+        }
+    }
+
+    @Test
+    fun `call-site download composes sequential calls without increasing concurrency`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            fun root() {
+                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit)
+                @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit)
+            }
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for root: {(2000, 1)}")
+        result.assertFunctionBandwidth("root", 2000)
+    }
+
+    @Test
+    fun `call-site download retains parallel concurrency through an ordinary wrapper`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+            suspend fun wrapper() = coroutineScope {
+                launch { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit) }
+                launch { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1000) checkNotNull(Unit) }
+            }
+            suspend fun root() = wrapper()
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for root: {(1000, 2)}")
+        result.assertFunctionBandwidth("root", 2000)
+    }
+
+    @Test
+    fun `call-site download is checked by a covering source function contract`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            @BandwidthEffect(rMaxBytesPerSecond = 1000, nMax = 1)
+            fun wrapper() {
+                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit)
+            }
+            fun root() = wrapper()
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 1000)
+    }
+
+    @Test
+    fun `call-site download cannot evade a narrow source function contract`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            @BandwidthEffect(rMaxBytesPerSecond = 500, nMax = 1)
+            fun unused() {
+                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit)
+            }
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("not covered by @BandwidthEffect contract")
+    }
+
+    @Test
+    fun `call-site download permits a covered known callee and charges its stated singleton`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            @BandwidthEffect(rMaxBytesPerSecond = 500, nMax = 1)
+            fun helper() = Unit
+            fun root() = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) helper()
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for root: {(1000, 1)}")
+        result.assertFunctionBandwidth("root", 1000)
+    }
+
+    @Test
+    fun `call-site download cannot narrow a known callee rate`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            @BandwidthEffect(rMaxBytesPerSecond = 2000, nMax = 1)
+            fun helper() = Unit
+            fun unused() = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) helper()
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Call effect")
+        result.assertOutputContains("not covered by @NetworkDownload contract")
+    }
+
+    @Test
+    fun `call-site download cannot narrow a known callee concurrency even with a larger rate`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            @BandwidthEffect(rMaxBytesPerSecond = 100, nMax = 2)
+            fun helper() = Unit
+            fun unused() = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) helper()
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Call effect")
+        result.assertOutputContains("not covered by @NetworkDownload contract")
+    }
+
+    @Test
+    fun `call-site download checks a known source body reached through helper indirection`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.coroutineScope
+            import kotlinx.coroutines.launch
+            suspend fun helper() = coroutineScope {
+                launch { @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1000) checkNotNull(Unit) }
+                launch { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1000) checkNotNull(Unit) }
+            }
+            suspend fun unused() = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) helper()
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Call effect")
+        result.assertOutputContains("not covered by @NetworkDownload contract")
+    }
+
+    @Test
+    fun `call-site download preserves eager argument evaluation outside its singleton`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            fun argument() = @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit)
+            fun root() = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(argument())
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for root: {(2000, 1)}")
+        result.assertFunctionBandwidth("root", 2000)
+    }
+
+    @Test
+    fun `call-site download preserves eager receiver evaluation outside its singleton`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            fun receiver() = @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit)
+            fun root() = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) receiver().toString()
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for root: {(2000, 1)}")
+        result.assertFunctionBandwidth("root", 2000)
+    }
+
+    @Test
+    fun `call-site download allows a covered direct function invocation`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            fun root() {
+                val callback = { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1000) checkNotNull(Unit) }
+                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) callback.invoke()
             }
         """, reportEffects = true)
         assertEquals(0, result.exitCode, result.output)
@@ -27,627 +243,203 @@ class CompilerPluginIntegrationTest {
     }
 
     @Test
-    fun `primitive boundary checks an annotated anonymous function body`() {
+    fun `call-site download cannot hide an oversized direct function invocation`() {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
-            fun download() = Unit
-            fun root() {
-                val callback = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-                    fun() { download() }
-                callback()
+            fun unused() {
+                val callback = { @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit) }
+                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) callback()
             }
         """)
         assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Call effect")
         result.assertOutputContains("not covered by @NetworkDownload contract")
     }
 
     @Test
-    fun `primitive boundary applies declared invocation effects to application roots`() {
-        listOf(
-            "@NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)",
-            "@BandwidthEffect(rMaxBytesPerSecond = 1_000, nMax = 1)",
-        ).forEach { annotation ->
-            val result = compile(
-                """
-                import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
-                import io.github.loinguyen.bandwidth.annotations.EntryPoint
+    fun `call-site download preserves a returned callback latent effect`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            fun factory(): () -> Unit = {
+                @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit)
+            }
+            fun root() {
+                val callback = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) factory()
+                callback()
+            }
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 2000)
+    }
+
+    @Test
+    fun `call-site download preserves a returned Flow latent effect`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.flow.collect
+            import kotlinx.coroutines.flow.flow
+            fun factory() = flow {
+                emit(@NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit))
+            }
+            suspend fun root() {
+                val stream = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) factory()
+                stream.collect()
+            }
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 2000)
+    }
+
+    @Test
+    fun `call-site download rejects annotations on a modeled coroutine operation`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.coroutineScope
+            suspend fun unused() = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) coroutineScope {
+                Unit
+            }
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("@NetworkDownload cannot annotate this modeled operation")
+    }
+    @Test
+    fun `call-site download rejects eager work in an unused function default argument`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            fun unused(
+                value: Unit = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit),
+            ) = Unit
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Eager network work in a function default argument is not modeled")
+    }
+
+    @Test
+    fun `call-site download rejects annotated structured builders inside a scope`() {
+        listOf("async", "launch").forEach { builder ->
+            val result = compile("""
                 import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-                @EntryPoint
-                $annotation
-                fun root() = Unit
-                """,
-                reportEffects = true,
-            )
-
-            assertEquals(0, result.exitCode, "$annotation\n${result.output}")
-            result.assertOutputContains("Inferred application entry-point effect from 1 entry point(s): {(1000, 1)}")
-            result.assertOutputContains("ReqBW=1000 bytes/s")
+                import kotlinx.coroutines.*
+                suspend fun unused() = coroutineScope {
+                    @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) $builder { Unit }
+                    Unit
+                }
+            """)
+            assertNotEquals(0, result.exitCode, "$builder\n${result.output}")
+            result.assertOutputContains("@NetworkDownload cannot annotate this modeled operation")
         }
     }
 
     @Test
-    fun `primitive boundary retains network demand when a framework repeats its declaration handler`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.Handler
+    fun `call-site download rejects annotated inline async arguments to awaitAll`() {
+        val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @Handler
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun handler() = Unit
-            """,
-        )
-
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("self bound")
-    }
-
-    @Test
-    fun `primitive boundary accepts sequential downloads fitting its singleton contract`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            fun first() = Unit
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            fun second() = Unit
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun sequential() { first(); second() }
-
-            fun root() = sequential()
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertFunctionBandwidth("root", 1000)
-    }
-
-    @Test
-    fun `primitive boundary rejects a nested download exceeding its declared rate`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
-            fun inner() = Unit
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun tooSmall() = inner()
-            """,
-        )
-
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("not covered by @NetworkDownload contract")
-    }
-
-    @Test
-    fun `primitive boundary rejects parallel untimed work despite zero required bandwidth`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            import kotlinx.coroutines.async
-            import kotlinx.coroutines.coroutineScope
-
-            @NetworkDownload()
-            suspend fun untimed() = Unit
-
-            @NetworkDownload()
-            suspend fun tooWide() = coroutineScope {
-                async { untimed() }
-                async { untimed() }
-                Unit
+            import kotlinx.coroutines.*
+            suspend fun unused() = coroutineScope {
+                awaitAll(@NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) async { Unit })
             }
-            """,
-        )
-
+        """)
         assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("not covered by @NetworkDownload contract")
+        result.assertOutputContains("@NetworkDownload cannot annotate this modeled operation")
     }
 
     @Test
-    fun `primitive boundary rejects an invoked callback exceeding its declared rate`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+    fun `call-site download rejects an annotated await on a tracked child`() {
+        val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun invokeDownload(
-                callback: @BandwidthEffect(rMaxBytesPerSecond = 2_000, nMax = 1) () -> Unit,
-            ) { callback() }
-            """,
-        )
-
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("not covered by @NetworkDownload contract")
-    }
-
-    @Test
-    fun `primitive boundary and explicit singleton effect have equivalent source contracts`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            fun inner() = Unit
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun downloadContract() = inner()
-
-            @BandwidthEffect(rMaxBytesPerSecond = 1_000, nMax = 1)
-            fun effectContract() = inner()
-
-            fun downloadRoot() = downloadContract()
-            fun effectRoot() = effectContract()
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for downloadRoot: {(1000, 1)}")
-        result.assertOutputContains("Inferred bandwidth effect for effectRoot: {(1000, 1)}")
-    }
-
-    @Test
-    fun `primitive boundary rejects eager network work in an omitted default argument`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
-            fun defaultValue(): Int = 1
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun download(value: Int = defaultValue()) = Unit
-
-            fun root() = download()
-            """,
-        )
-
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Eager network work in a primitive download default argument")
-    }
-
-    @Test
-    fun `primitive boundary checks a default callback against its parameter contract`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            fun inner() = Unit
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun download(callback: () -> Unit = { inner() }) { callback() }
-
-            fun root() = download()
-            """,
-        )
-
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Function default argument effect")
-        result.assertOutputContains("not covered by parameter contract")
-    }
-
-    @Test
-    fun `primitive boundary rejects an unconstrained symbolic body under a concrete singleton`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
-            import io.github.loinguyen.bandwidth.annotations.BandwidthVariable
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @BandwidthVariable("E")
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun wrap(callback: @BandwidthEffect("E") () -> Unit) { callback() }
-            """,
-        )
-
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Cannot verify a symbolic body effect against a concrete @NetworkDownload contract")
-    }
-
-    @Test
-    fun `primitive boundary rejects a parallel override of a primitive interface contract`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            import kotlinx.coroutines.async
-            import kotlinx.coroutines.coroutineScope
-
-            interface Library {
-                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-                suspend fun download()
+            import kotlinx.coroutines.*
+            suspend fun unused() = coroutineScope {
+                val child = async { Unit }
+                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) child.await()
             }
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("@NetworkDownload cannot annotate this modeled operation")
+    }
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun first() = Unit
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun second() = Unit
+    @Test
+    fun `call-site download rejects an annotated awaitAll on tracked children`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.*
+            suspend fun unused() = coroutineScope {
+                val children = listOf(async { Unit })
+                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) children.awaitAll()
+            }
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("@NetworkDownload cannot annotate this modeled operation")
+    }
 
-            class CompositeLibrary : Library {
-                override suspend fun download() {
-                    coroutineScope {
-                        async { first() }
-                        async { second() }
+    @Test
+    fun `call-site download rejects an annotated map of structured children`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.*
+            suspend fun unused() = coroutineScope {
+                val children = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
+                    listOf(1, 2).map { async { Unit } }
+                children.awaitAll()
+            }
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("@NetworkDownload cannot annotate this modeled operation")
+    }
+
+    @Test
+    fun `call-site download cannot narrow a single callback operation callee contract`() {
+        listOf(2000 to 1, 100 to 2).forEach { (rate, concurrency) ->
+            val result = compileSources(
+                sources = listOf(
+                    """
+                    package io.ktor.client.statement
+                    import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+                    class HttpStatement {
+                        @BandwidthEffect(rMaxBytesPerSecond = $rate, nMax = $concurrency)
+                        suspend fun <T> execute(block: suspend (String) -> T): T = error("stub")
+                    }
+                    """,
+                    """
+                    import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+                    import io.ktor.client.statement.HttpStatement
+                    suspend fun unused(statement: HttpStatement) {
+                        @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
+                        statement.execute { Unit }
+                    }
+                    """,
+                ),
+            )
+            assertNotEquals(0, result.exitCode, "($rate, $concurrency)\n${result.output}")
+            result.assertOutputContains("not covered by @NetworkDownload contract")
+        }
+    }
+
+    @Test
+    fun `call-site download overlaps a single callback effect with its own primitive`() {
+        val result = compileSources(
+            sources = listOf(
+                """
+                package io.ktor.client.statement
+                class HttpStatement {
+                    suspend fun <T> execute(block: suspend (String) -> T): T = error("stub")
+                }
+                """,
+                """
+                import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+                import io.ktor.client.statement.HttpStatement
+                suspend fun root(statement: HttpStatement) {
+                    @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
+                    statement.execute {
+                        @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit)
                     }
                 }
-            }
-            """,
-        )
-
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("overridden bandwidth contract")
-    }
-
-    @Test
-    fun `primitive boundary accepts a matching primitive implementation of an interface`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            interface Library {
-                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-                fun download()
-            }
-
-            fun opaqueFetch() = Unit
-
-            class PrimitiveLibrary : Library {
-                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-                override fun download() = opaqueFetch()
-            }
-
-            fun root(library: Library) = library.download()
-            fun concreteRoot() = PrimitiveLibrary().download()
-            """,
+                """,
+            ),
             reportEffects = true,
         )
-
         assertEquals(0, result.exitCode, result.output)
-        result.assertFunctionBandwidth("root", 1000)
-        result.assertFunctionBandwidth("concreteRoot", 1000)
-    }
-
-    @Test
-    fun `primitive boundary keeps eager argument evaluation in the caller`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
-            fun downloadArgument(): Int = 1
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun download(value: Int) = Unit
-
-            fun root() = download(downloadArgument())
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for root: {(2000, 1)}")
-        result.assertFunctionBandwidth("root", 2000)
-        assertFalse(result.output.contains("not covered by @NetworkDownload contract"), result.output)
-    }
-
-    @Test
-    fun `primitive boundary accepts fitting network work reached through an unannotated helper`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun download() = Unit
-
-            fun helper() = download()
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun hiddenComposite() = helper()
-
-            fun root() = hiddenComposite()
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertFunctionBandwidth("root", 1000)
-    }
-
-    @Test
-    fun `primitive boundary accepts returning a known network free lambda`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun download(): () -> Unit = {}
-
-            fun root() {
-                val callback = download()
-                callback()
-            }
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertFunctionBandwidth("root", 1000)
-    }
-
-    @Test
-    fun `primitive boundary accepts a leaf around an unannotated library call`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            // Stand-in for foreign I/O whose implementation is not modeled.
-            fun libraryFetch(): String = "payload"
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun download(): String = libraryFetch()
-
-            fun root() = download()
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for root: {(1000, 1)}")
-        result.assertFunctionBandwidth("root", 1000)
-    }
-
-    @Test
-    fun `primitive boundary rejects parallel downloads hidden inside its body`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            import kotlinx.coroutines.async
-            import kotlinx.coroutines.coroutineScope
-
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun first() = Unit
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
-            suspend fun second() = Unit
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun hiddenComposite() = coroutineScope {
-                async { first() }
-                async { second() }
-                Unit
-            }
-            """,
-        )
-
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("not covered by @NetworkDownload contract")
-    }
-
-    @Test
-    fun `primitive boundary leaves ordinary wrappers to infer their real concurrency`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            import kotlinx.coroutines.async
-            import kotlinx.coroutines.coroutineScope
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun first() = Unit
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun second() = Unit
-
-            suspend fun composite() = coroutineScope {
-                async { first() }
-                async { second() }
-                Unit
-            }
-            suspend fun root() = composite()
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for root: {(1000, 2)}")
-        result.assertFunctionBandwidth("root", 2000)
-    }
-
-    @Test
-    fun `primitive boundary supports a checked aggregate BandwidthEffect contract`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            import kotlinx.coroutines.async
-            import kotlinx.coroutines.coroutineScope
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun first() = Unit
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun second() = Unit
-
-            @BandwidthEffect(rMaxBytesPerSecond = 1_000, nMax = 2)
-            suspend fun composite() = coroutineScope {
-                async { first() }
-                async { second() }
-                Unit
-            }
-            suspend fun root() = composite()
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertFunctionBandwidth("root", 2000)
-    }
-
-    @Test
-    fun `primitive boundary checks aggregate concurrency instead of trusting a narrow contract`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            import kotlinx.coroutines.async
-            import kotlinx.coroutines.coroutineScope
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun first() = Unit
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun second() = Unit
-
-            @BandwidthEffect(rMaxBytesPerSecond = 1_000, nMax = 1)
-            suspend fun composite() = coroutineScope {
-                async { first() }
-                async { second() }
-                Unit
-            }
-            """,
-        )
-
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("not covered by @BandwidthEffect contract")
-    }
-
-    @Test
-    fun `primitive boundary accepts a single untimed download under timed and untimed contracts`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload()
-            fun untimed() = Unit
-
-            @NetworkDownload()
-            fun hiddenUntimedComposite() { untimed() }
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun timedComposite() { untimed() }
-
-            fun untimedRoot() = hiddenUntimedComposite()
-            fun timedRoot() = timedComposite()
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Inferred bandwidth effect for untimedRoot: {(0, 1)}")
-        result.assertFunctionBandwidth("timedRoot", 1000)
-    }
-
-    @Test
-    fun `primitive boundary accepts invoking a callback within its singleton bound`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun invokeDownload(
-                callback: @BandwidthEffect(rMaxBytesPerSecond = 700, nMax = 1) () -> Unit,
-            ) { callback() }
-
-            fun root(callback: @BandwidthEffect(rMaxBytesPerSecond = 700, nMax = 1) () -> Unit) {
-                invokeDownload(callback)
-            }
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertFunctionBandwidth("root", 1000)
-    }
-
-    @Test
-    fun `primitive boundary preserves a returned Flow effect until collection`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            import kotlinx.coroutines.flow.Flow
-            import kotlinx.coroutines.flow.collect
-            import kotlinx.coroutines.flow.flow
-
-            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun delayed(): Flow<Unit> = flow { download() }
-
-            suspend fun root() { delayed().collect { } }
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertFunctionBandwidth("root", 2000)
-    }
-
-    @Test
-    fun `primitive boundary does not certify an unknown returned Flow as network free`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            import kotlinx.coroutines.flow.Flow
-
-            interface Library { fun stream(): Flow<Unit> }
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun delayed(library: Library): @BandwidthEffect() Flow<Unit> = library.stream()
-            """,
-        )
-
-        assertNotEquals(0, result.exitCode, result.output)
-        result.assertOutputContains("Cannot verify returned Flow effect")
-    }
-
-    @Test
-    fun `primitive boundary preserves a returned function effect until invocation`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
-            fun download() = Unit
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun delayed(): () -> Unit = { download() }
-
-            fun root() {
-                val callback = delayed()
-                callback()
-            }
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertFunctionBandwidth("root", 2000)
-    }
-
-    @Test
-    fun `primitive boundary accepts recursion covered by its concrete singleton contract`() {
-        val result = compile(
-            """
-            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun recursive(remaining: Int) {
-                if (remaining > 0) recursive(remaining - 1)
-            }
-
-            fun root() = recursive(3)
-            """,
-            reportEffects = true,
-        )
-
-        assertEquals(0, result.exitCode, result.output)
-        result.assertFunctionBandwidth("root", 1000)
+        result.assertOutputContains("Inferred bandwidth effect for root: {(2000, 2)}")
+        result.assertFunctionBandwidth("root", 4000)
     }
 
     @Test
@@ -655,8 +447,7 @@ class CompilerPluginIntegrationTest {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             fun root() {
                 val callback = { download() }
                 callback.invoke()
@@ -672,8 +463,7 @@ class CompilerPluginIntegrationTest {
         val result = compile(
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             fun root() { with("scope") { download() } }
             """, reportEffects = true,
         )
@@ -689,8 +479,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.asFlow
             import kotlinx.coroutines.flow.collect
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            suspend fun download(url: String) = Unit
+            suspend fun download(url: String) = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(urls: List<String>) {
                 urls.asFlow().collect { url -> download(url) }
@@ -727,8 +516,7 @@ class CompilerPluginIntegrationTest {
                 }
             }
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun high() = Unit
+            suspend fun high() = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun register(callback: suspend () -> Unit) = Unit
 
@@ -756,8 +544,7 @@ class CompilerPluginIntegrationTest {
             private val firstSlots = Semaphore(3)
             private val secondSlots = Semaphore(3)
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun high() = Unit
+            suspend fun high() = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun register(callback: suspend (Boolean) -> Unit) = Unit
 
@@ -927,8 +714,7 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
-            fun primitive() = Unit
+            fun primitive() = run { @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             @BandwidthEffect(rMaxBytesPerSecond = 1000, nMax = 1)
             fun recursive(remaining: Int) {
                 primitive()
@@ -952,10 +738,8 @@ class CompilerPluginIntegrationTest {
                 mayOutliveCall = true, selfBound = 3,
             )])
             fun startBackground() = Unit
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1000)
-            fun childDownload() = Unit
-            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
-            fun after() = Unit
+            fun childDownload() = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
+            fun after() = run { @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             suspend fun load(values: List<Int>) = coroutineScope {
                 val slots = Semaphore(3)
                 values.map {
@@ -1006,8 +790,7 @@ class CompilerPluginIntegrationTest {
                 mayOutliveCall = true, selfBound = 3,
             )])
             fun startBackground() = Unit
-            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
-            fun after() = Unit
+            fun after() = run { @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             suspend fun load(values: List<Int>) = coroutineScope {
                 val slots = Semaphore(3)
                 values.map { async { slots.withPermit { startBackground() } } }.awaitAll()
@@ -1029,8 +812,7 @@ class CompilerPluginIntegrationTest {
                 mayOutliveCall = true, selfBound = 3,
             )])
             fun startBackground() = Unit
-            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
-            fun after() = Unit
+            fun after() = run { @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             suspend fun load(values: List<Int>) = coroutineScope {
                 values.map { async { startBackground() } }.awaitAll()
                 after()
@@ -1045,8 +827,7 @@ class CompilerPluginIntegrationTest {
     fun `nested named contract still checked module wide`() {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.*
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             fun root() {
                 @BandwidthEffect()
                 fun nested() { download() }
@@ -1060,8 +841,7 @@ class CompilerPluginIntegrationTest {
     fun `nested named invocation activates its effect`() {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             fun root() {
                 fun nested() { download() }
                 nested()
@@ -1075,8 +855,7 @@ class CompilerPluginIntegrationTest {
     fun `nested named declaration stays latent`() {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             fun root() {
                 fun nested() { download() }
             }
@@ -1089,10 +868,8 @@ class CompilerPluginIntegrationTest {
     fun `generic class normalization retains real overriding implementation`() {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.*
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            fun small(): Int = 1
-            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
-            fun large(): Int = 1
+            fun small(): Int = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); 1 }
+            fun large(): Int = run { @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit); 1 }
             open class Base<T> { open fun run(): Int = small() }
             class Derived : Base<Int>() { override fun run(): Int = large() }
             fun root() = Derived().run()
@@ -1115,10 +892,8 @@ class CompilerPluginIntegrationTest {
                     scope.launch { slots.withPermit { block() } }
                 }
             }
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            fun download(): Int = 1
-            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
-            fun after() = Unit
+            fun download(): Int = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); 1 }
+            fun after() = run { @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             fun root(scope: CoroutineScope) {
                 Cache<Int>(scope).submit { download() }
                 after()
@@ -1136,8 +911,7 @@ class CompilerPluginIntegrationTest {
                 @BandwidthVariable("E")
                 fun run(block: @BandwidthEffect("E") () -> T): T = block()
             }
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            fun download(): Int = 1
+            fun download(): Int = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); 1 }
             fun root() = Box<Int>().run { download() }
         """, reportEffects = true)
         assertEquals(0, result.exitCode, result.output)
@@ -1159,8 +933,9 @@ class CompilerPluginIntegrationTest {
                 """
                 import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-                $annotation
-                suspend fun download() = Unit
+                suspend fun download() {
+                    $annotation checkNotNull(Unit)
+                }
                 """,
             )
 
@@ -1176,11 +951,9 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload()
-            suspend fun untimed() = Unit
+            suspend fun untimed() = run { @NetworkDownload() checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun timed() = Unit
+            suspend fun timed() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() {
                 untimed()
@@ -1205,11 +978,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.launch
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = None, completeTimeoutMillis = None)
-            suspend fun untimed() = Unit
+            suspend fun untimed() = run { @NetworkDownload(maxBytes = None, completeTimeoutMillis = None) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun timed() = Unit
+            suspend fun timed() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 launch { untimed() }
@@ -1231,11 +1002,9 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
             import io.github.loinguyen.bandwidth.annotations.None
 
-            @NetworkDownload(maxBytes = None, completeTimeoutMillis = None)
-            suspend fun untimed() = Unit
+            suspend fun untimed() = run { @NetworkDownload(maxBytes = None, completeTimeoutMillis = None) checkNotNull(Unit); Unit }
 
-            @NetworkDownload()
-            suspend fun defaultUntimed() = Unit
+            suspend fun defaultUntimed() = run { @NetworkDownload() checkNotNull(Unit); Unit }
 
             suspend fun load() = untimed()
             suspend fun loadDefault() = defaultUntimed()
@@ -1263,13 +1032,12 @@ class CompilerPluginIntegrationTest {
             @BoundedClient(k = 2)
             val client = NetworkClient()
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download() = Unit
 
             suspend fun load() = coroutineScope {
-                launch { client.download() }
-                launch { client.download() }
-                launch { client.download() }
+                launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) client.download() }
+                launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) client.download() }
+                launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) client.download() }
             }
             """,
             reportEffects = true,
@@ -1291,14 +1059,13 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download() = Unit
 
             suspend fun load(@BoundedClient(k = 3) client: NetworkClient) = coroutineScope {
-                launch { client.download() }
-                launch { client.download() }
-                launch { client.download() }
-                launch { client.download() }
+                launch { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) client.download() }
+                launch { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) client.download() }
+                launch { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) client.download() }
+                launch { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) client.download() }
             }
             """,
             reportEffects = true,
@@ -1320,14 +1087,13 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download() = Unit
 
             fun onDownloadClicked(
                 scope: CoroutineScope,
                 @BoundedClient(k = 3) client: NetworkClient,
             ) {
-                scope.launch { client.download() }
+                scope.launch { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) client.download() }
             }
             """,
             reportEffects = true,
@@ -1350,8 +1116,7 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.download() = Unit
+            suspend fun NetworkClient.download() = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun onDownloadClicked(scope: CoroutineScope, client: NetworkClient) {
                 scope.launch { client.download() }
@@ -1377,11 +1142,9 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.first() = Unit
+            suspend fun NetworkClient.first() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.second() = Unit
+            suspend fun NetworkClient.second() = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load(
                 scope: CoroutineScope,
@@ -1412,15 +1175,14 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download() = Unit
 
             suspend fun load(
                 externalScope: CoroutineScope,
                 @BoundedClient(k = 2) client: NetworkClient,
             ) = coroutineScope {
-                externalScope.launch { client.download() }
-                client.download()
+                externalScope.launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) client.download() }
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) client.download()
             }
             """,
             reportEffects = true,
@@ -1442,14 +1204,13 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download() = Unit
 
             fun spawn(
                 scope: CoroutineScope,
                 @BoundedClient(k = 4) client: NetworkClient,
             ) {
-                scope.launch { client.download() }
+                scope.launch { @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000) client.download() }
             }
 
             suspend fun load(
@@ -1457,7 +1218,7 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 4) client: NetworkClient,
             ) {
                 spawn(scope, client)
-                client.download()
+                @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000) client.download()
             }
             """,
             reportEffects = true,
@@ -1479,8 +1240,7 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.download() = Unit
+            suspend fun NetworkClient.download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(client: NetworkClient) {
                 val task: suspend CoroutineScope.() -> Unit = { client.download() }
@@ -1506,8 +1266,7 @@ class CompilerPluginIntegrationTest {
             class NetworkClient
             class Result
 
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.download() = Unit
+            suspend fun NetworkClient.download() = run { @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(client: NetworkClient) = coroutineScope {
                 val task: suspend CoroutineScope.() -> Result = {
@@ -1535,8 +1294,7 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.download() = Unit
+            suspend fun NetworkClient.download() = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load(scope: CoroutineScope, client: NetworkClient) {
                 val task: suspend CoroutineScope.() -> Unit = { client.download() }
@@ -1561,14 +1319,13 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download() = Unit
 
             fun load(
                 scope: CoroutineScope,
                 @BoundedClient(k = 4) client: NetworkClient,
             ) {
-                val task: suspend CoroutineScope.() -> Unit = { client.download() }
+                val task: suspend CoroutineScope.() -> Unit = { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) client.download() }
                 scope.launch(block = task)
             }
             """,
@@ -1608,18 +1365,16 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.fast() = Unit
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.slow() = Unit
 
             suspend fun load(
                 @BoundedClient(k = 4) fastClient: NetworkClient,
                 slowClient: NetworkClient,
             ) {
-                coroutineScope { launch(Job()) { fastClient.fast() } }
-                slowClient.slow()
+                coroutineScope { launch(Job()) { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) fastClient.fast() } }
+                @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) slowClient.slow()
             }
             """,
             reportEffects = true,
@@ -1654,14 +1409,13 @@ class CompilerPluginIntegrationTest {
 
                 class NetworkClient
 
-                @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
                 suspend fun NetworkClient.download() = Unit
 
                 suspend fun load(
                     context: CoroutineContext,
                     @BoundedClient(k = 4) client: NetworkClient,
                 ) = coroutineScope {
-                    launch($coroutineContext) { client.download() }
+                    launch($coroutineContext) { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) client.download() }
                 }
                 """,
                 reportEffects = true,
@@ -1683,8 +1437,7 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.download() = Unit
+            suspend fun NetworkClient.download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(client: NetworkClient) = coroutineScope {
                 launch(Dispatchers.IO) { client.download() }
@@ -1708,8 +1461,7 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 650, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.download() = Unit
+            suspend fun NetworkClient.download() = run { @NetworkDownload(maxBytes = 650, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             val client = NetworkClient()
 
@@ -1773,8 +1525,7 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.download() = Unit
+            suspend fun NetworkClient.download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(client: NetworkClient) = coroutineScope {
                 launch(Job()) { client.download() }
@@ -1799,10 +1550,8 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.fast() = Unit
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.slow() = Unit
 
             suspend fun load(
@@ -1812,10 +1561,10 @@ class CompilerPluginIntegrationTest {
             ) {
                 coroutineScope {
                     launch {
-                        externalScope.launch { fastClient.fast() }
+                        externalScope.launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) fastClient.fast() }
                     }
                 }
-                slowClient.slow()
+                @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) slowClient.slow()
             }
             """,
             reportEffects = true,
@@ -1836,7 +1585,6 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String) = Unit
 
             fun loadImages(
@@ -1845,7 +1593,7 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 4) imageClient: NetworkClient,
             ) {
                 urls.forEach { url ->
-                    viewModelScope.launch { imageClient.download(url) }
+                    viewModelScope.launch { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) imageClient.download(url) }
                 }
             }
             """,
@@ -1931,8 +1679,7 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            fun download(id: String) = Unit
+            fun download(id: String) = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load(ids: List<String>) = ids.map { id ->
                 download(id)
@@ -1983,8 +1730,7 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
             import java.io.ByteArrayInputStream
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load() = ByteArrayInputStream(byteArrayOf()).use {
                 download()
@@ -2003,8 +1749,7 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 650, completeTimeoutMillis = 1_000)
-            fun download(id: String) = Unit
+            fun download(id: String) = run { @NetworkDownload(maxBytes = 650, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load(ids: List<String>) = ids.mapNotNull { id ->
                 download(id)
@@ -2025,8 +1770,7 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
             import kotlinx.coroutines.runBlocking
 
-            @NetworkDownload(maxBytes = 550, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 550, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load() = runBlocking {
                 download()
@@ -2055,8 +1799,7 @@ class CompilerPluginIntegrationTest {
                 @BandwidthEffect("E") cb: (T) -> R,
             ) = parts.map(cb)
 
-            @NetworkDownload(maxBytes = 450, completeTimeoutMillis = 1_000)
-            fun download(part: String) = Unit
+            fun download(part: String) = run { @NetworkDownload(maxBytes = 450, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load(parts: List<String>) = handleMultipart(parts) { part ->
                 download(part)
@@ -2091,8 +1834,7 @@ class CompilerPluginIntegrationTest {
                 @BandwidthEffect("E") block: () -> T,
             ): T = requireCaptcha(block)
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load() = captchaIfPresent {
                 download()
@@ -2115,8 +1857,7 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.BandwidthVariable
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 425, completeTimeoutMillis = 1_000)
-            fun prepare() = Unit
+            fun prepare() = run { @NetworkDownload(maxBytes = 425, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @BandwidthVariable("Body")
             fun invokeAfterPreparing(
@@ -2150,8 +1891,7 @@ class CompilerPluginIntegrationTest {
                 @BandwidthEffect("PageEffect") headerTemplate: () -> Unit,
             ) = headerTemplate()
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load() = genericPage {
                 download()
@@ -2184,11 +1924,9 @@ class CompilerPluginIntegrationTest {
                 launch { right() }
             }
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun fast() = Unit
+            fun fast() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            fun slow() = Unit
+            fun slow() = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load() = runBlocking {
                 invokeInParallel(
@@ -2221,8 +1959,7 @@ class CompilerPluginIntegrationTest {
                 task()
             }
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load() = invokeTwice { download() }
             """,
@@ -2283,8 +2020,7 @@ class CompilerPluginIntegrationTest {
                 @BandwidthEffect("E") callback: () -> Unit,
             ): () -> Unit = callback
 
-            @NetworkDownload(maxBytes = 625, completeTimeoutMillis = 1_000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 625, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load() {
                 val callback = returnCallback { download() }
@@ -2328,8 +2064,7 @@ class CompilerPluginIntegrationTest {
                 fun install(@BandwidthEffect("E") configure: () -> Unit)
             }
 
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun configure(installer: Installer) {
                 installer.install { download() }
@@ -2371,11 +2106,10 @@ class CompilerPluginIntegrationTest {
 
             fun register(callback: () -> Unit) = Unit
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             fun Client.download() = Unit
 
             fun configure(@BoundedClient(k = 3) client: Client) {
-                register(@Handler { client.download() })
+                register(@Handler { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download() })
             }
             """,
             reportEffects = true,
@@ -2395,8 +2129,7 @@ class CompilerPluginIntegrationTest {
 
             fun register(callback: () -> Unit) = Unit
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun configure() {
                 register(@Handler { download() })
@@ -2422,8 +2155,7 @@ class CompilerPluginIntegrationTest {
 
             fun register(callback: suspend () -> Unit) = Unit
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun configure() {
                 register(@Handler {
@@ -2450,8 +2182,7 @@ class CompilerPluginIntegrationTest {
 
             val handlerSlots = Semaphore(permits = 3)
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @Handler
             suspend fun frameworkCallback() {
@@ -2507,8 +2238,7 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.Handler
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @Handler
             suspend fun frameworkCallback() {
@@ -2542,7 +2272,6 @@ class CompilerPluginIntegrationTest {
 
             fun retain(callback: () -> Unit) = Unit
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
             fun Client.authenticate() = Unit
 
             fun configure(
@@ -2550,7 +2279,7 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 3) client: Client,
             ) {
                 installer.install {
-                    retain(@Handler { client.authenticate() })
+                    retain(@Handler { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) client.authenticate() })
                 }
             }
             """,
@@ -2604,7 +2333,6 @@ class CompilerPluginIntegrationTest {
                 itemContent: (T) -> Unit,
             ) = Unit
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             fun rememberAsyncImagePainter(
                 model: String,
                 imageLoader: ImageLoader,
@@ -2616,7 +2344,7 @@ class CompilerPluginIntegrationTest {
             ) {
                 LazyVerticalStaggeredGrid {
                     items(articles) { article ->
-                        rememberAsyncImagePainter(
+                        @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) rememberAsyncImagePainter(
                             model = article,
                             imageLoader = imageLoader,
                         )
@@ -2656,11 +2384,10 @@ class CompilerPluginIntegrationTest {
                 itemContent: (T) -> Unit,
             ) = Unit
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             fun rememberAsyncImagePainter(
                 model: String,
                 imageLoader: ImageLoader,
-            ) = Unit
+            ) = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun NewsFeed(
                 articles: List<String>,
@@ -2705,7 +2432,6 @@ class CompilerPluginIntegrationTest {
                 content: () -> Unit,
             ) = Unit
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download() = Unit
 
             fun DownloadButton(
@@ -2714,7 +2440,7 @@ class CompilerPluginIntegrationTest {
             ) {
                 Button(
                     onClick = {
-                        scope.launch { client.download() }
+                        scope.launch { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) client.download() }
                     },
                     content = {},
                 )
@@ -2747,8 +2473,7 @@ class CompilerPluginIntegrationTest {
                 fun setOnClickListener(listener: OnClickListener) = Unit
             }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun bind(view: View) {
                 view.setOnClickListener { download() }
@@ -2784,7 +2509,6 @@ class CompilerPluginIntegrationTest {
                 fun setOnClickListener(listener: OnClickListener) = Unit
             }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download() = Unit
 
             fun bind(
@@ -2793,7 +2517,7 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 3) client: NetworkClient,
             ) {
                 view.setOnClickListener {
-                    scope.launch { client.download() }
+                    scope.launch { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download() }
                 }
             }
             """,
@@ -2827,8 +2551,7 @@ class CompilerPluginIntegrationTest {
                 fun setOnClickListener(listener: OnClickListener) = Unit
             }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.download() = Unit
+            suspend fun NetworkClient.download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun bind(view: View, scope: CoroutineScope, client: NetworkClient) {
                 view.setOnClickListener {
@@ -2855,8 +2578,7 @@ class CompilerPluginIntegrationTest {
 
             fun Modifier.clickable(onClick: () -> Unit): Modifier = this
 
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun screen(modifier: Modifier) {
                 modifier.clickable { download() }
@@ -2888,8 +2610,7 @@ class CompilerPluginIntegrationTest {
                 content: () -> Unit,
             ) = Unit
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun NetworkClient.download() = Unit
+            suspend fun NetworkClient.download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun DownloadButton(
                 scope: CoroutineScope,
@@ -2922,18 +2643,16 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.downloadPrimary() = Unit
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.downloadSecondary() = Unit
 
             suspend fun foo(
                 @BoundedClient(k = 2) primaryClient: NetworkClient,
                 @BoundedClient(k = 3) secondaryClient: NetworkClient,
             ) = coroutineScope {
-                primaryClient.downloadPrimary()
-                secondaryClient.downloadSecondary()
+                @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) primaryClient.downloadPrimary()
+                @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) secondaryClient.downloadSecondary()
             }
 
             fun loadAll(
@@ -2974,16 +2693,15 @@ class CompilerPluginIntegrationTest {
             @BoundedClient(k = 2)
             val apiClient = NetworkClient()
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download() = Unit
 
             suspend fun load() = coroutineScope {
-                launch { imageClient.download() }
-                launch { imageClient.download() }
-                launch { imageClient.download() }
-                launch { apiClient.download() }
-                launch { apiClient.download() }
-                launch { apiClient.download() }
+                launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) imageClient.download() }
+                launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) imageClient.download() }
+                launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) imageClient.download() }
+                launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) apiClient.download() }
+                launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) apiClient.download() }
+                launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) apiClient.download() }
             }
             """,
             reportEffects = true,
@@ -3008,15 +2726,13 @@ class CompilerPluginIntegrationTest {
             @BoundedClient(k = 1)
             val client = NetworkClient()
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.boundedDownload() = Unit
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
             suspend fun unboundedDownload() = Unit
 
             suspend fun load() = coroutineScope {
-                val bounded = async { client.boundedDownload() }
-                val unbounded = async { unboundedDownload() }
+                val bounded = async { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) client.boundedDownload() }
+                val unbounded = async { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) unboundedDownload() }
                 bounded.await()
                 unbounded.await()
             }
@@ -3053,11 +2769,9 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 6_000, completeTimeoutMillis = 10_000)
-            fun large() = Unit
+            fun large() = run { @NetworkDownload(maxBytes = 6_000, completeTimeoutMillis = 10_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 4_000, completeTimeoutMillis = 10_000)
-            fun small() = Unit
+            fun small() = run { @NetworkDownload(maxBytes = 4_000, completeTimeoutMillis = 10_000) checkNotNull(Unit); Unit }
 
             @BandwidthEffect(rMaxBytesPerSecond = 600, nMax = 1)
             fun load(useLarge: Boolean) {
@@ -3080,8 +2794,7 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun fastSingle() = Unit
+            fun fastSingle() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @BandwidthEffect(rMaxBytesPerSecond = 100, nMax = 10)
             fun slowConcurrentBoundary() = Unit
@@ -3108,11 +2821,9 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 8_000, completeTimeoutMillis = 10_000)
-            fun large() = Unit
+            fun large() = run { @NetworkDownload(maxBytes = 8_000, completeTimeoutMillis = 10_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 10_000)
-            fun small() = Unit
+            fun small() = run { @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 10_000) checkNotNull(Unit); Unit }
 
             @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1)
             fun recover() {
@@ -3137,11 +2848,9 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun first() = Unit
+            suspend fun first() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun second() = Unit
+            suspend fun second() = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 first()
@@ -3164,11 +2873,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.coroutineScope
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun first() = Unit
+            suspend fun first() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun second() = Unit
+            suspend fun second() = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 first()
@@ -3196,11 +2903,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.async
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun large() = Unit
+            suspend fun large() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            suspend fun small() = Unit
+            suspend fun small() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 val largeResult = async { large() }
@@ -3225,14 +2930,11 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.coroutineScope
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
-            suspend fun childDownload() = Unit
+            suspend fun childDownload() = run { @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            suspend fun beforeJoin() = Unit
+            suspend fun beforeJoin() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun afterJoin() = Unit
+            suspend fun afterJoin() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 val job = launch { childDownload() }
@@ -3259,14 +2961,11 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.async
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            suspend fun firstChild() = Unit
+            suspend fun firstChild() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
-            suspend fun secondChild() = Unit
+            suspend fun secondChild() = run { @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun afterFirstAwait() = Unit
+            suspend fun afterFirstAwait() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 val first = async { firstChild() }
@@ -3294,11 +2993,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.async
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            suspend fun childDownload() = Unit
+            suspend fun childDownload() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun afterAwait() = Unit
+            suspend fun afterAwait() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 val original = async { childDownload() }
@@ -3326,20 +3023,15 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.coroutineScope
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            suspend fun launchedChild() = Unit
+            suspend fun launchedChild() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun asyncChild() = Unit
+            suspend fun asyncChild() = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
-            suspend fun beforeJoin() = Unit
+            suspend fun beforeJoin() = run { @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun betweenWaits() = Unit
+            suspend fun betweenWaits() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
-            suspend fun afterAwait() = Unit
+            suspend fun afterAwait() = run { @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 val job = launch { launchedChild() }
@@ -3370,20 +3062,15 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.coroutineScope
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun launchedChild() = Unit
+            suspend fun launchedChild() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1_000)
-            suspend fun asyncChild() = Unit
+            suspend fun asyncChild() = run { @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun beforeAwait() = Unit
+            suspend fun beforeAwait() = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun betweenWaits() = Unit
+            suspend fun betweenWaits() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun afterJoin() = Unit
+            suspend fun afterJoin() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 val job = launch { launchedChild() }
@@ -3414,20 +3101,15 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.coroutineScope
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            suspend fun innerChild() = Unit
+            suspend fun innerChild() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun beforeInnerAwait() = Unit
+            suspend fun beforeInnerAwait() = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun afterInnerAwait() = Unit
+            suspend fun afterInnerAwait() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
-            suspend fun outerSiblingWork() = Unit
+            suspend fun outerSiblingWork() = run { @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
-            suspend fun afterOuterJoin() = Unit
+            suspend fun afterOuterJoin() = run { @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 val outer = launch {
@@ -3459,14 +3141,11 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.async
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            suspend fun innerChild() = Unit
+            suspend fun innerChild() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun innerConcurrentWork() = Unit
+            suspend fun innerConcurrentWork() = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun innerAfterAwait() = Unit
+            suspend fun innerAfterAwait() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun innerLoad() = coroutineScope {
                 val inner = async { innerChild() }
@@ -3475,11 +3154,9 @@ class CompilerPluginIntegrationTest {
                 innerAfterAwait()
             }
 
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
-            suspend fun outerChild() = Unit
+            suspend fun outerChild() = run { @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
-            suspend fun outerAfterAwait() = Unit
+            suspend fun outerAfterAwait() = run { @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun outerLoad() = coroutineScope {
                 val outer = async { outerChild() }
@@ -3517,8 +3194,7 @@ class CompilerPluginIntegrationTest {
                 suspend fun sync(): Boolean
             }
 
-            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
-            suspend fun populateSearchIndex() = Unit
+            suspend fun populateSearchIndex() = run { @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun syncAll(
                 topicRepository: SyncRepository,
@@ -3556,10 +3232,8 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String) = Unit
 
-            @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000)
             suspend fun afterAwaitAll() = Unit
 
             suspend fun load(
@@ -3567,10 +3241,10 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 4) client: NetworkClient,
             ) = coroutineScope {
                 val jobs = urls.map { url ->
-                    async { client.download(url) }
+                    async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) }
                 }
                 jobs.awaitAll()
-                afterAwaitAll()
+                @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000) afterAwaitAll()
             }
             """,
             reportEffects = true,
@@ -3595,23 +3269,20 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
-            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
             suspend fun beforeWait() = Unit
 
-            @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000)
             suspend fun afterWait() = Unit
 
             suspend fun load(
                 urls: List<String>,
                 @BoundedClient(k = 4) client: NetworkClient,
             ) = coroutineScope {
-                val jobs = urls.map { url -> async { client.download(url) } }
-                beforeWait()
+                val jobs = urls.map { url -> async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) } }
+                @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000) beforeWait()
                 val results = jobs.awaitAll()
-                afterWait()
+                @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000) afterWait()
                 results
             }
             """,
@@ -3637,20 +3308,18 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
-            @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000)
             suspend fun afterWait() = Unit
 
             suspend fun load(
                 urls: List<String>,
                 @BoundedClient(k = 4) client: NetworkClient,
             ) = coroutineScope {
-                val jobs = urls.map { url -> async { client.download(url) } }
+                val jobs = urls.map { url -> async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) } }
                 var results: List<String> = emptyList()
                 results = jobs.awaitAll().sortedBy { it }
-                afterWait()
+                @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000) afterWait()
                 results
             }
             """,
@@ -3674,24 +3343,21 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
-            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
             suspend fun beforeWait() = Unit
 
-            @NetworkDownload(maxBytes = 1_700, completeTimeoutMillis = 1_000)
             suspend fun enclosingCallbackDownload() = Unit
 
             suspend fun load(
                 urls: List<String>,
                 @BoundedClient(k = 4) client: NetworkClient,
             ) = coroutineScope {
-                val jobs = urls.map { url -> async { client.download(url) } }
-                beforeWait()
+                val jobs = urls.map { url -> async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) } }
+                @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000) beforeWait()
                 val results = jobs.awaitAll()
                     .sortedBy { it }
-                    .also { enclosingCallbackDownload() }
+                    .also { @NetworkDownload(maxBytes = 1_700, completeTimeoutMillis = 1_000) enclosingCallbackDownload() }
                 results
             }
             """,
@@ -3717,32 +3383,27 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
             suspend fun siblingDownload() = Unit
 
-            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
             suspend fun beforeWait() = Unit
 
-            @NetworkDownload(maxBytes = 1_700, completeTimeoutMillis = 1_000)
             suspend fun betweenWaits() = Unit
 
-            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
             suspend fun afterBothWaits() = Unit
 
             suspend fun load(
                 urls: List<String>,
                 @BoundedClient(k = 4) client: NetworkClient,
             ) = coroutineScope {
-                val jobs = urls.map { url -> async { client.download(url) } }
-                val sibling = async { siblingDownload() }
-                beforeWait()
+                val jobs = urls.map { url -> async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) } }
+                val sibling = async { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) siblingDownload() }
+                @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000) beforeWait()
                 val results = jobs.awaitAll().sortedBy { it }
-                betweenWaits()
+                @NetworkDownload(maxBytes = 1_700, completeTimeoutMillis = 1_000) betweenWaits()
                 sibling.await()
-                afterBothWaits()
+                @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000) afterBothWaits()
                 results
             }
             """,
@@ -3789,13 +3450,10 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
-            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
             suspend fun beforeWait() = Unit
 
-            @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000)
             suspend fun afterWait() = Unit
 
             fun combine(before: Unit, values: List<String>, after: Unit): List<String> = values
@@ -3804,8 +3462,8 @@ class CompilerPluginIntegrationTest {
                 urls: List<String>,
                 @BoundedClient(k = 4) client: NetworkClient,
             ) = coroutineScope {
-                val jobs = urls.map { url -> async { client.download(url) } }
-                val results = combine(beforeWait(), jobs.awaitAll(), afterWait())
+                val jobs = urls.map { url -> async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) } }
+                val results = combine(@NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000) beforeWait(), jobs.awaitAll(), @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000) afterWait())
                 results
             }
             """,
@@ -3831,14 +3489,13 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
             suspend fun load(
                 urls: List<String>,
                 @BoundedClient(k = 4) client: NetworkClient,
             ) = coroutineScope {
-                val jobs = urls.map { url -> async { client.download(url) } }
+                val jobs = urls.map { url -> async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) } }
                 val waitLater: suspend () -> Unit = {
                     jobs.awaitAll()
                     Unit
@@ -3865,7 +3522,6 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
             suspend fun load(
@@ -3873,7 +3529,7 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 4) client: NetworkClient,
                 waitNow: Boolean,
             ) = coroutineScope {
-                val jobs = urls.map { url -> async { client.download(url) } }
+                val jobs = urls.map { url -> async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) } }
                 val results = if (waitNow) jobs.awaitAll() else emptyList<String>()
                 results
             }
@@ -3894,11 +3550,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.async
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun childDownload() = Unit
+            suspend fun childDownload() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000)
-            suspend fun foregroundDownload() = Unit
+            suspend fun foregroundDownload() = run { @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 val child = async { childDownload() }
@@ -3922,11 +3576,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.async
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun childDownload() = Unit
+            suspend fun childDownload() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000)
-            suspend fun foregroundDownload() = Unit
+            suspend fun foregroundDownload() = run { @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(waitNow: Boolean) = coroutineScope {
                 val child = async { childDownload() }
@@ -3954,10 +3606,8 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
-            @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000)
             suspend fun afterWait() = Unit
 
             suspend fun load(
@@ -3966,10 +3616,10 @@ class CompilerPluginIntegrationTest {
             ) = coroutineScope {
                 val jobs = servers.filter { it.value }.map { (url, _) ->
                     val prepared = url.trim()
-                    async { client.download(prepared) }
+                    async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(prepared) }
                 }
                 jobs.awaitAll()
-                afterWait()
+                @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000) afterWait()
             }
             """,
             reportEffects = true,
@@ -3994,13 +3644,10 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000)
             suspend fun prepare(url: String): String = url
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
-            @NetworkDownload(maxBytes = 1_700, completeTimeoutMillis = 1_000)
             suspend fun afterWait() = Unit
 
             suspend fun load(
@@ -4008,11 +3655,11 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 4) client: NetworkClient,
             ) = coroutineScope {
                 val jobs = urls.map { url ->
-                    val prepared = prepare(url)
-                    async { client.download(prepared) }
+                    val prepared = @NetworkDownload(maxBytes = 1_100, completeTimeoutMillis = 1_000) prepare(url)
+                    async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(prepared) }
                 }
                 jobs.awaitAll()
-                afterWait()
+                @NetworkDownload(maxBytes = 1_700, completeTimeoutMillis = 1_000) afterWait()
             }
             """,
             reportEffects = true,
@@ -4039,13 +3686,10 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.backgroundDownload() = Unit
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
-            @NetworkDownload(maxBytes = 1_700, completeTimeoutMillis = 1_000)
             suspend fun afterWait() = Unit
 
             suspend fun load(
@@ -4055,11 +3699,11 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 3) client: NetworkClient,
             ) = coroutineScope {
                 val jobs = urls.map { url ->
-                    externalScope.launch { backgroundClient.backgroundDownload() }
-                    async { client.download(url) }
+                    externalScope.launch { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) backgroundClient.backgroundDownload() }
+                    async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) }
                 }
                 jobs.awaitAll()
-                afterWait()
+                @NetworkDownload(maxBytes = 1_700, completeTimeoutMillis = 1_000) afterWait()
             }
             """,
             reportEffects = true,
@@ -4084,7 +3728,6 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
             suspend fun load(
@@ -4093,8 +3736,8 @@ class CompilerPluginIntegrationTest {
                 alternative: Boolean,
             ) = coroutineScope {
                 val jobs = urls.map { url ->
-                    if (alternative) async { client.download(url) }
-                    else async { client.download(url) }
+                    if (alternative) async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) }
+                    else async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) }
                 }
                 jobs.awaitAll()
             }
@@ -4147,10 +3790,8 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
             suspend fun backgroundDownload() = Unit
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
             suspend fun load(
@@ -4159,8 +3800,8 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 3) client: NetworkClient,
             ) = coroutineScope {
                 val jobs = urls.map { url ->
-                    externalScope.launch { backgroundDownload() }
-                    async { client.download(url) }
+                    externalScope.launch { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) backgroundDownload() }
+                    async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) }
                 }
                 jobs.awaitAll()
             }
@@ -4184,7 +3825,6 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String): String = url
 
             fun opaqueDeferred(): Deferred<String> = error("not executed")
@@ -4196,7 +3836,7 @@ class CompilerPluginIntegrationTest {
             ) = coroutineScope {
                 val jobs = urls.map { url ->
                     if (returnOpaque) return@map opaqueDeferred()
-                    async { client.download(url) }
+                    async { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) client.download(url) }
                 }
                 jobs.awaitAll()
             }
@@ -4221,7 +3861,6 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(url: String) = Unit
 
             suspend fun load(
@@ -4229,7 +3868,7 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 3) client: NetworkClient,
             ) = coroutineScope {
                 urls.map { url ->
-                    async { client.download(url) }
+                    async { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) client.download(url) }
                 }.awaitAll()
             }
             """,
@@ -4250,8 +3889,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.awaitAll
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download(url: String) = Unit
+            suspend fun download(url: String) = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(urls: List<String>) = coroutineScope {
                 val jobs = urls.map { url ->
@@ -4307,8 +3945,7 @@ class CompilerPluginIntegrationTest {
                 f: suspend (T) -> R,
             ): Flow<R> = error("audited library boundary")
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun download(url: String): String? = url
+            suspend fun download(url: String): String? = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); url }
 
             fun downloads(urls: List<String>): Flow<String?> =
                 urls.asFlow().boundedMap(buffer = 4, maxConcurrency = 3) { download(it) }
@@ -4351,11 +3988,9 @@ class CompilerPluginIntegrationTest {
                 f: suspend (T) -> R,
             ): Flow<R> = error("audited library boundary")
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun heavy() = Unit
+            suspend fun heavy() = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000)
-            suspend fun light() = Unit
+            suspend fun light() = run { @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun stage() {
                 heavy()
@@ -4396,11 +4031,9 @@ class CompilerPluginIntegrationTest {
                 f: suspend (T) -> R,
             ): Flow<R> = error("audited library boundary")
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun nextItem(): Int = 1
+            suspend fun nextItem(): Int = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); 1 }
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun download(item: Int) = Unit
+            suspend fun download(item: Int) = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() {
                 flow { emit(nextItem()) }.boundedMap(3, 4) { download(it) }.collect()
@@ -4431,8 +4064,7 @@ class CompilerPluginIntegrationTest {
                 f: suspend (T) -> R,
             ): Flow<R> = error("audited library boundary")
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun download(item: Int) = Unit
+            suspend fun download(item: Int) = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun withZero() {
                 listOf(1).asFlow().boundedMap(0, 4) { download(it) }.collect()
@@ -4467,8 +4099,7 @@ class CompilerPluginIntegrationTest {
                 f: suspend (T) -> R,
             ): Flow<R> = error("audited library boundary")
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun download(item: Int) = Unit
+            suspend fun download(item: Int) = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(scope: CoroutineScope) {
                 listOf(1).asFlow().boundedMap(3, 4) { item ->
@@ -4567,11 +4198,9 @@ class CompilerPluginIntegrationTest {
                 @BandwidthEffect("E") transform: suspend (T) -> R,
             ): Flow<R> = source.boundedMap(3, 4, transform)
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun nextItem(): Int = 1
+            suspend fun nextItem(): Int = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); 1 }
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun download(item: Int) = Unit
+            suspend fun download(item: Int) = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() {
                 val pipeline = forward(flow { emit(nextItem()) }) { download(it) }
@@ -4604,8 +4233,7 @@ class CompilerPluginIntegrationTest {
                 f: suspend (T) -> R,
             ): Flow<R> = error("audited library boundary")
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() {
                 listOf(1).asFlow().boundedMap(3, 4) {
@@ -4635,8 +4263,7 @@ class CompilerPluginIntegrationTest {
                     f: suspend (T) -> R,
                 ): Flow<R> = error("audited library boundary")
 
-                @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
                 suspend fun load() {
                     listOf(1).asFlow().boundedMapWithExtra(3, $extraArgument) { Unit }.collect()
@@ -4680,11 +4307,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flatMapMerge
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            suspend fun download(url: String) = Unit
+            suspend fun download(url: String) = run { @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000)
-            suspend fun afterCollect() = Unit
+            suspend fun afterCollect() = run { @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @OptIn(ExperimentalCoroutinesApi::class)
             suspend fun load(urls: List<String>) {
@@ -4717,8 +4342,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flatMapMerge
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun download(url: String) = Unit
+            suspend fun download(url: String) = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @OptIn(ExperimentalCoroutinesApi::class)
             suspend fun buildOnly(urls: List<String>) {
@@ -4757,8 +4381,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.asFlow
             import kotlinx.coroutines.flow.collect
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            suspend fun download(url: String) = Unit
+            suspend fun download(url: String) = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(urls: List<String>) {
                 urls.asFlow().collect { url -> download(url) }
@@ -4789,8 +4412,7 @@ class CompilerPluginIntegrationTest {
                 f: suspend (T) -> R,
             ): Flow<R> = error("audited library boundary")
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun download(segment: String) = Unit
+            suspend fun download(segment: String) = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() {
                 listOf(listOf("a", "b", "c"), listOf("d", "e", "f")).asFlow()
@@ -4818,11 +4440,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun nextItem(): String = "segment"
+            suspend fun nextItem(): String = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); "segment" }
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            suspend fun download(segment: String) = Unit
+            suspend fun download(segment: String) = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() {
                 flow {
@@ -4849,8 +4469,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun download(segment: String) = Unit
+            suspend fun download(segment: String) = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(scope: CoroutineScope, segments: List<String>) {
                 segments.asFlow().collect { segment ->
@@ -4878,10 +4497,8 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(segment: String) = Unit
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
             suspend fun afterCollect() = Unit
 
             suspend fun load(
@@ -4890,9 +4507,9 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 3) client: NetworkClient,
             ) {
                 segments.asFlow().collect { segment ->
-                    scope.launch { client.download(segment) }
+                    scope.launch { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) client.download(segment) }
                 }
-                afterCollect()
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) afterCollect()
             }
             """,
             reportEffects = true,
@@ -4923,11 +4540,9 @@ class CompilerPluginIntegrationTest {
                 source.collect(action)
             }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun nextItem(): String = "segment"
+            suspend fun nextItem(): String = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); "segment" }
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun download(segment: String) = Unit
+            suspend fun download(segment: String) = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() {
                 consume(flow { emit(nextItem()) }) { download(it) }
@@ -4949,8 +4564,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.asFlow
             import kotlinx.coroutines.flow.collect
 
-            @NetworkDownload(maxBytes = 1_200, completeTimeoutMillis = 1_000)
-            suspend fun prepareCollector() = Unit
+            suspend fun prepareCollector() = run { @NetworkDownload(maxBytes = 1_200, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun collector(): suspend (Int) -> Unit {
                 prepareCollector()
@@ -4979,8 +4593,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun nextItem(): String = "segment"
+            suspend fun nextItem(): String = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); "segment" }
 
             @BandwidthEffect(rMaxBytesPerSecond = 0, nMax = 1)
             suspend fun untimedDownload(segment: String) = Unit
@@ -5008,11 +4621,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun nextItem(): String = "segment"
+            suspend fun nextItem(): String = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); "segment" }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download(segment: String) = Unit
+            suspend fun download(segment: String) = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() {
                 flow { emit(nextItem()) }.collect { segment ->
@@ -5040,8 +4651,7 @@ class CompilerPluginIntegrationTest {
                 fun stream(): Flow<String>
             }
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            suspend fun download(segment: String) = Unit
+            suspend fun download(segment: String) = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(source: Source) {
                 source.stream().collect { download(it) }
@@ -5078,8 +4688,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun download(): String = "content"
+            suspend fun download(): String = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); "content" }
 
             suspend fun load(): String {
                 val result = StringBuilder()
@@ -5104,8 +4713,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 710, completeTimeoutMillis = 1_000)
-            suspend fun download(): String = "content"
+            suspend fun download(): String = run { @NetworkDownload(maxBytes = 710, completeTimeoutMillis = 1_000) checkNotNull(Unit); "content" }
 
             suspend fun load(): String {
                 val result = StringBuilder()
@@ -5133,8 +4741,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 725, completeTimeoutMillis = 1_000)
-            suspend fun download(): String = "content"
+            suspend fun download(): String = run { @NetworkDownload(maxBytes = 725, completeTimeoutMillis = 1_000) checkNotNull(Unit); "content" }
 
             fun stream(): Flow<String>? = flow { emit(download()) }
 
@@ -5163,8 +4770,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun consume(
                 @BandwidthEffect(rMaxBytesPerSecond = 750, nMax = 1) source: Flow<Unit>,
@@ -5192,8 +4798,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 760, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 760, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun consume(
                 source: @BandwidthEffect(rMaxBytesPerSecond = 760, nMax = 1) Flow<Unit>,
@@ -5242,8 +4847,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 775, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 775, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun consume(source: Flow<Unit>) {
                 source.collect()
@@ -5289,8 +4893,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun stream(): @BandwidthEffect(rMaxBytesPerSecond = 500, nMax = 1) Flow<Unit> =
                 flow { emit(download()) }
@@ -5338,8 +4941,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download(): String = "network content"
+            suspend fun download(): String = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); "network content" }
 
             interface Source {
                 fun stream(): @BandwidthEffect() Flow<String>
@@ -5366,8 +4968,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 825, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 825, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @BandwidthEffect()
             fun stream(): Flow<Unit> = flow { emit(download()) }
@@ -5551,8 +5152,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 850, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 850, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @BandwidthVariable("E")
             fun <T> forward(@BandwidthEffect("E") source: Flow<T>): Flow<T> = source
@@ -5580,8 +5180,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 850, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 850, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @BandwidthVariable("E")
             fun <T> @BandwidthEffect("E") Flow<T>.forward(): Flow<T> = this
@@ -5612,8 +5211,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>.consume() {
                 collect()
@@ -5638,8 +5236,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>.consume() {
                 collect()
@@ -5683,8 +5280,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun Flow<Unit>.consume() {
                 collect()
@@ -5709,8 +5305,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 825, completeTimeoutMillis = 1_000)
-            suspend fun download(): String = "content"
+            suspend fun download(): String = run { @NetworkDownload(maxBytes = 825, completeTimeoutMillis = 1_000) checkNotNull(Unit); "content" }
 
             @BandwidthVariable("E")
             fun <T> @BandwidthEffect("E") Flow<T>.relay(): Flow<T> = flow {
@@ -5744,11 +5339,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            suspend fun prepare() = Unit
+            suspend fun prepare() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 850, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 850, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @BandwidthVariable("E")
             suspend fun <T> @BandwidthEffect("E") Flow<T>.prepareRelay(): Flow<T> {
@@ -5780,12 +5373,9 @@ class CompilerPluginIntegrationTest {
                 rMaxBytesPerSecond = 100, nMax = 1, mayOutliveCall = true, selfBound = 10,
             )])
             fun background() = Unit
-            @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1000)
-            fun middle() = Unit
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000)
-            fun last() = Unit
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000)
-            fun after() = Unit
+            fun middle() = run { @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
+            fun last() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
+            fun after() = run { @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             class Source {
                 val first = background()
                 init { middle() }
@@ -5805,10 +5395,8 @@ class CompilerPluginIntegrationTest {
                 rMaxBytesPerSecond = 100, nMax = 1, mayOutliveCall = true, selfBound = 10,
             )])
             fun background() = Unit
-            @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1000)
-            fun middle() = Unit
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000)
-            fun after() = Unit
+            fun middle() = run { @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
+            fun after() = run { @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             class Source(val label: String) {
                 val first = background()
                 constructor() : this("default") { middle() }
@@ -5827,8 +5415,7 @@ class CompilerPluginIntegrationTest {
                 rMaxBytesPerSecond = 100, nMax = 1, mayOutliveCall = true, selfBound = 10,
             )])
             fun background() = Unit
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000)
-            fun after() = Unit
+            fun after() = run { @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             open class Base { val base = background() }
             class Source : Base {
                 val own = background()
@@ -5844,10 +5431,8 @@ class CompilerPluginIntegrationTest {
     fun `constructor inference resolves inner and local classes to their own initializers`() {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.*
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000)
-            fun first() = Unit
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000)
-            fun second() = Unit
+            fun first() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
+            fun second() = run { @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             class Outer {
                 inner class Inner { init { first() } }
                 fun create() = Inner()
@@ -5870,8 +5455,7 @@ class CompilerPluginIntegrationTest {
                 rMaxBytesPerSecond = 100, nMax = 1, mayOutliveCall = true, selfBound = 10,
             )])
             fun background() = Unit
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000)
-            fun after() = Unit
+            fun after() = run { @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             fun load() {
                 class Local { val value = background() }
                 Local()
@@ -5892,8 +5476,7 @@ class CompilerPluginIntegrationTest {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.*
             import kotlinx.coroutines.flow.*
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             class Source {
                 var stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit> = emptyFlow()
                 init { stream = flow { emit(download()) } }
@@ -5907,8 +5490,7 @@ class CompilerPluginIntegrationTest {
     fun `constructor inference retains strict object initialization boundaries`() {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.*
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             object Source { val value = download() }
         """)
         assertNotEquals(0, result.exitCode, result.output)
@@ -5919,8 +5501,7 @@ class CompilerPluginIntegrationTest {
     fun `constructor inference rejects unmodeled eager default arguments`() {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.*
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             class Source(val value: Unit = download())
             fun create() = Source()
         """)
@@ -5935,8 +5516,7 @@ class CompilerPluginIntegrationTest {
             import kotlin.properties.Delegates
             @BandwidthEffect(downloads = [BandwidthDownload(100, 1, selfBound = 2)])
             fun notifyRemote() = Unit
-            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000)
-            fun foreground() = Unit
+            fun foreground() = run { @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             class Source {
                 var value: Int by Delegates.observable(0) { _, _, _ -> notifyRemote() }
             }
@@ -5951,8 +5531,7 @@ class CompilerPluginIntegrationTest {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.*
             import kotlin.properties.Delegates
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1000)
-            fun notifyRemote() = Unit
+            fun notifyRemote() = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
             class Source {
                 var value: Int by Delegates.observable(0) { _, _, _ -> notifyRemote() }
             }
@@ -5966,8 +5545,7 @@ class CompilerPluginIntegrationTest {
     fun `standard zip transform contributes repeated callback network effects`() {
         val result = compile("""
             import io.github.loinguyen.bandwidth.annotations.*
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000)
-            fun download(id: Int) = id
+            fun download(id: Int) = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1000) checkNotNull(Unit); id }
             fun load(ids: List<Int>, labels: List<String>) =
                 ids.zip(labels) { id, label -> download(id) to label }
         """, reportEffects = true)
@@ -5985,8 +5563,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source(val stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>) {
                 suspend fun read() { stream.collect() }
@@ -6015,8 +5592,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source(var stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>) {
                 fun replace() { stream = flow { emit(download()) } }
@@ -6045,8 +5621,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source(val stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>)
 
@@ -6066,8 +5641,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source(val stream: Flow<Unit>)
 
@@ -6087,8 +5661,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source {
                 val stream: Flow<Unit> = flow { emit(download()) }
@@ -6111,8 +5684,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source {
                 val stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit> =
@@ -6140,8 +5712,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source {
                 var stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit> = flow { emit(Unit) }
@@ -6165,8 +5736,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source(var stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>)
 
@@ -6210,11 +5780,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun small() = Unit
+            suspend fun small() = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun large() = Unit
+            suspend fun large() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source(val stream: @BandwidthEffect(rMaxBytesPerSecond = 1_000, nMax = 1) Flow<Unit>)
 
@@ -6289,8 +5857,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source {
                 var stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit> = flow { emit(Unit) }
@@ -6316,8 +5883,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source {
                 var stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit> = flow { emit(Unit) }
@@ -6343,8 +5909,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source {
                 var stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit> = flow { emit(Unit) }
@@ -6369,8 +5934,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source {
                 val stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>
@@ -6418,8 +5982,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            fun prepare() = Unit
+            fun prepare() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source {
                 val stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>
@@ -6450,8 +6013,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 350, completeTimeoutMillis = 1_000)
-            fun prepare() = Unit
+            fun prepare() = run { @NetworkDownload(maxBytes = 350, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source {
                 var stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit> = flow { emit(Unit) }
@@ -6510,8 +6072,7 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1000)
-            fun download(): String = "data"
+            fun download(): String = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1000) checkNotNull(Unit); "data" }
             fun createSource(): Any = object {
                 val stream: @BandwidthEffect() Flow<Unit> = flow { emit(Unit) }
                 val eager = download()
@@ -6575,8 +6136,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            fun downloadMetadata() = Unit
+            fun downloadMetadata() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
             fun prepare(): Flow<Unit> {
                 downloadMetadata()
                 return flow { emit(Unit) }
@@ -6602,8 +6162,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Source(val stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>) {
                 constructor() : this(flow { emit(download()) })
@@ -6624,8 +6183,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             open class Base(val stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>)
 
@@ -6649,8 +6207,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flow
             import kotlinx.coroutines.flow.flowOn
 
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun stream() = flow { emit(download()) }.flowOn(Dispatchers.Default)
 
@@ -6676,11 +6233,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            suspend fun download(): String = "content"
+            suspend fun download(): String = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); "content" }
 
-            @NetworkDownload(maxBytes = 850, completeTimeoutMillis = 1_000)
-            suspend fun recover(): String = "fallback"
+            suspend fun recover(): String = run { @NetworkDownload(maxBytes = 850, completeTimeoutMillis = 1_000) checkNotNull(Unit); "fallback" }
 
             fun stream() = flow { emit(download()) }.catch { emit(recover()) }
 
@@ -6706,11 +6261,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flow
             import kotlinx.coroutines.flow.onCompletion
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun finish() = Unit
+            suspend fun finish() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun stream() = flow { emit(download()) }.onCompletion { finish() }
 
@@ -6739,8 +6292,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.emitAll
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 875, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 875, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @BandwidthVariable("E")
             fun <T> forward(@BandwidthEffect("E") source: Flow<T>): Flow<T> = flow { emitAll(source) }
@@ -6815,8 +6367,7 @@ class CompilerPluginIntegrationTest {
 
             fun rows(): List<Int> = listOf(1).map { it + 1 }
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-            suspend fun download(): Int = 1
+            suspend fun download(): Int = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); 1 }
 
             suspend fun load() {
                 flow { emit(download()) }.map { rows() }.collect()
@@ -6864,8 +6415,7 @@ class CompilerPluginIntegrationTest {
                 import io.github.loinguyen.bandwidth.annotations.NetworkDownload
                 import kotlinx.coroutines.flow.toList
 
-                @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-                fun download(): Int = 1
+                fun download(): Int = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); 1 }
 
                 fun stream() = createFlow(Unit, false, arrayOf("items")) { download() }
                 fun buildOnly() { stream() }
@@ -6939,10 +6489,8 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flow
             import kotlinx.coroutines.flow.onStart
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-            suspend fun begin() = Unit
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            suspend fun download(): Int = 1
+            suspend fun begin() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
+            suspend fun download(): Int = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); 1 }
 
             fun stream() = flow { emit(download()) }.onStart { begin() }
             fun buildOnly() { stream() }
@@ -6967,12 +6515,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.onStart
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-            suspend fun background() = Unit
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            suspend fun download(): Int = 1
-            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
-            suspend fun after() = Unit
+            suspend fun background() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
+            suspend fun download(): Int = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); 1 }
+            suspend fun after() = run { @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
             suspend fun load(scope: CoroutineScope) {
                 flow { emit(download()) }.onStart { scope.launch { background() } }.collect()
@@ -6996,8 +6541,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.sync.Mutex
             import kotlinx.coroutines.sync.withLock
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
             suspend fun load(mutex: Mutex) = coroutineScope {
                 launch { mutex.withLock { download() } }
@@ -7019,11 +6563,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.async
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            suspend fun firstDownload() = Unit
+            suspend fun firstDownload() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
-            suspend fun laterDownload() = Unit
+            suspend fun laterDownload() = run { @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 var current = async { firstDownload() }
@@ -7045,8 +6587,7 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-            fun download(): Int = 1
+            fun download(): Int = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); 1 }
 
             fun load(cache: MutableMap<String, Int>) {
                 cache.getOrPut("item") { download() }
@@ -7070,14 +6611,11 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.sync.Semaphore
             import kotlinx.coroutines.sync.withPermit
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-            suspend fun download(value: Int): Int = value
+            suspend fun download(value: Int): Int = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); value }
 
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            suspend fun prepare() = Unit
+            suspend fun prepare() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
-            suspend fun afterWait() = Unit
+            suspend fun afterWait() = run { @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
             suspend fun load(values: List<Any>) = coroutineScope {
                 val slots = Semaphore(3)
@@ -7154,11 +6692,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.awaitAll
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            suspend fun download(): Int = 1
+            suspend fun download(): Int = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); 1 }
 
-            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
-            suspend fun afterTry() = Unit
+            suspend fun afterTry() = run { @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 val first = async { download() }
@@ -7241,8 +6777,7 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-            fun download() = Unit
+            fun download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
             fun load(count: Int) { repeat(count) { download() } }
             """,
@@ -7261,8 +6796,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.CoroutineScope
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
             fun load(scope: CoroutineScope, count: Int) {
                 repeat(count) { scope.launch { download() } }
@@ -7284,8 +6818,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.map
             import kotlinx.coroutines.flow.toList
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-            suspend fun download(value: Int): Int = value
+            suspend fun download(value: Int): Int = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); value }
 
             fun stream() = listOf(1, 2, 3).asFlow().map { download(it) }
             fun buildOnly() { stream() }
@@ -7309,8 +6842,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.map
             import kotlinx.coroutines.flow.toList
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-            suspend fun download(value: Int) = Unit
+            suspend fun download(value: Int) = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
             suspend fun load() {
                 listOf(1, 2).asFlow().map { value -> flow { emit(download(value)) } }.toList()
@@ -7330,11 +6862,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.launch
             import kotlinx.coroutines.supervisorScope
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            suspend fun afterScope() = Unit
+            suspend fun afterScope() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
             suspend fun load() {
                 supervisorScope {
@@ -7365,11 +6895,9 @@ class CompilerPluginIntegrationTest {
                 import io.github.loinguyen.bandwidth.annotations.NetworkDownload
                 import io.ktor.client.statement.HttpStatement
 
-                @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
-                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-                suspend fun afterCall() = Unit
+                suspend fun afterCall() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
                 suspend fun load(statement: HttpStatement) {
                     statement.execute { download() }
@@ -7402,11 +6930,9 @@ class CompilerPluginIntegrationTest {
                 import io.ktor.client.plugins.websocket.ws
                 import io.ktor.client.plugins.websocket.wss
 
-                @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
-                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-                suspend fun afterCall() = Unit
+                suspend fun afterCall() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
                 suspend fun load(client: Client) {
                     client.webSocket { download() }
@@ -7434,11 +6960,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flow
             import kotlinx.coroutines.flow.toList
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1000)
-            suspend fun prepare(value: Int) = Unit
+            suspend fun prepare(value: Int) = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1000)
-            suspend fun download(value: Int): Int = value
+            suspend fun download(value: Int): Int = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1000) checkNotNull(Unit); value }
 
             @OptIn(ExperimentalCoroutinesApi::class)
             fun stream() = listOf(1, 2, 3).asFlow().flatMapConcat { value ->
@@ -7469,11 +6993,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flow
             import kotlinx.coroutines.flow.toList
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1000)
-            suspend fun nextItem(): Int = 1
+            suspend fun nextItem(): Int = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1000) checkNotNull(Unit); 1 }
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1000)
-            suspend fun download(value: Int) = Unit
+            suspend fun download(value: Int) = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
             @OptIn(ExperimentalCoroutinesApi::class)
             suspend fun load() {
@@ -7525,8 +7047,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.toList
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
             @OptIn(ExperimentalCoroutinesApi::class)
             suspend fun load(scope: CoroutineScope) {
@@ -7566,11 +7087,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.awaitAll
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-            suspend fun download(): Int = 1
+            suspend fun download(): Int = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); 1 }
 
-            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
-            suspend fun afterWait() = Unit
+            suspend fun afterWait() = run { @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
             suspend fun load() = coroutineScope {
                 val first = async { download() }
@@ -7635,11 +7154,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.filter
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun nextItem(): Int = 1
+            suspend fun nextItem(): Int = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); 1 }
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            suspend fun accepts(value: Int): Boolean = true
+            suspend fun accepts(value: Int): Boolean = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); true }
 
             fun stream() = flow { emit(nextItem()) }.filter { accepts(it) }
             fun buildOnly() { stream() }
@@ -7663,8 +7180,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.transform
 
-            @NetworkDownload(maxBytes = 650, completeTimeoutMillis = 1_000)
-            suspend fun download(value: Int): Int = value
+            suspend fun download(value: Int): Int = run { @NetworkDownload(maxBytes = 650, completeTimeoutMillis = 1_000) checkNotNull(Unit); value }
 
             fun stream() = listOf(1, 2, 3).asFlow().transform { emit(download(it)) }
             fun buildOnly() { stream() }
@@ -7687,11 +7203,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.onEach
 
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            suspend fun inspect(value: Int) = Unit
+            suspend fun inspect(value: Int) = run { @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun save(value: Int) = Unit
+            suspend fun save(value: Int) = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun stream() = listOf(1, 2).asFlow().onEach { inspect(it) }
             fun buildOnly() { stream() }
@@ -7723,11 +7237,9 @@ class CompilerPluginIntegrationTest {
                 @BandwidthEffect("C") action: suspend (T) -> Unit,
             ): Flow<T> = source.onEach(action)
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun nextItem(): Int = 1
+            suspend fun nextItem(): Int = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); 1 }
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun inspect(value: Int) = Unit
+            suspend fun inspect(value: Int) = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() {
                 observe(flow { emit(nextItem()) }) { inspect(it) }.collect()
@@ -7748,11 +7260,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.asFlow
             import kotlinx.coroutines.flow.onEach
 
-            @NetworkDownload(maxBytes = 1200, completeTimeoutMillis = 1_000)
-            suspend fun prepare() = Unit
+            suspend fun prepare() = run { @NetworkDownload(maxBytes = 1200, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            suspend fun inspect(value: Int) = Unit
+            suspend fun inspect(value: Int) = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun action(): suspend (Int) -> Unit {
                 prepare()
@@ -7779,8 +7289,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.onEach
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun download(value: Int) = Unit
+            suspend fun download(value: Int) = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(scope: CoroutineScope) {
                 listOf(1, 2).asFlow().onEach { scope.launch { download(it) } }.collect()
@@ -7807,15 +7316,13 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download(value: Int) = Unit
 
-            @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1_000)
             suspend fun afterCollect() = Unit
 
             suspend fun load(scope: CoroutineScope, @BoundedClient(k = 3) client: NetworkClient) {
-                listOf(1, 2).asFlow().onEach { scope.launch { client.download(it) } }.collect()
-                afterCollect()
+                listOf(1, 2).asFlow().onEach { scope.launch { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) client.download(it) } }.collect()
+                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1_000) afterCollect()
             }
             """,
             reportEffects = true,
@@ -7855,8 +7362,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             var Flow<Unit>.marker: Int
                 get() = 0
@@ -7883,8 +7389,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @BandwidthEffect()
             suspend fun Flow<Unit>.consume() { collect() }
@@ -7910,8 +7415,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 350, completeTimeoutMillis = 1_000)
-            fun prepare() = Unit
+            fun prepare() = run { @NetworkDownload(maxBytes = 350, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             open class Base {
                 open val stream: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>
@@ -7943,8 +7447,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.Flow
             import kotlinx.coroutines.flow.emptyFlow
 
-            @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000)
-            fun downloadMetadata(): String = "metadata"
+            fun downloadMetadata(): String = run { @NetworkDownload(maxBytes = 300, completeTimeoutMillis = 1_000) checkNotNull(Unit); "metadata" }
 
             class Wrapper(val source: @BandwidthEffect(rMaxBytesPerSecond = 800, nMax = 1) Flow<Unit>) {
                 val metadata: String = downloadMetadata()
@@ -7985,8 +7488,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flatMapMerge
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            suspend fun download(url: String) = Unit
+            suspend fun download(url: String) = run { @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @OptIn(ExperimentalCoroutinesApi::class)
             suspend fun load(urls: List<String>, limit: Int) {
@@ -8025,8 +7527,7 @@ class CompilerPluginIntegrationTest {
             private const val MAX_SCORE_HANDLERS = 4
             private val scoreSlots = Semaphore(MAX_SCORE_HANDLERS)
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun downloadScores() = Unit
+            suspend fun downloadScores() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun scoresHandler() = scoreSlots.withPermit {
                 downloadScores()
@@ -8053,8 +7554,7 @@ class CompilerPluginIntegrationTest {
             private const val MAX_SCORE_HANDLERS = 4
             private val scoreSlots = Semaphore(MAX_SCORE_HANDLERS)
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun downloadScores() = Unit
+            suspend fun downloadScores() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun registerScoresHandlers(
                 requests: List<Unit>,
@@ -8090,8 +7590,7 @@ class CompilerPluginIntegrationTest {
 
             private val scoreSlots = Semaphore(4)
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun downloadScores() = Unit
+            suspend fun downloadScores() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun registerScoresHandlers(
                 requests: List<Unit>,
@@ -8127,8 +7626,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.sync.Semaphore
             import kotlinx.coroutines.sync.withPermit
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun downloadScores() = Unit
+            suspend fun downloadScores() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun scoresHandler() {
                 val scoreSlots = Semaphore(4)
@@ -8153,8 +7651,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.sync.Semaphore
             import kotlinx.coroutines.sync.withPermit
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun download(value: Int) = value
+            suspend fun download(value: Int) = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); value }
 
             suspend fun batch(values: List<Int>) = coroutineScope {
                 val batchSlots = Semaphore(3)
@@ -8213,8 +7710,7 @@ class CompilerPluginIntegrationTest {
 
             val handlerSlots = Semaphore(3)
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun batch(values: List<Int>) = coroutineScope {
                 val batchSlots = Semaphore(3)
@@ -8246,8 +7742,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.sync.Semaphore
             import kotlinx.coroutines.sync.withPermit
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun batch(values: List<Int>) = coroutineScope {
                 val batchSlots = Semaphore(3)
@@ -8281,8 +7776,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.sync.Semaphore
             import kotlinx.coroutines.sync.withPermit
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun batch(values: List<Int>) = coroutineScope {
                 val batchSlots = Semaphore(3)
@@ -8311,8 +7805,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.sync.Semaphore
             import kotlinx.coroutines.sync.withPermit
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun batch(values: List<Int>) = coroutineScope {
                 values.map {
@@ -8346,8 +7839,7 @@ class CompilerPluginIntegrationTest {
                 import kotlinx.coroutines.sync.Semaphore
                 import kotlinx.coroutines.sync.withPermit
 
-                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
                 suspend fun batch(values: List<Int>, limit: Int) = coroutineScope {
                     $setup
@@ -8371,8 +7863,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.sync.Semaphore
             import kotlinx.coroutines.sync.withPermit
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun batch(values: List<Int>) = coroutineScope {
                 val batchSlots = Semaphore(3)
@@ -8403,8 +7894,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.sync.Semaphore
             import kotlinx.coroutines.sync.withPermit
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun batch(values: List<Int>, external: CoroutineScope) = coroutineScope {
                 val batchSlots = Semaphore(3)
@@ -8434,8 +7924,7 @@ class CompilerPluginIntegrationTest {
             private val configuredLimit = System.getProperty("score.limit", "4").toInt()
             private val scoreSlots = Semaphore(configuredLimit)
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun downloadScores() = Unit
+            suspend fun downloadScores() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun registerScoresHandlers(
                 requests: List<Unit>,
@@ -8488,8 +7977,7 @@ class CompilerPluginIntegrationTest {
 
             private val scoreSlots = Semaphore(4)
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun downloadScores() = Unit
+            suspend fun downloadScores() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun scoresHandler(requestScope: CoroutineScope) =
                 scoreSlots.withPermit {
@@ -8515,8 +8003,7 @@ class CompilerPluginIntegrationTest {
 
             private val scoreSlots = Semaphore(4)
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun downloadScores() = Unit
+            suspend fun downloadScores() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun registerScoresHandlers(
                 requests: List<Unit>,
@@ -8544,8 +8031,7 @@ class CompilerPluginIntegrationTest {
                 import io.github.loinguyen.bandwidth.annotations.EntryPoint
                 import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
                 @EntryPoint
                 suspend fun firstRoot() {
@@ -8581,11 +8067,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.awaitAll
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 10, completeTimeoutMillis = 1_000)
-            suspend fun highRate() = Unit
+            suspend fun highRate() = run { @NetworkDownload(maxBytes = 10, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000)
-            suspend fun lowRate() = Unit
+            suspend fun lowRate() = run { @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @EntryPoint
             suspend fun application() {
@@ -8622,8 +8106,7 @@ class CompilerPluginIntegrationTest {
 
                 private val slots = Semaphore(3)
 
-                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
                 @EntryPoint
                 fun Application.module() {
@@ -8656,8 +8139,7 @@ class CompilerPluginIntegrationTest {
                 import io.ktor.server.routing.routing
                 import io.ktor.server.websocket.webSocketRaw
 
-                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
                 fun Application.module() {
                     routing { webSocketRaw("/events") { download() } }
@@ -8688,8 +8170,7 @@ class CompilerPluginIntegrationTest {
 
                 private val slots = Semaphore(3)
 
-                @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000) checkNotNull(Unit); Unit }
 
                 @EntryPoint
                 fun Application.module() {
@@ -8723,8 +8204,7 @@ class CompilerPluginIntegrationTest {
                 private val pictureSlots = Semaphore(3)
                 private val searchSlots = Semaphore(5)
 
-                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
                 @EntryPoint
                 fun Application.module() {
@@ -8773,8 +8253,7 @@ class CompilerPluginIntegrationTest {
                 private val pictureSlots = Semaphore(2)
                 private val searchSlots = Semaphore(3)
 
-                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
                 @EntryPoint
                 fun Application.module() {
@@ -8831,8 +8310,7 @@ class CompilerPluginIntegrationTest {
                 private val createSlots = Semaphore(2)
                 private val readSlots = Semaphore(3)
 
-                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
                 @EntryPoint
                 fun Application.module() {
@@ -8882,8 +8360,7 @@ class CompilerPluginIntegrationTest {
 
                 private val slots = Semaphore(2)
 
-                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
                 @EntryPoint
                 fun main() {
@@ -8919,8 +8396,7 @@ class CompilerPluginIntegrationTest {
                 import io.ktor.server.routing.get
                 import io.ktor.server.routing.routing
 
-                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-                suspend fun download() = Unit
+                suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
                 @EntryPoint
                 fun Application.module() {
@@ -8948,8 +8424,7 @@ class CompilerPluginIntegrationTest {
                 import io.ktor.server.routing.Application
                 import io.ktor.server.routing.routing
 
-                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-                fun startupDownload() = Unit
+                fun startupDownload() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
                 @EntryPoint
                 fun Application.module() {
@@ -9008,8 +8483,7 @@ class CompilerPluginIntegrationTest {
                 suspend fun getNewsResources(): List<String>
             }
 
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            suspend fun retrofitGetNewsResources(): List<String> = emptyList()
+            suspend fun retrofitGetNewsResources(): List<String> = run { @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000) checkNotNull(Unit); emptyList() }
 
             class RetrofitNiaNetwork : NiaNetworkDataSource {
                 override suspend fun getNewsResources(): List<String> =
@@ -9042,8 +8516,7 @@ class CompilerPluginIntegrationTest {
                 suspend fun getNewsResources(): List<String>
             }
 
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            suspend fun retrofitGetNewsResources(): List<String> = emptyList()
+            suspend fun retrofitGetNewsResources(): List<String> = run { @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000) checkNotNull(Unit); emptyList() }
 
             class RetrofitNiaNetwork @Inject constructor() : NiaNetworkDataSource {
                 override suspend fun getNewsResources(): List<String> =
@@ -9083,8 +8556,7 @@ class CompilerPluginIntegrationTest {
                 suspend fun getNewsResources(): List<String>
             }
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun retrofitGetNewsResources(): List<String> = emptyList()
+            suspend fun retrofitGetNewsResources(): List<String> = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); emptyList() }
 
             class RetrofitNiaNetwork : NiaNetworkDataSource {
                 override suspend fun getNewsResources(): List<String> =
@@ -9103,8 +8575,7 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            suspend fun downloadBatch(ids: List<String>) = Unit
+            suspend fun downloadBatch(ids: List<String>) = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun syncChanged(ids: List<String>) {
                 ids.chunked(40).forEach { chunkedIds ->
@@ -9130,11 +8601,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.Dispatchers
             import kotlinx.coroutines.withContext
 
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            suspend fun first() = Unit
+            suspend fun first() = run { @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun second() = Unit
+            suspend fun second() = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load() = withContext(Dispatchers.IO) {
                 first()
@@ -9167,8 +8636,7 @@ class CompilerPluginIntegrationTest {
                 block: () -> T,
             ): T = block()
 
-            @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun tracedSync() = traceAsync("Sync", 0) {
                 download()
@@ -9191,8 +8659,7 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 6_000, completeTimeoutMillis = 10_000)
-            fun primitive() = Unit
+            fun primitive() = run { @NetworkDownload(maxBytes = 6_000, completeTimeoutMillis = 10_000) checkNotNull(Unit); Unit }
 
             @BandwidthEffect(rMaxBytesPerSecond = 500, nMax = 1)
             fun load() {
@@ -9234,8 +8701,7 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun primitive() = Unit
+            fun primitive() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun caller() {
                 val operation = {
@@ -9257,8 +8723,7 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
-            fun primitive() = Unit
+            fun primitive() = run { @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun caller() {
                 val operation = ::primitive
@@ -9279,8 +8744,7 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 650, completeTimeoutMillis = 1_000)
-            fun primitive() = Unit
+            fun primitive() = run { @NetworkDownload(maxBytes = 650, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun caller() {
                 val inner = {
@@ -9305,11 +8769,9 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1_000)
-            fun small() = Unit
+            fun small() = run { @NetworkDownload(maxBytes = 200, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            fun large() = Unit
+            fun large() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun caller(useLarge: Boolean) {
                 var operation: () -> Unit = ::small
@@ -9332,8 +8794,7 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000)
-            fun primitive() = Unit
+            fun primitive() = run { @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun makeFactory(): () -> () -> Unit = {
                 {
@@ -9384,8 +8845,7 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            fun primitive() = Unit
+            fun primitive() = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun callback():
                 @BandwidthEffect(rMaxBytesPerSecond = 500, nMax = 1) (() -> Unit) = {
@@ -9455,8 +8915,7 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            fun primitive() = Unit
+            fun primitive() = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun invokeNetwork(
                 @BandwidthEffect(rMaxBytesPerSecond = 500, nMax = 1)
@@ -9484,8 +8943,7 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            fun primitive() = Unit
+            fun primitive() = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun invokeEmpty(@BandwidthEffect() callback: () -> Unit) {
                 callback()
@@ -9508,8 +8966,7 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun primitive() = Unit
+            fun primitive() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun deferredSequence() = sequenceOf(1).map {
                     primitive()
@@ -9546,8 +9003,7 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun primitive() = Unit
+            fun primitive() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun recursive() {
                 primitive()
@@ -9567,8 +9023,7 @@ class CompilerPluginIntegrationTest {
             import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun primitive() = Unit
+            fun primitive() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             @BandwidthEffect(rMaxBytesPerSecond = 1_000, nMax = 1)
             fun recursive(remaining: Int) {
@@ -9593,11 +9048,9 @@ class CompilerPluginIntegrationTest {
             """
             import io.github.loinguyen.bandwidth.annotations.NetworkDownload
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            fun primary() = Unit
+            fun primary() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            fun secondary() = Unit
+            fun secondary() = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun whileLoop(count: Int) {
                 var index = 0
@@ -9711,7 +9164,6 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download() = Unit
 
             fun load(
@@ -9720,8 +9172,8 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 2) secondClient: NetworkClient,
             ) {
                 scope.launch {
-                    firstClient.download()
-                    secondClient.download()
+                    @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) firstClient.download()
+                    @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) secondClient.download()
                 }
             }
             """,
@@ -9743,11 +9195,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.awaitAll
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
-            suspend fun childDownload() = Unit
+            suspend fun childDownload() = run { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun callbackInputDownload() = Unit
+            suspend fun callbackInputDownload() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun callbackFactory(): suspend CoroutineScope.() -> Unit {
                 callbackInputDownload()
@@ -9782,10 +9232,8 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.backgroundDownload() = Unit
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
             suspend fun foregroundDownload() = Unit
 
             @BandwidthEffect(
@@ -9801,12 +9249,12 @@ class CompilerPluginIntegrationTest {
                 scope: CoroutineScope,
                 @BoundedClient(k = 2) client: NetworkClient,
             ) {
-                scope.launch { client.backgroundDownload() }
+                scope.launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) client.backgroundDownload() }
             }
 
             suspend fun load(scope: CoroutineScope, client: NetworkClient) {
                 start(scope, client)
-                foregroundDownload()
+                @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) foregroundDownload()
             }
             """,
             reportEffects = true,
@@ -9902,7 +9350,6 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.download() = Unit
 
             @BandwidthEffect(
@@ -9917,7 +9364,7 @@ class CompilerPluginIntegrationTest {
                 scope: CoroutineScope,
                 @BoundedClient(k = 2) client: NetworkClient,
             ) {
-                scope.launch { client.download() }
+                scope.launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) client.download() }
             }
             """,
         )
@@ -9937,10 +9384,8 @@ class CompilerPluginIntegrationTest {
 
             class NetworkClient
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.first() = Unit
 
-            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
             suspend fun NetworkClient.second() = Unit
 
             fun load(
@@ -9949,9 +9394,9 @@ class CompilerPluginIntegrationTest {
                 @BoundedClient(k = 2) secondClient: NetworkClient,
             ) {
                 try {
-                    scope.launch { firstClient.first() }
+                    scope.launch { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) firstClient.first() }
                 } finally {
-                    scope.launch { secondClient.second() }
+                    scope.launch { @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000) secondClient.second() }
                 }
             }
             """,
@@ -9997,8 +9442,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.MutableStateFlow
             import kotlinx.coroutines.flow.collect
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            fun initialValue() = 1
+            fun initialValue() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); 1 }
 
             fun buildOnly() { MutableStateFlow(initialValue()) }
 
@@ -10025,8 +9469,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.onEach
 
-            @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000)
-            suspend fun download(value: Int) = Unit
+            suspend fun download(value: Int) = run { @NetworkDownload(maxBytes = 750, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun events() = MutableStateFlow(1).asStateFlow().onEach { download(it) }
 
@@ -10187,8 +9630,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.onEach
             import kotlinx.coroutines.flow.receiveAsFlow
 
-            @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000)
-            suspend fun download(value: Int) = Unit
+            suspend fun download(value: Int) = run { @NetworkDownload(maxBytes = 900, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Events {
                 private val channel = Channel<Int>(4)
@@ -10240,8 +9682,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flow
             import kotlinx.coroutines.flow.stateIn
 
-            @NetworkDownload(maxBytes = 950, completeTimeoutMillis = 1_000)
-            suspend fun download() = 1
+            suspend fun download() = run { @NetworkDownload(maxBytes = 950, completeTimeoutMillis = 1_000) checkNotNull(Unit); 1 }
 
             suspend fun observe(scope: CoroutineScope) {
                 flow { emit(download()) }.stateIn(scope, SharingStarted.Eagerly, 0).collect { }
@@ -10264,8 +9705,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flow
             import kotlinx.coroutines.flow.shareIn
 
-            @NetworkDownload(maxBytes = 950, completeTimeoutMillis = 1_000)
-            suspend fun download() = 1
+            suspend fun download() = run { @NetworkDownload(maxBytes = 950, completeTimeoutMillis = 1_000) checkNotNull(Unit); 1 }
 
             suspend fun observe(scope: CoroutineScope) {
                 flow { emit(download()) }.shareIn(scope, SharingStarted.Eagerly).collect { }
@@ -10287,8 +9727,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.distinctUntilChanged
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun download() = 1
+            suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); 1 }
 
             suspend fun observe() {
                 flow { emit(download()) }.distinctUntilChanged().buffer(1).collectLatest { it + 1 }
@@ -10310,8 +9749,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.flow.distinctUntilChanged
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            fun equivalent(previous: Int, current: Int) = false
+            fun equivalent(previous: Int, current: Int) = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); false }
 
             suspend fun observe() {
                 listOf(1, 2).asFlow().distinctUntilChanged { previous, current ->
@@ -10333,8 +9771,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.MutableStateFlow
             import kotlinx.coroutines.flow.collect
 
-            @NetworkDownload(maxBytes = 1_200, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 1_200, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Worker {
                 private val isCancelled by lazy { MutableStateFlow(false) }
@@ -10359,8 +9796,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.MutableStateFlow
             import kotlinx.coroutines.flow.collect
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            fun initialize() = Unit
+            fun initialize() = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class Worker {
                 private val isCancelled by lazy {
@@ -10389,8 +9825,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collect
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 1_300, completeTimeoutMillis = 1_000)
-            suspend fun download() = 1
+            suspend fun download() = run { @NetworkDownload(maxBytes = 1_300, completeTimeoutMillis = 1_000) checkNotNull(Unit); 1 }
 
             fun start(scope: CoroutineScope): StateFlow<Int> {
                 val state = MutableStateFlow(0)
@@ -10416,11 +9851,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collectLatest
             import kotlinx.coroutines.flow.flow
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun nextValue() = 1
+            suspend fun nextValue() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); 1 }
 
-            @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000)
-            suspend fun download(value: Int) = Unit
+            suspend fun download(value: Int) = run { @NetworkDownload(maxBytes = 1_500, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun observe() {
                 flow { emit(nextValue()) }.collectLatest { download(it) }
@@ -10443,8 +9876,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.collectLatest
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
-            suspend fun download(value: Int) = Unit
+            suspend fun download(value: Int) = run { @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun observe(scope: CoroutineScope) {
                 listOf(1, 2).asFlow().collectLatest { value ->
@@ -10469,8 +9901,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.asSharedFlow
             import kotlinx.coroutines.flow.collect
 
-            @NetworkDownload(maxBytes = 1_600, completeTimeoutMillis = 1_000)
-            suspend fun download(value: Int) = Unit
+            suspend fun download(value: Int) = run { @NetworkDownload(maxBytes = 1_600, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             class EventBus {
                 private val mutableEvents = MutableSharedFlow<Int>(
@@ -10499,8 +9930,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.asSharedFlow
             import kotlinx.coroutines.flow.collect
 
-            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
-            fun capacity() = 4
+            fun capacity() = run { @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000) checkNotNull(Unit); 4 }
 
             fun buildOnly() { MutableSharedFlow<Int>(extraBufferCapacity = capacity()).asSharedFlow() }
 
@@ -10597,11 +10027,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.CoroutineScope
             import kotlinx.coroutines.async
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun background() = Unit
+            suspend fun background() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
-            suspend fun foreground() = Unit
+            suspend fun foreground() = run { @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(scope: CoroutineScope) {
                 scope.async { background() }
@@ -10625,11 +10053,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.async
             import kotlinx.coroutines.launch
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun heavy() = Unit
+            suspend fun heavy() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun light() = Unit
+            suspend fun light() = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(scope: CoroutineScope) {
                 scope.launch { heavy(); light() }
@@ -10660,11 +10086,9 @@ class CompilerPluginIntegrationTest {
 
             private val slots = Semaphore(3)
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun background() = Unit
+            suspend fun background() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
-            suspend fun foreground() = Unit
+            suspend fun foreground() = run { @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun repeatedLaunches(count: Int, scope: CoroutineScope) {
                 repeat(count) { scope.launch { slots.withPermit { background() } } }
@@ -10697,8 +10121,7 @@ class CompilerPluginIntegrationTest {
 
             private val slots = Semaphore(3)
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load(count: Int, scope: CoroutineScope) {
                 repeat(count) {
@@ -10724,11 +10147,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flow
             import kotlinx.coroutines.flow.launchIn
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun background() = Unit
+            suspend fun background() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
-            suspend fun foreground() = Unit
+            suspend fun foreground() = run { @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(scope: CoroutineScope) {
                 flow { background(); emit(Unit) }.launchIn(scope)
@@ -10752,8 +10173,7 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.flow.flow
             import kotlinx.coroutines.flow.launchIn
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             fun load(count: Int, scope: CoroutineScope) {
                 repeat(count) { flow { download(); emit(Unit) }.launchIn(scope) }
@@ -10779,11 +10199,9 @@ class CompilerPluginIntegrationTest {
 
             private val slots = Semaphore(3)
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun background() = Unit
+            suspend fun background() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
-            suspend fun foreground() = Unit
+            suspend fun foreground() = run { @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(count: Int, scope: CoroutineScope) {
                 repeat(count) {
@@ -10813,8 +10231,7 @@ class CompilerPluginIntegrationTest {
 
             private val slots = Semaphore(3)
 
-            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
-            suspend fun download() = Unit
+            suspend fun download() = run { @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
             suspend fun load(count: Int, scope: CoroutineScope) {
                 repeat(count) {
@@ -10860,11 +10277,9 @@ class CompilerPluginIntegrationTest {
 
         private val handlerSlots = Semaphore($permits)
 
-        @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-        suspend fun high() = Unit
+        suspend fun high() = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
-        @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000)
-        suspend fun low() = Unit
+        suspend fun low() = run { @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
 
         suspend fun gatedRequest() = handlerSlots.withPermit {
             high()
@@ -10882,10 +10297,8 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.awaitAll
             import kotlinx.coroutines.coroutineScope
 
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun heavy() = Unit
-            @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000)
-            suspend fun light() = Unit
+            suspend fun heavy() = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
+            suspend fun light() = run { @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
             suspend fun load() {
                 heavy()
                 coroutineScope { awaitAll(async { light() }, async { light() }, async { light() }) }
@@ -10983,12 +10396,9 @@ class CompilerPluginIntegrationTest {
             import kotlinx.coroutines.sync.withPermit
 
             val gate = Semaphore(3)
-            @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000)
-            suspend fun heavy() = Unit
-            @NetworkDownload(maxBytes = 2, completeTimeoutMillis = 1_000)
-            suspend fun marker() = Unit
-            @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000)
-            suspend fun light(): Int = 1
+            suspend fun heavy() = run { @NetworkDownload(maxBytes = 100, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
+            suspend fun marker() = run { @NetworkDownload(maxBytes = 2, completeTimeoutMillis = 1_000) checkNotNull(Unit); Unit }
+            suspend fun light(): Int = run { @NetworkDownload(maxBytes = 1, completeTimeoutMillis = 1_000) checkNotNull(Unit); 1 }
             @Handler
             suspend fun handle() = gate.withPermit {
                 heavy()

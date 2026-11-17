@@ -41,15 +41,20 @@ does not yet transform coroutine launches.
 ## Annotation sketch
 
 ```kotlin
-@NetworkDownload(maxBytes = 8_000_000, completeTimeoutMillis = 10_000)
-suspend fun downloadImage(url: String): ByteArray
+suspend fun downloadImage(http: HttpLibrary, url: String): ByteArray {
+    val bytes = @NetworkDownload(
+        maxBytes = 8_000_000,
+        completeTimeoutMillis = 10_000,
+    ) http.fetchBody(url)
+    return bytes
+}
 
 @EntryPoint
 fun Application.module() {
     routing {
         get("/picture") {
             pictureSlots.withPermit {
-                downloadImage("https://images.example/picture")
+                downloadImage(http, "https://images.example/picture")
             }
         }
     }
@@ -91,17 +96,23 @@ try {
 }
 ```
 
-`@NetworkDownload` describes a primitive transfer, usually at a library
-boundary. A size `s` in bytes and complete-call timeout `t` in milliseconds
-supply the singleton contract `{(1000*s/t, 1)}`. Calls use this contract; an available source body is inferred and
-must be a subtype of it, using the same coverage check as `@BandwidthEffect`.
-Thus, a sequential wrapper can fit the contract, while two parallel downloads
-cannot be hidden behind concurrency one. Ordinary wrappers usually need no
-annotation. Omit both bounds, or set both to `None`, for an untimed download
+`@NetworkDownload` annotates a **call expression** for one primitive transfer
+at an opaque library boundary, such as `http.fetchBody(url)` above. It does not
+annotate function declarations. A size `s` in bytes and complete-call timeout
+`t` in milliseconds contribute the singleton effect `{(1000*s/t, 1)}`. Effects
+from evaluating the receiver and arguments are retained. The size, timeout,
+and single-transfer behavior are trusted assumptions; the annotation does not
+configure the library's timer or prove its transfer size.
+
+The source wrapper `downloadImage` is unannotated: its effect is inferred from
+the annotated call. Callers then reuse that inferred summary without repeating
+the primitive annotation. Sequential or parallel wrappers are analyzed by
+composing their bodies, and may declare a checked `@BandwidthEffect` contract.
+Omit both bounds, or set both to `None`, for an untimed download
 with no size bound. It contributes rate zero and concurrency one, so its
 interference is retained. A zero timeout or a partially specified bound is
-rejected. Eager network work in a primitive adapter's default arguments must be made
-explicit at the call site; callback defaults must satisfy their parameter contracts.
+rejected. Receiver and argument work must also have inferable effects or
+contracts; callback defaults must satisfy their parameter contracts.
 
 `@BandwidthEffect` supplies a general effect summary for source functions,
 higher-order inputs, and opaque libraries. Available source bodies are checked
@@ -109,7 +120,12 @@ against concrete contracts. Size/deadline declarations and summaries of opaque
 I/O remain trusted assumptions: the checker does not discover unannotated
 network behavior in a third-party library. An opaque operation with parallel
 or escaping downloads needs a covering `@BandwidthEffect` contract rather than
-the completing singleton. See [annotation contract examples](docs/annotation-contracts.md).
+the completing singleton. `@NetworkDownload` has expression target and source
+retention; its call-site information is used during inference.
+Explicit `@BandwidthEffect` contracts are retained in compiled binaries for
+separate compilation. Inferred summaries are cached only within the current
+compilation and are not automatically exported.
+See [annotation contract examples](docs/annotation-contracts.md).
 The original
 `rMaxBytesPerSecond`/`nMax` arguments remain shorthand for one completing
 download effect. Contracts that may outlive their call retain that fact:

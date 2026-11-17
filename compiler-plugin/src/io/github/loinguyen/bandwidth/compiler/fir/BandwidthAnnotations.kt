@@ -17,10 +17,12 @@ import org.jetbrains.kotlin.fir.expressions.FirFunctionCall
 import org.jetbrains.kotlin.fir.expressions.FirLiteralExpression
 import org.jetbrains.kotlin.fir.expressions.FirNamedArgumentExpression
 import org.jetbrains.kotlin.fir.expressions.FirSpreadArgumentExpression
+import org.jetbrains.kotlin.fir.expressions.FirStatement
 import org.jetbrains.kotlin.fir.expressions.FirVarargArgumentsExpression
 import org.jetbrains.kotlin.fir.expressions.FirWrappedArgumentExpression
 import org.jetbrains.kotlin.fir.expressions.FirWrappedExpression
 import org.jetbrains.kotlin.fir.expressions.impl.FirResolvedArgumentList
+import org.jetbrains.kotlin.fir.references.FirResolvedNamedReference
 import org.jetbrains.kotlin.fir.declarations.evaluateAs
 import org.jetbrains.kotlin.fir.resolve.fullyExpandedType
 import org.jetbrains.kotlin.name.ClassId
@@ -232,14 +234,13 @@ private fun FirFunction.concurrentMapAnnotationProblems(
         add(AnnotationProblem(annotation.source ?: source, message))
     }
     if (
-        this@concurrentMapAnnotationProblems.annotation(NETWORK_DOWNLOAD_ANNOTATION, session) != null ||
         this@concurrentMapAnnotationProblems.annotation(BANDWIDTH_EFFECT_ANNOTATION, session) != null ||
         this@concurrentMapAnnotationProblems.annotation(BANDWIDTH_VARIABLE_ANNOTATION, session) != null ||
         returnTypeRef.annotation(BANDWIDTH_EFFECT_ANNOTATION, session) != null
     ) {
         problem(
-            "@BandwidthConcurrentMap cannot be combined with @NetworkDownload, " +
-                "@BandwidthEffect, @BandwidthVariable, or a returned effect contract.",
+            "@BandwidthConcurrentMap cannot be combined with @BandwidthEffect, " +
+                "@BandwidthVariable, or a returned effect contract.",
         )
     }
     if (symbol.callableId.classId != null || symbol.callableId.isLocal) {
@@ -296,18 +297,18 @@ internal fun FirDeclaration.validateBandwidthAnnotations(
     session: FirSession,
 ): List<AnnotationProblem> = buildList {
     val container: FirAnnotationContainer = this@validateBandwidthAnnotations
-    val download = container.annotation(NETWORK_DOWNLOAD_ANNOTATION, session)
-    val effect = container.annotation(BANDWIDTH_EFFECT_ANNOTATION, session)
-    val variables = container.annotation(BANDWIDTH_VARIABLE_ANNOTATION, session)
-    if (download != null && effect != null) {
+    // Kotlin can attach an expression annotation on a lambda to its anonymous
+    // function declaration, rather than its surrounding expression node.
+    container.annotation(NETWORK_DOWNLOAD_ANNOTATION, session)?.let { annotation ->
         add(
             AnnotationProblem(
-                source = source,
-                message = "@NetworkDownload and @BandwidthEffect cannot annotate " +
-                    "the same declaration.",
+                annotation.source ?: source,
+                "@NetworkDownload applies only to a function call expression.",
             ),
         )
     }
+    val effect = container.annotation(BANDWIDTH_EFFECT_ANNOTATION, session)
+    val variables = container.annotation(BANDWIDTH_VARIABLE_ANNOTATION, session)
 
     container.annotation(BANDWIDTH_CONCURRENT_MAP_ANNOTATION, session)?.let { annotation ->
         val function = this@validateBandwidthAnnotations as? FirFunction
@@ -318,7 +319,6 @@ internal fun FirDeclaration.validateBandwidthAnnotations(
         }
     }
 
-    download?.let { validateDownloadAnnotation(it, session) }
     effect?.let { validateEffectAnnotation(it, session) }
     variables?.let { annotation ->
         val names = annotation.stringArguments(NAMES, session)
@@ -441,6 +441,42 @@ internal fun FirDeclaration.validateBandwidthAnnotations(
             }
         }
     }
+}
+
+/** Checks primitive call annotations independently of effect-inference reachability. */
+internal fun FirStatement.validateNetworkDownloadAnnotations(
+    session: FirSession,
+): List<AnnotationProblem> = buildList {
+    val annotation = annotation(NETWORK_DOWNLOAD_ANNOTATION, session) ?: return@buildList
+    if (this@validateNetworkDownloadAnnotations !is FirFunctionCall) {
+        add(
+            AnnotationProblem(
+                annotation.source ?: source,
+                "@NetworkDownload applies only to a function call expression.",
+            ),
+        )
+    } else {
+        // These calls can be consumed directly by coroutine phase tracking,
+        // without passing through the ordinary call-effect visitor.
+        val target = (this@validateNetworkDownloadAnnotations.calleeReference as? FirResolvedNamedReference)
+            ?.resolvedSymbol?.fir
+            as? FirFunction
+        val callableName = target?.symbol?.callableId?.asSingleFqName()?.asString()
+        if (callableName?.startsWith("kotlinx.coroutines.") == true ||
+            callableName?.startsWith("kotlin.collections.") == true ||
+            callableName?.startsWith("kotlin.sequences.") == true ||
+            target?.concurrentMapContract(session) != null
+        ) {
+            add(
+                AnnotationProblem(
+                    annotation.source ?: source,
+                    "@NetworkDownload cannot annotate this modeled operation. " +
+                        "Annotate the primitive library call inside it instead.",
+                ),
+            )
+        }
+    }
+    validateDownloadAnnotation(annotation, session)
 }
 
 /** Appends validation problems for one `@NetworkDownload` [annotation]. */
