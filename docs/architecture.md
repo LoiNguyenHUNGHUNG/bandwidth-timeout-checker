@@ -24,7 +24,7 @@ Kotlin FIR resolution: Gamma |- e : tau
               |
               v
 FIR quantitative-effect visitor: Gamma |- e : tau |> Phi
-  - primitive download -> singleton effect
+  - @NetworkDownload on a primitive call expression -> singleton effect
   - sequence / choice -> sequential join
   - structured concurrency -> parallel composition
   - repeat -> completing work stays sequential; escaping work uses self bounds
@@ -78,13 +78,19 @@ bounded-scope semaphore rewrite.
 
 Annotations are required only where inference cannot see enough:
 
-1. `@NetworkDownload(maxBytes, completeTimeoutMillis)` on primitive network
-   operations or library adapters.
+1. `@NetworkDownload(maxBytes, completeTimeoutMillis)` on a call expression
+   performing one primitive transfer at an opaque library boundary. It
+   contributes `{(1000 * maxBytes / completeTimeoutMillis, 1)}` in bytes per
+   second, together with the effects of evaluating its receiver and arguments.
+   It is a trusted declaration of transfer size, complete-call timeout, and
+   single-transfer behavior, not a function contract. Source wrappers infer
+   their effects from these calls and ordinary composition.
 2. `@EntryPoint` on a framework-invoked application root that ordinary source
    code may never call. Every marked root contributes one invocation to the
    virtual application root.
-3. Concrete `@BandwidthEffect` contracts on opaque functions, higher-order
-   inputs, and opaque returned function types. Entries retain
+3. Concrete `@BandwidthEffect` contracts on source or opaque functions,
+   higher-order inputs, and opaque returned function types. Available source
+   bodies are checked; opaque library behavior is trusted. Entries retain
    `(rMaxBytesPerSecond, nMax, selfBound, lifetime)`, where a zero `selfBound`
    denotes the default bound infinity. A positive value is a trusted contract
    that runtime configuration establishes a finite limit.
@@ -104,6 +110,21 @@ Annotations are required only where inference cannot see enough:
    work and must expose a finite self bound.
 8. `@BandwidthAlternative` on a whole `try/catch` expression when the
    programmer asserts that its network branches are comparable alternatives.
+
+`@NetworkDownload` targets expressions and has `SOURCE` retention. It is read
+from the primitive call during inference; it is not placed on functions,
+interfaces, or callable references. `@BandwidthEffect` supplies function and
+interface contracts. The visitor uses those declared contracts at calls and
+callable references, while the inference pass checks available source bodies
+and overriding implementations against them. Returned Flow/function effects
+remain separate latent obligations.
+
+Explicit `@BandwidthEffect` annotations have `BINARY` retention, allowing
+separately compiled consumers to use them without seeing the original
+primitive-call annotations. Inferred summaries are cached within one compiler
+session and are not automatically exported. Unannotated opaque I/O is not
+discovered by this check: its primitive size, deadline, and transfer lifetime
+remain assumptions. See [examples](annotation-contracts.md).
 
 The MVP has no priorities and no download identifiers.
 

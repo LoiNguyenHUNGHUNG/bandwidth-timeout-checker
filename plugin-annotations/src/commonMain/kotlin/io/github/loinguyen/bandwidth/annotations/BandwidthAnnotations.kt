@@ -4,20 +4,28 @@ package io.github.loinguyen.bandwidth.annotations
 public const val None: Long = -1
 
 /**
- * Declares a primitive network operation.
+ * Declares one primitive network transfer at a call expression, for example
+ * `@NetworkDownload(1000, 1000) client.fetchBody(url)`.
  *
  * The timeout is the complete-call deadline used for the transfer, not merely
- * a connect or read-idle timeout.
+ * a connect or read-idle timeout. The call contributes the singleton effect
+ * `{(maxBytes / timeout, 1)}`, with timeout expressed in seconds. Effects of
+ * evaluating receivers and arguments are accounted for separately. Known
+ * callee effects must be covered by this contract; opaque library behavior,
+ * the transfer size, and the actual deadline remain trusted assumptions.
+ * The transfer must complete or be cancelled before the annotated call returns.
  *
  * Set both arguments to [None], or omit both, for an untimed download with no
- * declared size bound.
- * It still counts as one competing download, with required rate zero. Supply
- * both a non-negative size and a positive timeout for a timed download. The
- * [None] denotes an absent bound, not a zero-duration timeout. The transfer
- * must complete or be cancelled before the annotated call returns.
+ * declared size bound. It still counts as one competing download with required
+ * rate zero. Supply both a non-negative size and a positive timeout for a timed
+ * download. [None] denotes an absent bound, not a zero-duration timeout.
+ *
+ * This annotation is source-only and cannot annotate a function declaration.
+ * Source functions infer their effects from their bodies; [BandwidthEffect]
+ * supplies function-level contracts, including separately compiled APIs.
  */
-@Target(AnnotationTarget.FUNCTION)
-@Retention(AnnotationRetention.BINARY)
+@Target(AnnotationTarget.EXPRESSION)
+@Retention(AnnotationRetention.SOURCE)
 public annotation class NetworkDownload(
     public val maxBytes: Long = None,
     public val completeTimeoutMillis: Long = None,
@@ -67,8 +75,11 @@ public annotation class BandwidthVariable(
 )
 
 /**
- * Conservative list of download effects for an opaque function, higher-order
- * input, or returned function type whose body is unavailable to the checker.
+ * Conservative list of download effects for a function, higher-order input,
+ * or returned function type. Calls use the declared contract. Available source
+ * bodies are checked against concrete invocation contracts; contracts for
+ * opaque library operations are trusted. Unlike [NetworkDownload], this can
+ * express multiple rate/concurrency pairs and work that outlives the call.
  *
  * A non-empty [variable] assigns a quantified effect to a higher-order input or
  * to the invocation of an opaque function. For example, placing

@@ -9,11 +9,14 @@ import org.jetbrains.kotlin.fir.analysis.checkers.MppCheckerKind
 import org.jetbrains.kotlin.fir.analysis.checkers.context.CheckerContext
 import org.jetbrains.kotlin.fir.analysis.checkers.declaration.DeclarationCheckers
 import org.jetbrains.kotlin.fir.analysis.checkers.declaration.FirDeclarationChecker
+import org.jetbrains.kotlin.fir.analysis.checkers.expression.ExpressionCheckers
+import org.jetbrains.kotlin.fir.analysis.checkers.expression.FirExpressionChecker
 import org.jetbrains.kotlin.fir.analysis.extensions.FirAdditionalCheckersExtension
 import org.jetbrains.kotlin.fir.declarations.FirDeclaration
 import org.jetbrains.kotlin.fir.declarations.FirAnonymousInitializer
 import org.jetbrains.kotlin.fir.declarations.FirConstructor
 import org.jetbrains.kotlin.fir.declarations.FirProperty
+import org.jetbrains.kotlin.fir.expressions.FirStatement
 
 internal class BandwidthFirCheckersExtension(
     session: FirSession,
@@ -39,6 +42,10 @@ internal class BandwidthFirCheckersExtension(
             override val anonymousInitializerCheckers =
                 setOf(BandwidthInitializerEffectChecker(inference))
         }
+
+    override val expressionCheckers: ExpressionCheckers = object : ExpressionCheckers() {
+        override val basicExpressionCheckers = setOf(BandwidthDownloadExpressionChecker)
+    }
 }
 
 private class BandwidthPropertyEffectChecker(
@@ -76,6 +83,22 @@ private object BandwidthAnnotationChecker :
         declaration.validateBandwidthAnnotations(context.session).forEach { problem ->
             reporter.reportOn(
                 problem.source ?: declaration.source,
+                BandwidthDiagnostics.ERROR,
+                problem.message,
+                context,
+            )
+        }
+    }
+}
+
+/** Validates all primitive call annotations, including expressions in unused functions. */
+private object BandwidthDownloadExpressionChecker :
+    FirExpressionChecker<FirStatement>(MppCheckerKind.Common) {
+    context(context: CheckerContext, reporter: DiagnosticReporter)
+    override fun check(expression: FirStatement) {
+        expression.validateNetworkDownloadAnnotations(context.session).forEach { problem ->
+            reporter.reportOn(
+                problem.source ?: expression.source,
                 BandwidthDiagnostics.ERROR,
                 problem.message,
                 context,
