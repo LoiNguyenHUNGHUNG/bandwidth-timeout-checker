@@ -312,17 +312,15 @@ internal class KotlinNetworkEffectInference(
         diagnosticContext = context
         diagnosticReporter = reporter
         try {
-            validateFlowParameterDefaults(function)
-            val inferred: KotlinFunctionEffect = inferFunctionEffect(function)
+            validateParameterDefaults(function)
+            val inferred: KotlinFunctionEffect = inferFunctionBodyEffect(function)
+            validateDownloadContract(function, inferred)
             val returnsFlow = function.returnTypeRef.coneType.isBandwidthFlow(session)
             val overriddenReturnedContracts = function.overriddenReturnedEffectContracts(session, context, analysisMode)
             if (function.body != null && (returnsFlow || overriddenReturnedContracts.isNotEmpty())) {
-                // Primitive and symbolic eager contracts bypass body inference. They do
+                // A symbolic eager contract bypasses body inference. It does
                 // not certify the effect suspended inside a returned Flow.
-                val returned = if (
-                    function.downloadContract(session, analysisMode) != null ||
-                    function.symbolicInvocationEffect(session, analysisMode) != null
-                ) {
+                val returned = if (function.symbolicInvocationEffect(session, analysisMode) != null) {
                     effectVisitor.inferFunctionBody(function, latentValues).returned
                 } else {
                     inferred.returned
@@ -377,7 +375,7 @@ internal class KotlinNetworkEffectInference(
                         error(
                             function.source,
                             "Inferred override effect ${inferredEffect.render()} is not " +
-                                "covered by the overridden @BandwidthEffect contract " +
+                                "covered by the overridden bandwidth contract " +
                                 "${declaredEffect.render()}.",
                         )
                     }
@@ -397,12 +395,16 @@ internal class KotlinNetworkEffectInference(
                         }
                     }
                 }
+                // Framework roots have no ordinary call site to materialize
+                // their invocation contract. Keep validation on the actual
+                // body, but record the same summary an ordinary call would use.
+                val invocationEffect = function.downloadContract(session, analysisMode)?.network
+                    ?: function.effectContract(session, analysisMode)
+                        ?.takeIf { it.variable == null }?.network
+                    ?: inferredEffect
                 when {
                     isDeclarationHandler -> {
-                        val handlerBody = function.effectContract(session, analysisMode)
-                            ?.takeIf { it.variable == null }
-                            ?.network
-                            ?: inferredEffect
+                        val handlerBody = invocationEffect
                         val repeatedBody = handlerBody.withLifetime(
                             DownloadLifetime.MAY_OUTLIVE_CALL,
                         )
@@ -426,7 +428,7 @@ internal class KotlinNetworkEffectInference(
                             )
                         }
                     }
-                    function.isEntryPoint(session) -> applicationEntryPoints.record(inferredEffect)
+                    function.isEntryPoint(session) -> applicationEntryPoints.record(invocationEffect)
                 }
             } else if (function.isEntryPoint(session) || isDeclarationHandler) {
                 val annotationName = if (isDeclarationHandler) "@Handler" else "@EntryPoint"
@@ -461,11 +463,16 @@ internal class KotlinNetworkEffectInference(
         }
     }
 
-    /** Defaults preserve Flow contracts; eager constructor defaults require an explicit argument. */
-    private fun validateFlowParameterDefaults(function: FirFunction) {
+    /**
+     * Defaults preserve latent contracts. Primitive/constructor eager defaults
+     * require explicit arguments because omitted arguments are not visited at calls.
+     */
+    private fun validateParameterDefaults(function: FirFunction) {
+        val primitive = function.downloadContract(session, analysisMode) != null
         val defaults = function.valueParameters.filter {
             it.defaultValue != null &&
-                (function is FirConstructor || it.returnTypeRef.coneType.isBandwidthFlow(session))
+                (function is FirConstructor || primitive ||
+                    it.returnTypeRef.coneType.isBandwidthFlow(session))
         }
         if (defaults.isEmpty()) return
         val variables = function.effectVariableIds(session).associateBy(EffectVariableId::name)
@@ -488,14 +495,18 @@ internal class KotlinNetworkEffectInference(
             val expression = parameter.defaultValue ?: return@forEach
             val inferred = effectVisitor.infer(expression, context)
             if (inferred.network.concreteOrNull() != NetworkEffect.EMPTY) {
-                val kind = if (function is FirConstructor) "constructor" else "Flow"
+                val kind = when {
+                    function is FirConstructor -> "constructor"
+                    primitive -> "primitive download"
+                    else -> "Flow"
+                }
                 error(
                     expression.source ?: parameter.source,
                     "Eager network work in a $kind default argument is not modeled at call " +
                         "boundaries. Use an explicit initialization argument.",
                 )
             }
-            if (!parameter.returnTypeRef.coneType.isBandwidthFlow(session)) return@forEach
+            if (!parameter.returnTypeRef.coneType.isBandwidthLatentValue(session)) return@forEach
             val contract = parameter.effectContract(session, analysisMode)
                 ?: parameter.returnTypeRef.effectContract(session, analysisMode)
             val expected = contract?.variable?.let { name ->
@@ -514,9 +525,10 @@ internal class KotlinNetworkEffectInference(
                         concreteActual.isCoveredBy(concreteExpected))
                 )
             if (!covered) {
+                val kind = if (parameter.returnTypeRef.coneType.isBandwidthFlow(session)) "Flow" else "Function"
                 error(
                     expression.source ?: parameter.source,
-                    "Flow default argument effect ${actual?.render() ?: "unknown"} is not " +
+                    "$kind default argument effect ${actual?.render() ?: "unknown"} is not " +
                         "covered by parameter contract ${expected.render()}.",
                 )
             }
@@ -556,16 +568,45 @@ internal class KotlinNetworkEffectInference(
         }
     }
 
-    /**
-     * Returns a cached or newly inferred summary for [function], using primitive
-     * contracts and annotated recursion boundaries when available.
-     */
+    /** Applies a primitive invocation contract when a function is used as a value. */
     private fun inferFunctionEffect(function: FirFunction): KotlinFunctionEffect {
-        function.downloadContract(session, analysisMode)?.let { contract ->
-            return KotlinFunctionEffect(
-                network = contract.network.asEffect(),
+        val inferred = inferFunctionBodyEffect(function)
+        val contract = function.downloadContract(session, analysisMode) ?: return inferred
+        // Anonymous functions are inferred through this path rather than through
+        // the named-function declaration checker. Validate them here as well.
+        validateDownloadContract(function, inferred)
+        return inferred.copy(network = contract.network.asEffect())
+    }
+
+    /** The same concrete coverage relation checks primitive and composite bodies. */
+    private fun validateDownloadContract(function: FirFunction, inferred: KotlinFunctionEffect) {
+        val contract = function.downloadContract(session, analysisMode) ?: return
+        val actual = inferred.network.concreteOrNull()
+        if (actual == null) {
+            problem(
+                key = "symbolic-download-contract:${function.symbol}",
+                source = function.source,
+                message = "Cannot verify a symbolic body effect against a concrete " +
+                    "@NetworkDownload contract. Infer the effect or use an " +
+                    "effect-polymorphic boundary instead.",
+            )
+        } else if (!actual.isCoveredBy(contract.network)) {
+            problem(
+                key = "download-contract:${function.symbol}",
+                source = function.source,
+                message = "Inferred effect ${actual.render()} is not covered by " +
+                    "@NetworkDownload contract ${contract.network.render()}. " +
+                    "Use inference or a covering @BandwidthEffect for composite work.",
             )
         }
+    }
+
+    /**
+     * Returns a cached or newly inferred body summary for [function]. Concrete
+     * invocation contracts are applied by the visitor at calls, so available
+     * bodies remain independently checkable, including primitive adapters.
+     */
+    private fun inferFunctionBodyEffect(function: FirFunction): KotlinFunctionEffect {
         function.symbolicInvocationEffect(session, analysisMode)?.let { contract ->
             return KotlinFunctionEffect(network = contract)
         }

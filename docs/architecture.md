@@ -79,12 +79,15 @@ bounded-scope semaphore rewrite.
 Annotations are required only where inference cannot see enough:
 
 1. `@NetworkDownload(maxBytes, completeTimeoutMillis)` on primitive network
-   operations or library adapters.
+   operations or library adapters. This is a singleton invocation contract
+   `{(size / timeout, 1)}`; an available source body must satisfy it using
+   ordinary effect subtyping. It does not replace source-body checking.
 2. `@EntryPoint` on a framework-invoked application root that ordinary source
    code may never call. Every marked root contributes one invocation to the
    virtual application root.
-3. Concrete `@BandwidthEffect` contracts on opaque functions, higher-order
-   inputs, and opaque returned function types. Entries retain
+3. Concrete `@BandwidthEffect` contracts on source or opaque functions,
+   higher-order inputs, and opaque returned function types. Available source
+   bodies are checked; opaque library behavior is trusted. Entries retain
    `(rMaxBytesPerSecond, nMax, selfBound, lifetime)`, where a zero `selfBound`
    denotes the default bound infinity. A positive value is a trusted contract
    that runtime configuration establishes a finite limit.
@@ -104,6 +107,15 @@ Annotations are required only where inference cannot see enough:
    work and must expose a finite self bound.
 8. `@BandwidthAlternative` on a whole `try/catch` expression when the
    programmer asserts that its network branches are comparable alternatives.
+
+Primitive size/deadline contracts and concrete effect contracts use the same
+coverage relation. The visitor uses the declared invocation contract at calls
+and callable references, while the inference pass checks available bodies
+independently. Returned Flow/function effects are preserved separately; an
+eager invocation contract does not erase them. Override checking also honors
+primitive contracts declared on interfaces or base methods. Unannotated opaque
+I/O is not discovered by this check: its primitive size, deadline, and transfer
+lifetime remain assumptions. See [examples](annotation-contracts.md).
 
 The MVP has no priorities and no download identifiers.
 

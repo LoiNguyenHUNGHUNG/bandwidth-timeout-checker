@@ -91,12 +91,26 @@ try {
 }
 ```
 
-`@NetworkDownload` applies only at primitive/library boundaries. Omit both
-bounds, or set both to `None`, for an untimed download with no size bound. It
-contributes rate zero and concurrency one, so its interference is retained.
-A zero timeout or a partially specified bound is rejected.
-`@BandwidthEffect` supplies a conservative list of download effects when a
-higher-order or library body is unavailable. The original
+`@NetworkDownload` describes a primitive transfer, usually at a library
+boundary. A size `s` in bytes and complete-call timeout `t` in milliseconds
+supply the singleton contract `{(1000*s/t, 1)}`. Calls use this contract; an available source body is inferred and
+must be a subtype of it, using the same coverage check as `@BandwidthEffect`.
+Thus, a sequential wrapper can fit the contract, while two parallel downloads
+cannot be hidden behind concurrency one. Ordinary wrappers usually need no
+annotation. Omit both bounds, or set both to `None`, for an untimed download
+with no size bound. It contributes rate zero and concurrency one, so its
+interference is retained. A zero timeout or a partially specified bound is
+rejected. Eager network work in a primitive adapter's default arguments must be made
+explicit at the call site; callback defaults must satisfy their parameter contracts.
+
+`@BandwidthEffect` supplies a general effect summary for source functions,
+higher-order inputs, and opaque libraries. Available source bodies are checked
+against concrete contracts. Size/deadline declarations and summaries of opaque
+I/O remain trusted assumptions: the checker does not discover unannotated
+network behavior in a third-party library. An opaque operation with parallel
+or escaping downloads needs a covering `@BandwidthEffect` contract rather than
+the completing singleton. See [annotation contract examples](docs/annotation-contracts.md).
+The original
 `rMaxBytesPerSecond`/`nMax` arguments remain shorthand for one completing
 download effect. Contracts that may outlive their call retain that fact:
 

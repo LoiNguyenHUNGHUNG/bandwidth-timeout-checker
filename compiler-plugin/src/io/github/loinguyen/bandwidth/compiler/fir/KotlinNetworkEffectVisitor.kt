@@ -2560,13 +2560,12 @@ internal class KotlinNetworkEffectVisitor(
         // the definition, then translate the call's effect-variable bindings.
         // Real source overrides are retained: only substitution wrappers peel.
         val definition = generateSequence(target) { it.originalForSubstitutionOverride }.last()
-        definition.downloadContract(session, analysisMode)?.let { contract ->
-            return KotlinFunctionEffect(
-                network = contract.network.asEffect(),
-            )
-        }
-
-        val invocationContract = definition.effectContract(session, analysisMode)
+        // A primitive size/deadline declaration is shorthand for a singleton
+        // invocation contract. Use the same source-body and returned-latent
+        // handling as an ordinary concrete @BandwidthEffect.
+        val invocationContract = definition.downloadContract(session, analysisMode)?.let {
+            EffectContract(network = it.network, variable = null)
+        } ?: definition.effectContract(session, analysisMode)
         val symbolicInvocation = definition.symbolicInvocationEffect(session, analysisMode)
         val returnedContract = target.returnTypeRef.effectContract(session, analysisMode)
             ?: definition.returnTypeRef.effectContract(session, analysisMode)

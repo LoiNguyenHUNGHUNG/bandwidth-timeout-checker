@@ -42,7 +42,11 @@ internal fun FirElement.functionTypeConversionOperand(): FirExpression? = null
 internal fun FirExpression.annotationArrayElements(): List<FirExpression>? =
     (this as? FirCollectionLiteral)?.argumentList?.arguments
 
-/** Collects inherited effect contracts from every safely resolved override. */
+/**
+ * Collects inherited eager-effect bounds from every safely resolved override.
+ * A primitive interface or abstract method also constrains its implementations:
+ * its singleton download bound must not hide a larger inferred body effect.
+ */
 internal fun FirFunction.overriddenEffectContracts(
     session: org.jetbrains.kotlin.fir.FirSession,
     context: CheckerContext,
@@ -53,6 +57,9 @@ internal fun FirFunction.overriddenEffectContracts(
         with(context) {
             function.symbol.processOverriddenFunctionsSafe { overridden ->
                 overridden.fir.effectContract(session, analysisMode)?.let(::add)
+                overridden.fir.downloadContract(session, analysisMode)?.let { contract ->
+                    add(EffectContract(network = contract.network, variable = null))
+                }
             }
         }
     }

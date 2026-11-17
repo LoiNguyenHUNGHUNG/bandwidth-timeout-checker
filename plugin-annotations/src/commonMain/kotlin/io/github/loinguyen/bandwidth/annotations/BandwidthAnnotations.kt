@@ -9,6 +9,14 @@ public const val None: Long = -1
  * The timeout is the complete-call deadline used for the transfer, not merely
  * a connect or read-idle timeout.
  *
+ * This supplies the singleton invocation contract `{(maxBytes / timeout, 1)}`,
+ * with the timeout expressed in seconds. Calls use that contract. When source
+ * is available, the inferred body effect must be covered by the same contract,
+ * just as for [BandwidthEffect]; the annotation does not hide parallel work.
+ * Unknown library I/O, the transfer size, and the actual deadline remain
+ * trusted assumptions. Ordinary wrappers can instead leave their effects
+ * inferred; use [BandwidthEffect] for more general effect summaries.
+ *
  * Set both arguments to [None], or omit both, for an untimed download with no
  * declared size bound.
  * It still counts as one competing download, with required rate zero. Supply
@@ -67,8 +75,11 @@ public annotation class BandwidthVariable(
 )
 
 /**
- * Conservative list of download effects for an opaque function, higher-order
- * input, or returned function type whose body is unavailable to the checker.
+ * Conservative list of download effects for a function, higher-order input,
+ * or returned function type. Calls use the declared contract. Available source
+ * bodies are checked against concrete invocation contracts; contracts for
+ * opaque library operations are trusted. Unlike [NetworkDownload], this can
+ * express multiple rate/concurrency pairs and work that outlives the call.
  *
  * A non-empty [variable] assigns a quantified effect to a higher-order input or
  * to the invocation of an opaque function. For example, placing

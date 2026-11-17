@@ -12,6 +12,645 @@ import kotlin.test.assertNotEquals
 
 class CompilerPluginIntegrationTest {
     @Test
+    fun `primitive boundary preserves an annotated anonymous function contract`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            fun opaqueFetch() = Unit
+            fun root() {
+                val callback = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
+                    fun() { opaqueFetch() }
+                callback()
+            }
+        """, reportEffects = true)
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 1000)
+    }
+
+    @Test
+    fun `primitive boundary checks an annotated anonymous function body`() {
+        val result = compile("""
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            @NetworkDownload(maxBytes = 2000, completeTimeoutMillis = 1000)
+            fun download() = Unit
+            fun root() {
+                val callback = @NetworkDownload(maxBytes = 1000, completeTimeoutMillis = 1000)
+                    fun() { download() }
+                callback()
+            }
+        """)
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("not covered by @NetworkDownload contract")
+    }
+
+    @Test
+    fun `primitive boundary applies declared invocation effects to application roots`() {
+        listOf(
+            "@NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)",
+            "@BandwidthEffect(rMaxBytesPerSecond = 1_000, nMax = 1)",
+        ).forEach { annotation ->
+            val result = compile(
+                """
+                import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+                import io.github.loinguyen.bandwidth.annotations.EntryPoint
+                import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+                @EntryPoint
+                $annotation
+                fun root() = Unit
+                """,
+                reportEffects = true,
+            )
+
+            assertEquals(0, result.exitCode, "$annotation\n${result.output}")
+            result.assertOutputContains("Inferred application entry-point effect from 1 entry point(s): {(1000, 1)}")
+            result.assertOutputContains("ReqBW=1000 bytes/s")
+        }
+    }
+
+    @Test
+    fun `primitive boundary retains network demand when a framework repeats its declaration handler`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.Handler
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @Handler
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun handler() = Unit
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("self bound")
+    }
+
+    @Test
+    fun `primitive boundary accepts sequential downloads fitting its singleton contract`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 800, completeTimeoutMillis = 1_000)
+            fun first() = Unit
+            @NetworkDownload(maxBytes = 600, completeTimeoutMillis = 1_000)
+            fun second() = Unit
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun sequential() { first(); second() }
+
+            fun root() = sequential()
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 1000)
+    }
+
+    @Test
+    fun `primitive boundary rejects a nested download exceeding its declared rate`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
+            fun inner() = Unit
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun tooSmall() = inner()
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("not covered by @NetworkDownload contract")
+    }
+
+    @Test
+    fun `primitive boundary rejects parallel untimed work despite zero required bandwidth`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload()
+            suspend fun untimed() = Unit
+
+            @NetworkDownload()
+            suspend fun tooWide() = coroutineScope {
+                async { untimed() }
+                async { untimed() }
+                Unit
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("not covered by @NetworkDownload contract")
+    }
+
+    @Test
+    fun `primitive boundary rejects an invoked callback exceeding its declared rate`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun invokeDownload(
+                callback: @BandwidthEffect(rMaxBytesPerSecond = 2_000, nMax = 1) () -> Unit,
+            ) { callback() }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("not covered by @NetworkDownload contract")
+    }
+
+    @Test
+    fun `primitive boundary and explicit singleton effect have equivalent source contracts`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
+            fun inner() = Unit
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun downloadContract() = inner()
+
+            @BandwidthEffect(rMaxBytesPerSecond = 1_000, nMax = 1)
+            fun effectContract() = inner()
+
+            fun downloadRoot() = downloadContract()
+            fun effectRoot() = effectContract()
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for downloadRoot: {(1000, 1)}")
+        result.assertOutputContains("Inferred bandwidth effect for effectRoot: {(1000, 1)}")
+    }
+
+    @Test
+    fun `primitive boundary rejects eager network work in an omitted default argument`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
+            fun defaultValue(): Int = 1
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun download(value: Int = defaultValue()) = Unit
+
+            fun root() = download()
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Eager network work in a primitive download default argument")
+    }
+
+    @Test
+    fun `primitive boundary checks a default callback against its parameter contract`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 700, completeTimeoutMillis = 1_000)
+            fun inner() = Unit
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun download(callback: () -> Unit = { inner() }) { callback() }
+
+            fun root() = download()
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Function default argument effect")
+        result.assertOutputContains("not covered by parameter contract")
+    }
+
+    @Test
+    fun `primitive boundary rejects an unconstrained symbolic body under a concrete singleton`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.BandwidthVariable
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @BandwidthVariable("E")
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun wrap(callback: @BandwidthEffect("E") () -> Unit) { callback() }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Cannot verify a symbolic body effect against a concrete @NetworkDownload contract")
+    }
+
+    @Test
+    fun `primitive boundary rejects a parallel override of a primitive interface contract`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+
+            interface Library {
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+                suspend fun download()
+            }
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun first() = Unit
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun second() = Unit
+
+            class CompositeLibrary : Library {
+                override suspend fun download() {
+                    coroutineScope {
+                        async { first() }
+                        async { second() }
+                    }
+                }
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("overridden bandwidth contract")
+    }
+
+    @Test
+    fun `primitive boundary accepts a matching primitive implementation of an interface`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            interface Library {
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+                fun download()
+            }
+
+            fun opaqueFetch() = Unit
+
+            class PrimitiveLibrary : Library {
+                @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+                override fun download() = opaqueFetch()
+            }
+
+            fun root(library: Library) = library.download()
+            fun concreteRoot() = PrimitiveLibrary().download()
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 1000)
+        result.assertFunctionBandwidth("concreteRoot", 1000)
+    }
+
+    @Test
+    fun `primitive boundary keeps eager argument evaluation in the caller`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
+            fun downloadArgument(): Int = 1
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun download(value: Int) = Unit
+
+            fun root() = download(downloadArgument())
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for root: {(2000, 1)}")
+        result.assertFunctionBandwidth("root", 2000)
+        assertFalse(result.output.contains("not covered by @NetworkDownload contract"), result.output)
+    }
+
+    @Test
+    fun `primitive boundary accepts fitting network work reached through an unannotated helper`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun download() = Unit
+
+            fun helper() = download()
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun hiddenComposite() = helper()
+
+            fun root() = hiddenComposite()
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 1000)
+    }
+
+    @Test
+    fun `primitive boundary accepts returning a known network free lambda`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun download(): () -> Unit = {}
+
+            fun root() {
+                val callback = download()
+                callback()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 1000)
+    }
+
+    @Test
+    fun `primitive boundary accepts a leaf around an unannotated library call`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            // Stand-in for foreign I/O whose implementation is not modeled.
+            fun libraryFetch(): String = "payload"
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun download(): String = libraryFetch()
+
+            fun root() = download()
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for root: {(1000, 1)}")
+        result.assertFunctionBandwidth("root", 1000)
+    }
+
+    @Test
+    fun `primitive boundary rejects parallel downloads hidden inside its body`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun first() = Unit
+            @NetworkDownload(maxBytes = 400, completeTimeoutMillis = 1_000)
+            suspend fun second() = Unit
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun hiddenComposite() = coroutineScope {
+                async { first() }
+                async { second() }
+                Unit
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("not covered by @NetworkDownload contract")
+    }
+
+    @Test
+    fun `primitive boundary leaves ordinary wrappers to infer their real concurrency`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun first() = Unit
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun second() = Unit
+
+            suspend fun composite() = coroutineScope {
+                async { first() }
+                async { second() }
+                Unit
+            }
+            suspend fun root() = composite()
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for root: {(1000, 2)}")
+        result.assertFunctionBandwidth("root", 2000)
+    }
+
+    @Test
+    fun `primitive boundary supports a checked aggregate BandwidthEffect contract`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun first() = Unit
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun second() = Unit
+
+            @BandwidthEffect(rMaxBytesPerSecond = 1_000, nMax = 2)
+            suspend fun composite() = coroutineScope {
+                async { first() }
+                async { second() }
+                Unit
+            }
+            suspend fun root() = composite()
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 2000)
+    }
+
+    @Test
+    fun `primitive boundary checks aggregate concurrency instead of trusting a narrow contract`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.async
+            import kotlinx.coroutines.coroutineScope
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            suspend fun first() = Unit
+            @NetworkDownload(maxBytes = 500, completeTimeoutMillis = 1_000)
+            suspend fun second() = Unit
+
+            @BandwidthEffect(rMaxBytesPerSecond = 1_000, nMax = 1)
+            suspend fun composite() = coroutineScope {
+                async { first() }
+                async { second() }
+                Unit
+            }
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("not covered by @BandwidthEffect contract")
+    }
+
+    @Test
+    fun `primitive boundary accepts a single untimed download under timed and untimed contracts`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload()
+            fun untimed() = Unit
+
+            @NetworkDownload()
+            fun hiddenUntimedComposite() { untimed() }
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun timedComposite() { untimed() }
+
+            fun untimedRoot() = hiddenUntimedComposite()
+            fun timedRoot() = timedComposite()
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Inferred bandwidth effect for untimedRoot: {(0, 1)}")
+        result.assertFunctionBandwidth("timedRoot", 1000)
+    }
+
+    @Test
+    fun `primitive boundary accepts invoking a callback within its singleton bound`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun invokeDownload(
+                callback: @BandwidthEffect(rMaxBytesPerSecond = 700, nMax = 1) () -> Unit,
+            ) { callback() }
+
+            fun root(callback: @BandwidthEffect(rMaxBytesPerSecond = 700, nMax = 1) () -> Unit) {
+                invokeDownload(callback)
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 1000)
+    }
+
+    @Test
+    fun `primitive boundary preserves a returned Flow effect until collection`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.flow.Flow
+            import kotlinx.coroutines.flow.collect
+            import kotlinx.coroutines.flow.flow
+
+            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
+            suspend fun download() = Unit
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun delayed(): Flow<Unit> = flow { download() }
+
+            suspend fun root() { delayed().collect { } }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 2000)
+    }
+
+    @Test
+    fun `primitive boundary does not certify an unknown returned Flow as network free`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.BandwidthEffect
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+            import kotlinx.coroutines.flow.Flow
+
+            interface Library { fun stream(): Flow<Unit> }
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun delayed(library: Library): @BandwidthEffect() Flow<Unit> = library.stream()
+            """,
+        )
+
+        assertNotEquals(0, result.exitCode, result.output)
+        result.assertOutputContains("Cannot verify returned Flow effect")
+    }
+
+    @Test
+    fun `primitive boundary preserves a returned function effect until invocation`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 2_000, completeTimeoutMillis = 1_000)
+            fun download() = Unit
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun delayed(): () -> Unit = { download() }
+
+            fun root() {
+                val callback = delayed()
+                callback()
+            }
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 2000)
+    }
+
+    @Test
+    fun `primitive boundary accepts recursion covered by its concrete singleton contract`() {
+        val result = compile(
+            """
+            import io.github.loinguyen.bandwidth.annotations.NetworkDownload
+
+            @NetworkDownload(maxBytes = 1_000, completeTimeoutMillis = 1_000)
+            fun recursive(remaining: Int) {
+                if (remaining > 0) recursive(remaining - 1)
+            }
+
+            fun root() = recursive(3)
+            """,
+            reportEffects = true,
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        result.assertFunctionBandwidth("root", 1000)
+    }
+
+    @Test
     fun `explicit invoke charges the stored callback effect`() {
         val result = compile(
             """
